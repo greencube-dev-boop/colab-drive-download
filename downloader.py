@@ -123,8 +123,8 @@ def download_hls_stream(stream_url: str, headers: Dict[str, str], raw_path: str,
         except Exception:
             return None
 
-    MAX_WORKERS = 8
-    SLIDING_WINDOW = 24
+    MAX_WORKERS = min(16, max(2, int(task.get("download_connections", 8))))
+    SLIDING_WINDOW = MAX_WORKERS * 3
 
     def fetch_seg_resilient(idx, seg_url):
         curr_url = seg_url
@@ -246,11 +246,12 @@ def download_aria2c_or_requests(url: str, raw_path: str, task: Dict[str, Any]):
     raw_dir = os.path.dirname(raw_path)
     target_name = os.path.basename(raw_path)
 
+    conn_str = str(task.get("download_connections", 16))
     aria_cmd = [
         "aria2c",
         "-c",
-        "-x", "16",
-        "-s", "16",
+        "-x", conn_str,
+        "-s", conn_str,
         "-k", "1M",
         "--file-allocation=none",
         "--summary-interval=1",

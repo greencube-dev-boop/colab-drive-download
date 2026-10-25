@@ -173,7 +173,18 @@ def run_task_pipeline(task: Dict[str, Any]):
             task["status"] = "Cancelled"
             cleanup_task_files(t_id, task)
 
-def queue_direct_items(items_list: List[Tuple[str, str]], workers_val: int = 3, debrid_prov: str = "local", debrid_k: str = "") -> int:
+def queue_direct_items(
+    items_list: List[Tuple[str, str]],
+    workers_val: int = 3,
+    debrid_prov: str = "local",
+    debrid_k: str = "",
+    download_conn: int = 8,
+    res_preset: str = "480p",
+    v_codec: str = "H.265 / HEVC",
+    container: str = "mkv",
+    audio_preset: str = "Opus 64 kbps",
+    crf_val: int = 32
+) -> int:
     queued_count = 0
     with tasks_lock:
         for url, title in items_list:
@@ -187,8 +198,14 @@ def queue_direct_items(items_list: List[Tuple[str, str]], workers_val: int = 3, 
                 "has_custom_title": True,
                 "debrid_provider": debrid_prov,
                 "debrid_key": debrid_k,
-                "status": "Queued for Download",
+                "download_connections": int(download_conn),
                 "parallel_workers": int(workers_val),
+                "res_preset": res_preset,
+                "video_codec": v_codec,
+                "container_format": container.lower(),
+                "audio_preset": audio_preset,
+                "crf_val": int(crf_val),
+                "status": "Queued for Download",
                 "download_pct": 0.0,
                 "download_speed": "--",
                 "downloaded_str": "0 MB",
@@ -199,7 +216,8 @@ def queue_direct_items(items_list: List[Tuple[str, str]], workers_val: int = 3, 
                 "chunk_status": {},
                 "error_msg": "",
                 "cancelled": False,
-                "active_proc": None
+                "active_proc": None,
+                "active_procs": []
             }
             config.tasks.append(new_task)
             threading.Thread(target=run_task_pipeline, args=(new_task,), daemon=True).start()

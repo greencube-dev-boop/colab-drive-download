@@ -1,4 +1,4 @@
-# 🎬 Colab Video Downloader & 480p Ultra-Compact MKV Batch Engine
+# 🎬 Colab Video Downloader & Universal Transcode Engine
 
 An asynchronous batch video processing web application running natively in Google Colab with an interactive **Gradio** dashboard, hardware NVENC GPU encoding, and direct Google Drive preservation.
 
@@ -6,27 +6,27 @@ An asynchronous batch video processing web application running natively in Googl
 
 ## 🌟 Key Architecture & Capabilities
 
-### 1. Decluttered 3-Tab Interface (Zero Visual Clutter)
-* **Tab 1: 🔎 Instant Search & Episode Discovery**:
-  * Search any movie or TV series by name (e.g. `FBI`, `Inception`, `Breaking Bad`, `Stranger Things`, `Reacher`).
-  * Live suggestions powered by IMDb's official suggestion engine (free, no API key required).
-  * TV Series Season picker & full episode checklist with titles (e.g. `EP 01 - Pilot`, `EP 02 - Green Birds`).
-  * **Multi-Tracker Torrent Swarms**: Real-time swarm search across The Pirate Bay, YTS, 1337x, and public trackers with quality tags (`[4K]`, `[1080p]`, `[720p]`, `[SD]`) and seed/peer health counts.
-  * 1-Click batch season queueing with auto-naming (`FBI S01E03 - Prey_480p.mkv`).
-* **Tab 2: 🧲 Torrent & Magnet Explorer (Single Unified Hub)**:
-  * Eliminates duplicate input fields — this is the single, dedicated hub for all torrent operations.
-  * Paste a magnet link or upload `.torrent` files.
-  * Pure-Python Bencode inspector decodes metadata, calculates total size, and renders the complete folder/file tree.
-  * Interactive file selector lets you choose specific episodes or whole folders.
-  * Downloads via `aria2c` with selective file filtering (`--select-file=N`), zero seeding (`--seed-time=0`), and protocol encryption.
-  * Preserves exact folder hierarchy in Google Drive (`/content/drive/MyDrive/vid/<TorrentName>/<Folder>/<File>_480p.mkv`).
-  * Optional cloud debrid integration (TorBox / Real-Debrid) for 100% P2P-insulated direct downloads.
-* **Tab 3: 🔗 Direct Links & Custom Streams**:
-  * Direct MP4/MKV download links.
-  * Videm embed links (`https://videm.xyz/embed/...` or `/player.php?id=...`).
-  * VidSrc / vsembed stream links with automated TMDb-to-IMDb translation and scene release naming.
-  * HLS M3U8 live playlists.
-  * YouTube, Vimeo, Doodstream, Streamtape, and other web video platforms via `yt-dlp`.
+### 1. ⚙️ Universal Settings Bar (Top Persistent Controls)
+* **📥 Download Settings**:
+  * **Download Connections / Chunks**: Configurable slider (1 to 16 concurrent streams for aria2c and HLS).
+  * **Cloud Debrid Bridge**: Optional TorBox or Real-Debrid routing for 100% P2P-insulated direct downloads.
+* **🎚️ Output Transcoding & Container Options**:
+  * **Resolution Presets**: `480p (Default - Ultra Compact)`, `360p (Mobile Ultra-Low)`, `240p (Data Saver)`, `720p (HD)`, `1080p (Full HD)`, or `Original / Passthrough`.
+  * **Video Codecs**: `H.265 / HEVC` (high compression) or `H.264 / AVC` (broad device compatibility) with GPU NVENC hardware acceleration and transparent CPU fallback.
+  * **Container Formats**: `MKV` (multi-track resilient) or `MP4` (`+faststart` streaming).
+  * **Audio Presets**: `Opus 64 kbps` (recommended zero-drift audio), `Opus 48 kbps`, `AAC 96 kbps`, `AAC 128 kbps`, or `Copy Original Audio`.
+  * **Parallel Conversion Chunks**: Configurable worker threads (1 to 6 GPU/CPU slices).
+  * **Quality CRF Slider**: Customizable visual quality (18 to 40, default: 32).
+
+### 2. 2-Tab Layout with Instant Navigation
+* **Main Tab 1: 📥 Fetch & Queue**:
+  * **Sub-Tab 1: 🔗 Direct Download**: Paste direct MP4/MKV links, Videm/VidSrc embeds, and HLS M3U8 playlists.
+  * **Sub-Tab 2: 🧲 Torrent & Magnet Download**: Unified hub for magnet links or `.torrent` file uploads with folder hierarchy tree, selective episode picking, and Drive folder preservation.
+  * **Sub-Tab 3: 🔎 Title Search & Swarm Explorer**: Search any movie or TV series, browse official episodes, and query live multi-tracker torrent swarms across The Pirate Bay (`apibay.org`) and YTS.
+* **Main Tab 2: 📊 Downloads & Processes**:
+  * **Automated Tab Switching**: Adding downloads from any sub-tab instantly switches to this tab!
+  * **Working 1-Click Clear & Cancel**: Immediate subprocess termination (`ffmpeg`, `aria2c`), workspace cleanup, and instant removal from the process cards.
+  * Single **`🧹 Clear Completed`** button to clean all finished/errored tasks.
 
 ### 2. Reliable Stream & Embed Ingestion
 * **Videm 5-Server Multi-Probing**:

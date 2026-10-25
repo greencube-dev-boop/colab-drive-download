@@ -47,36 +47,30 @@ def generate_notebook():
     compressed_bundle = base64.b64encode(zlib.compress(bundle_json.encode('utf-8'))).decode('ascii')
 
     # Cell 0: Modern Documentation
-    add_markdown("""# 🎬 Colab Video Downloader & 480p Ultra-Compact MKV Batch Engine
+    add_markdown("""# 🎬 Colab Video Downloader & Universal Transcode Engine
 
 An asynchronous batch video processing web application running natively in Google Colab with an interactive **Gradio** dashboard, hardware NVENC GPU encoding, and direct Google Drive preservation.
 
 ---
 
 ### 🌟 Key Architecture & Capabilities:
-1. **Organized Tabbed Interface (Zero Clutter)**:
-   - **Tab 1: 🔎 Instant Search & Episode Discovery**: Search any Movie or TV Show by title (e.g. `FBI`, `Inception`, `Breaking Bad`, `Reacher`). View posters, IMDb IDs, cast, official episode lists, and live multi-tracker torrent swarms.
-   - **Tab 2: 🧲 Torrent & Magnet Explorer (Single Unified Hub)**: Dedicated single location for inspecting magnets and `.torrent` files. Filter by folder, choose custom episodes, and preserve folder hierarchy in Google Drive.
-   - **Tab 3: 🔗 Direct Links & Custom Streams**: For direct MP4/MKV links, Videm/VidSrc embeds, M3U8 playlists, YouTube/yt-dlp links.
-2. **Multi-Source Torrent Swarm Indexer (Integrated from en.yts.lu)**:
-   - Real-time swarm search across The Pirate Bay, YTS, 1337x, and public trackers.
-   - Quality tags (`[4K]`, `[1080p]`, `[720p]`, `[SD]`) with active seed/peer health counts.
-   - 1-Click direct queue or 1-click bridge to the Torrent Explorer to cherry-pick specific episodes.
-   - Auto-syncs swarms when switching TV seasons.
-3. **Resilient Streaming & Embed Ingestion**:
-   - Videm 5-server multi-probing with sliding-window HLS downloader (8 workers) and token refresh.
-   - VidSrc / vsembed support with automated TMDb-to-IMDb translation and clean scene release naming.
-4. **Working 1-Click Cancel on Every Card**:
-   - Native FastAPI `/api/task/{id}/cancel` endpoint terminates ffmpeg/aria2c immediately and purges workspace files.
-5. **Clean Processes Panel**:
-   - Single `🧹 Clear Completed` button in header.
-   - Live real-time visual progress tiles (download %, speed, ETA, parallel GPU chunk bars).
-6. **Hardware Acceleration & Zero-Desync Audio**:
-   - Tesla T4 GPU NVENC hardware encoding (`hevc_nvenc` with CRF 32).
-   - Continuous Opus audio extraction (100% sync-safe, zero drift).
-   - Saves directly to `/content/drive/MyDrive/vid/<torrent_name>/<folder>/`.
-7. **Persistent Cell Keep-Alive Heartbeat**:
-   - Runs a live runtime telemetry loop so Google Colab never enters idle mode.
+1. **⚙️ Universal Settings Bar (Persistent Header)**:
+   - **Download Settings**: Configurable connection / segment concurrency (1–16 connections) and optional cloud Debrid bridges (TorBox / Real-Debrid).
+   - **Output Resolution**: `480p (Default)`, `360p (Mobile Ultra-Low)`, `240p (Data Saver)`, `720p (HD)`, `1080p (Full HD)`, or `Original / Passthrough`.
+   - **Video Codecs**: `H.265 / HEVC` (high compression) or `H.264 / AVC` (broad device playback) with GPU NVENC hardware acceleration and transparent CPU fallback.
+   - **Container Formats**: `MKV` (multi-track resilient) or `MP4` (`+faststart` streaming).
+   - **Audio Presets**: `Opus 64 kbps` (zero-desync frame-perfect), `Opus 48 kbps`, `AAC 96 kbps`, `AAC 128 kbps`, or `Copy Original`.
+   - **Transcode Chunks & Quality**: Selectable parallel transcode slices (1–6 workers) and custom CRF compression slider (18–40).
+2. **Clean 2-Tab Layout with Automatic Switch**:
+   - **Main Tab 1: 📥 Fetch & Queue**:
+     - *Sub-Tab 1: 🔗 Direct Download*: High-speed multi-connection downloads for direct video URLs, Videm/VidSrc embeds, and HLS M3U8 playlists.
+     - *Sub-Tab 2: 🧲 Torrent & Magnet Download*: Dedicated hub to inspect `.torrent` files or magnet links, explore the complete directory hierarchy, and cherry-pick specific episodes.
+     - *Sub-Tab 3: 🔎 Title Search & Discovery*: Instant IMDb search, TV series season/episode browser, and live multi-tracker torrent swarms (The Pirate Bay & YTS).
+   - **Main Tab 2: 📊 Downloads & Processes**:
+     - Automatically switches here whenever a download is queued!
+     - Displays real-time progress, speed, ETA, parallel GPU chunk bars, and compression savings %.
+     - Working **`✕ Cancel`** (active) and **`✕ Clear`** (errored/done) buttons that immediately kill subprocesses, delete temp files, and remove cards.
+     - Single **`🧹 Clear Completed`** button for one-click cleanup.
 """)
 
     # Cell 1: Environment Setup, Dependencies & Drive Mount

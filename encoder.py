@@ -8,24 +8,27 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, List
 from config import TEMP_DIR, DRIVE_DIR, sanitize_filename, tasks_lock
 
-# Cache NVENC detection
+# Cache NVENC detections
 _nvenc_checked = False
-_gpu_nvenc_available = False
-_nvenc_preset = "p4"
+_gpu_hevc_nvenc_available = False
+_gpu_h264_nvenc_available = False
+_hevc_preset = "p4"
+_h264_preset = "p4"
 
-def is_nvenc_available() -> bool:
-    """Verifies that NVIDIA GPU and hevc_nvenc are not just listed, but actually functional."""
-    global _nvenc_checked, _gpu_nvenc_available, _nvenc_preset
+def check_hardware_encoders():
+    """Verifies that NVIDIA GPU, hevc_nvenc, and h264_nvenc are actually functional."""
+    global _nvenc_checked, _gpu_hevc_nvenc_available, _gpu_h264_nvenc_available, _hevc_preset, _h264_preset
     if not _nvenc_checked:
-        _gpu_nvenc_available = False
+        _gpu_hevc_nvenc_available = False
+        _gpu_h264_nvenc_available = False
         try:
-            # 1. Quick check: is nvidia-smi responding?
             smi = subprocess.run(["nvidia-smi"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=4)
             if smi.returncode == 0:
-                # 2. Check if ffmpeg lists hevc_nvenc
                 res = subprocess.run(["ffmpeg", "-encoders"], capture_output=True, text=True, timeout=5)
-                if "hevc_nvenc" in res.stdout:
-                    # 3. Dry-run test encode of a tiny 0.1s synthetic black frame at 854x480
+                encoders_str = res.stdout
+
+                # 1. Test HEVC NVENC
+                if "hevc_nvenc" in encoders_str:
                     for preset in ["p4", "medium"]:
                         test_cmd = [
                             "ffmpeg", "-nostdin", "-y",
@@ -35,15 +38,39 @@ def is_nvenc_available() -> bool:
                             "-pix_fmt", "yuv420p",
                             "-f", "null", "-"
                         ]
-                        dry_res = subprocess.run(test_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
-                        if dry_res.returncode == 0:
-                            _gpu_nvenc_available = True
-                            _nvenc_preset = preset
+                        dry = subprocess.run(test_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+                        if dry.returncode == 0:
+                            _gpu_hevc_nvenc_available = True
+                            _hevc_preset = preset
+                            break
+
+                # 2. Test H.264 NVENC
+                if "h264_nvenc" in encoders_str:
+                    for preset in ["p4", "medium"]:
+                        test_cmd = [
+                            "ffmpeg", "-nostdin", "-y",
+                            "-f", "lavfi", "-i", "color=c=black:s=854x480:d=0.1",
+                            "-c:v", "h264_nvenc",
+                            "-preset", preset,
+                            "-pix_fmt", "yuv420p",
+                            "-f", "null", "-"
+                        ]
+                        dry = subprocess.run(test_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+                        if dry.returncode == 0:
+                            _gpu_h264_nvenc_available = True
+                            _h264_preset = preset
                             break
         except Exception:
-            _gpu_nvenc_available = False
+            pass
         _nvenc_checked = True
-    return _gpu_nvenc_available
+
+def is_nvenc_available() -> bool:
+    check_hardware_encoders()
+    return _gpu_hevc_nvenc_available
+
+def is_h264_nvenc_available() -> bool:
+    check_hardware_encoders()
+    return _gpu_h264_nvenc_available
 
 def register_proc(task: Dict[str, Any], proc: subprocess.Popen):
     """Registers a running subprocess on the task for instant cancellation."""
@@ -59,8 +86,35 @@ def unregister_proc(task: Dict[str, Any], proc: subprocess.Popen):
             procs.remove(proc)
         task["active_proc"] = procs[-1] if procs else None
 
+def get_resolution_tag_and_limit(res_preset: str) -> tuple[str, int]:
+    r = (res_preset or "").lower()
+    if "240p" in r:
+        return "240p", 240
+    if "360p" in r:
+        return "360p", 360
+    if "720p" in r:
+        return "720p", 720
+    if "1080p" in r:
+        return "1080p", 1080
+    if "original" in r:
+        return "orig", 99999
+    return "480p", 480
+
+def get_bitrate_for_resolution(res_limit: int) -> tuple[str, str]:
+    if res_limit <= 240:
+        return "350k", "700k"
+    if res_limit <= 360:
+        return "450k", "900k"
+    if res_limit <= 480:
+        return "600k", "1200k"
+    if res_limit <= 720:
+        return "1400k", "2800k"
+    if res_limit <= 1080:
+        return "2800k", "5600k"
+    return "4000k", "8000k"
+
 def convert_worker(task: Dict[str, Any]):
-    """Transcodes downloaded raw video into an ultra-compact 480p MKV with Opus audio."""
+    """Transcodes downloaded raw video according to Universal Output Settings."""
     if task.get("cancelled"):
         return
 
@@ -81,60 +135,120 @@ def convert_worker(task: Dict[str, Any]):
     duration = float(probe_data.get("format", {}).get("duration", 0) or v_streams[0].get("duration", 0) or 1)
     task["duration"] = duration
 
-    # 2. Target 480p calculation preserving aspect ratio
-    if src_w >= src_h:
-        target_h = min(src_h, 480)
-        target_w = int(round((target_h * (src_w / src_h)) / 2.0) * 2)
+    # 2. Target Resolution calculation preserving aspect ratio
+    res_tag, res_limit = get_resolution_tag_and_limit(task.get("res_preset", "480p"))
+    if res_limit >= 99999 or (src_w <= res_limit and src_h <= res_limit):
+        target_w, target_h = src_w, src_h
+        scale_filter = "null"
     else:
-        target_w = min(src_w, 480)
-        target_h = int(round((target_w * (src_h / src_w)) / 2.0) * 2)
-    target_w = target_w if target_w % 2 == 0 else target_w + 1
-    target_h = target_h if target_h % 2 == 0 else target_h + 1
+        if src_w >= src_h:
+            target_h = min(src_h, res_limit)
+            target_w = int(round((target_h * (src_w / src_h)) / 2.0) * 2)
+        else:
+            target_w = min(src_w, res_limit)
+            target_h = int(round((target_w * (src_h / src_w)) / 2.0) * 2)
+        target_w = target_w if target_w % 2 == 0 else target_w + 1
+        target_h = target_h if target_h % 2 == 0 else target_h + 1
+        scale_filter = f"scale={target_w}:{target_h}:flags=lanczos,setsar=1"
 
-    scale_filter = f"scale={target_w}:{target_h}:flags=lanczos,setsar=1"
+    max_v_rate, buf_v_rate = get_bitrate_for_resolution(res_limit)
+    crf_val = int(task.get("crf_val", 32))
 
-    # 3. Choose Video Codec args (NVENC Hardware GPU or libx265 CPU fallback)
-    use_nvenc = is_nvenc_available()
-    if use_nvenc:
-        v_codec_args = [
-            "-c:v", "hevc_nvenc",
-            "-preset", _nvenc_preset,
-            "-rc", "vbr",
-            "-cq:v", "32",
-            "-b:v", "0",
-            "-maxrate", "550k",
-            "-bufsize", "1200k",
-            "-pix_fmt", "yuv420p"
-        ]
-    else:
-        v_codec_args = [
-            "-c:v", "libx265",
-            "-crf", "32",
+    # 3. Choose Video Codec args (NVENC Hardware GPU or CPU fallback)
+    v_codec_choice = task.get("video_codec", "H.265 / HEVC")
+    is_h264 = "264" in v_codec_choice or "AVC" in v_codec_choice
+
+    if is_h264:
+        use_gpu = is_h264_nvenc_available()
+        if use_gpu:
+            v_codec_args = [
+                "-c:v", "h264_nvenc",
+                "-preset", _h264_preset,
+                "-rc", "vbr",
+                "-cq:v", str(crf_val),
+                "-b:v", "0",
+                "-maxrate", max_v_rate,
+                "-bufsize", buf_v_rate,
+                "-pix_fmt", "yuv420p"
+            ]
+        else:
+            v_codec_args = [
+                "-c:v", "libx264",
+                "-crf", str(crf_val),
+                "-preset", "veryfast",
+                "-maxrate", max_v_rate,
+                "-bufsize", buf_v_rate,
+                "-pix_fmt", "yuv420p"
+            ]
+        cpu_fallback_args = [
+            "-c:v", "libx264",
+            "-crf", str(crf_val),
             "-preset", "veryfast",
-            "-maxrate", "550k",
-            "-bufsize", "1200k",
+            "-maxrate", max_v_rate,
+            "-bufsize", buf_v_rate,
             "-pix_fmt", "yuv420p"
         ]
-
-    cpu_fallback_args = [
-        "-c:v", "libx265",
-        "-crf", "32",
-        "-preset", "veryfast",
-        "-maxrate", "550k",
-        "-bufsize", "1200k",
-        "-pix_fmt", "yuv420p"
-    ]
+    else:
+        # H.265 / HEVC default
+        use_gpu = is_nvenc_available()
+        if use_gpu:
+            v_codec_args = [
+                "-c:v", "hevc_nvenc",
+                "-preset", _hevc_preset,
+                "-rc", "vbr",
+                "-cq:v", str(crf_val),
+                "-b:v", "0",
+                "-maxrate", max_v_rate,
+                "-bufsize", buf_v_rate,
+                "-pix_fmt", "yuv420p"
+            ]
+        else:
+            v_codec_args = [
+                "-c:v", "libx265",
+                "-crf", str(crf_val),
+                "-preset", "veryfast",
+                "-maxrate", max_v_rate,
+                "-bufsize", buf_v_rate,
+                "-pix_fmt", "yuv420p"
+            ]
+        cpu_fallback_args = [
+            "-c:v", "libx265",
+            "-crf", str(crf_val),
+            "-preset", "veryfast",
+            "-maxrate", max_v_rate,
+            "-bufsize", buf_v_rate,
+            "-pix_fmt", "yuv420p"
+        ]
 
     if task.get("cancelled"):
         return
 
-    # 4. Continuous Opus audio extraction (100% sync-safe, zero drift!)
-    audio_path = os.path.join(TEMP_DIR, f"audio_{task['id']}.opus")
+    # 4. Audio track extraction according to audio_preset
+    audio_preset = task.get("audio_preset", "Opus 64 kbps")
+    audio_path = os.path.join(TEMP_DIR, f"audio_{task['id']}")
+
+    if "opus 48" in audio_preset.lower():
+        audio_path += ".opus"
+        a_args = ["-vn", "-c:a", "libopus", "-b:a", "48k", "-vbr", "on"]
+    elif "aac 128" in audio_preset.lower():
+        audio_path += ".aac"
+        a_args = ["-vn", "-c:a", "aac", "-b:a", "128k"]
+    elif "aac" in audio_preset.lower():
+        audio_path += ".aac"
+        a_args = ["-vn", "-c:a", "aac", "-b:a", "96k"]
+    elif "copy" in audio_preset.lower() or "passthrough" in audio_preset.lower():
+        audio_path += ".mka"
+        a_args = ["-vn", "-c:a", "copy"]
+    else:
+        # Default: Opus 64 kbps (100% frame-perfect sync)
+        audio_path += ".opus"
+        a_args = ["-vn", "-c:a", "libopus", "-b:a", "64k", "-vbr", "on"]
+
     if os.path.exists(audio_path):
         os.remove(audio_path)
 
     if a_streams:
-        a_cmd = ["ffmpeg", "-nostdin", "-y", "-i", task["raw_path"], "-vn", "-c:a", "libopus", "-b:a", "64k", "-vbr", "on", audio_path]
+        a_cmd = ["ffmpeg", "-nostdin", "-y", "-i", task["raw_path"], *a_args, audio_path]
         a_proc = subprocess.Popen(a_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         register_proc(task, a_proc)
         try:
@@ -200,16 +314,16 @@ def convert_worker(task: Dict[str, Any]):
         task["chunk_status"][idx]["status"] = "Encoding"
 
         def run_ffmpeg(selected_args):
-            cmd = [
-                "ffmpeg", "-nostdin", "-y",
-                "-i", chunk_path,
-                "-vf", scale_filter,
+            cmd = ["ffmpeg", "-nostdin", "-y", "-i", chunk_path]
+            if scale_filter != "null":
+                cmd.extend(["-vf", scale_filter])
+            cmd.extend([
                 *selected_args,
                 "-an",
                 "-avoid_negative_ts", "make_zero",
                 "-progress", "pipe:1",
                 out_chunk
-            ]
+            ])
             with open(log_file, "w") as lf:
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=lf, text=True, bufsize=1)
                 register_proc(task, proc)
@@ -241,14 +355,13 @@ def convert_worker(task: Dict[str, Any]):
                 finally:
                     unregister_proc(task, proc)
 
-        # Primary encode attempt (GPU NVENC if available, or CPU)
         code = run_ffmpeg(v_codec_args)
 
         if task.get("cancelled"):
             return out_chunk
 
-        # Automatic CPU Fallback if NVENC failed during the run
-        if code != 0 and use_nvenc:
+        # Automatic CPU Fallback if GPU hardware encoder failed during run
+        if code != 0 and use_gpu:
             task["chunk_status"][idx]["status"] = "Retrying (CPU)"
             task["chunk_status"][idx]["speed"] = "--"
             code = run_ffmpeg(cpu_fallback_args)
@@ -303,8 +416,14 @@ def convert_worker(task: Dict[str, Any]):
     if task.get("cancelled"):
         return
 
+    # 8. Mux into chosen container (MKV or MP4)
+    container_choice = task.get("container_format", "mkv").lower()
+    target_ext = ".mp4" if "mp4" in container_choice else ".mkv"
+
     stem = os.path.splitext(task["title"])[0]
-    task["temp_path"] = os.path.join(TEMP_DIR, f"{stem}_480p.mkv")
+    # Remove existing resolution tag if user provided it to avoid double tags
+    stem = re.sub(r'_(240p|360p|480p|720p|1080p|orig)$', '', stem, flags=re.I)
+    task["temp_path"] = os.path.join(TEMP_DIR, f"{stem}_{res_tag}{target_ext}")
     if os.path.exists(task["temp_path"]):
         os.remove(task["temp_path"])
 
@@ -313,6 +432,10 @@ def convert_worker(task: Dict[str, Any]):
         mux_cmd.extend(["-i", audio_path, "-c", "copy"])
     else:
         mux_cmd.extend(["-c", "copy"])
+
+    if target_ext == ".mp4":
+        mux_cmd.extend(["-movflags", "+faststart"])
+
     mux_cmd.append(task["temp_path"])
 
     m_proc = subprocess.Popen(mux_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -325,7 +448,7 @@ def convert_worker(task: Dict[str, Any]):
     task["convert_pct"] = 100.0
     task["final_size_mb"] = os.path.getsize(task["temp_path"]) / (1024 * 1024)
 
-    # Clean intermediate chunk directory
+    # Clean intermediate chunk directory and files
     shutil.rmtree(task_chunks_dir, ignore_errors=True)
     for p in [stitched_video, concat_list_file, audio_path]:
         if os.path.exists(p):
