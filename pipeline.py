@@ -45,24 +45,46 @@ def cleanup_task_files(task_id: int, task: Dict[str, Any] = None):
                     pass
 
 def cancel_task_by_id(task_id: int) -> bool:
-    """Cancels an active or queued process, kills its subprocess, and purges all files."""
+    """Cancels an active or queued process, kills all its subprocesses, purges files, and removes it from the panel."""
     found = False
     with tasks_lock:
-        for t in tasks:
+        target_task = None
+        for t in list(config.tasks):
             if str(t.get("id")) == str(task_id):
-                t["cancelled"] = True
-                t["status"] = "Cancelled"
-                proc = t.get("active_proc")
-                if proc:
-                    try:
-                        proc.terminate()
-                        proc.kill()
-                    except Exception:
-                        pass
-                t["active_proc"] = None
-                cleanup_task_files(task_id, t)
+                target_task = t
                 found = True
                 break
+
+        if target_task:
+            target_task["cancelled"] = True
+            target_task["status"] = "Cancelled"
+
+            # 1. Kill primary active proc
+            proc = target_task.get("active_proc")
+            if proc:
+                try:
+                    proc.terminate()
+                    proc.kill()
+                except Exception:
+                    pass
+
+            # 2. Kill all parallel/worker procs
+            for p in list(target_task.get("active_procs", [])):
+                try:
+                    p.terminate()
+                    p.kill()
+                except Exception:
+                    pass
+
+            target_task["active_proc"] = None
+            target_task["active_procs"] = []
+
+            # 3. Purge workspace files
+            cleanup_task_files(task_id, target_task)
+
+            # 4. Remove immediately from task registry so the card is removed from UI
+            config.tasks = [item for item in config.tasks if str(item.get("id")) != str(task_id)]
+
     return found
 
 def clear_done_tasks():
@@ -143,8 +165,9 @@ def run_task_pipeline(task: Dict[str, Any]):
         task["status"] = "Done"
 
     except Exception as e:
-        task["status"] = "Error"
-        task["error_msg"] = str(e)
+        if not task.get("cancelled"):
+            task["status"] = "Error"
+            task["error_msg"] = str(e)
     finally:
         if task.get("cancelled"):
             task["status"] = "Cancelled"

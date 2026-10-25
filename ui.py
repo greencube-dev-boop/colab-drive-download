@@ -50,8 +50,10 @@ def render_dashboard_html() -> str:
         if task.get("rel_folder") and task["rel_folder"] != "Root":
             folder_badge = f'<span style="background: #313244; color: #a6adc8; border: 1px solid #45475a; font-size: 11px; padding: 2px 8px; border-radius: 6px; margin-left: 8px;">📁 {html.escape(task["rel_folder"])}</span>'
 
+        btn_label = "✕ Clear" if st in ["Done", "Error", "Cancelled"] else "✕ Cancel"
+
         card = [f"""
-        <div style="background: #1e1e2e; border: 1px solid {sc['border']}; border-radius: 12px; padding: 16px 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.25);">
+        <div id="task-card-{task_id}" style="background: #1e1e2e; border: 1px solid {sc['border']}; border-radius: 12px; padding: 16px 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.25); transition: opacity 0.3s ease;">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
                 <div style="font-weight: 600; font-size: 15px; color: #cdd6f4; max-width: 70%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
                     🎬 #{task_id}: {title}{folder_badge}
@@ -62,9 +64,9 @@ def render_dashboard_html() -> str:
                     </span>
                     <button id="cancel-btn-{task_id}"
                             onclick="window.cancelTask({task_id})"
-                            title="Cancel process #{task_id} and delete all related files"
+                            title="Cancel and remove process #{task_id}"
                             style="background: rgba(243, 139, 168, 0.15); color: #f38ba8; border: 1px solid rgba(243, 139, 168, 0.4); font-weight: 600; font-size: 11px; padding: 4px 10px; border-radius: 6px; cursor: pointer; transition: all 0.2s ease;">
-                        ✕ Cancel
+                        {btn_label}
                     </button>
                 </div>
             </div>
@@ -179,20 +181,36 @@ def render_dashboard_html() -> str:
 HEAD_JS = """
 <script>
 window.cancelTask = function(taskId) {
-    var btn = document.getElementById('cancel-btn-' + taskId);
-    if (btn) {
-        btn.innerText = 'Cancelling...';
-        btn.style.opacity = '0.5';
-        btn.disabled = true;
+    var card = document.getElementById('task-card-' + taskId);
+    if (card) {
+        card.style.opacity = '0.3';
+        card.style.pointerEvents = 'none';
+        var btn = document.getElementById('cancel-btn-' + taskId);
+        if (btn) {
+            btn.innerText = 'Removing...';
+            btn.disabled = true;
+        }
     }
+    // 1. Call native FastAPI cancel route
     fetch('/api/task/' + taskId + '/cancel', { method: 'POST' })
         .then(function(res) { return res.json(); })
         .then(function(data) {
-            console.log('Task cancelled:', data);
+            if (card) card.remove();
         })
         .catch(function(err) {
-            console.error('Cancel error:', err);
+            console.error('Cancel API error:', err);
         });
+
+    // 2. Redundant dispatch to hidden Gradio component
+    try {
+        var inp = document.querySelector('#hidden_cancel_input textarea, #hidden_cancel_input input');
+        var btnAction = document.querySelector('#hidden_cancel_btn');
+        if (inp && btnAction) {
+            inp.value = taskId;
+            inp.dispatchEvent(new Event('input', { bubbles: true }));
+            btnAction.click();
+        }
+    } catch(e) {}
 };
 </script>
 <style>
@@ -871,6 +889,25 @@ def create_ui() -> gr.Blocks:
         # Connect Single Clear Completed Button
         btn_clear_completed.click(
             fn=lambda: (clear_done_tasks(), render_dashboard_html())[1],
+            outputs=[dashboard_component]
+        )
+
+        # Redundant Hidden Event Trigger for Web Browser / Iframe cancellation
+        with gr.Row(visible=False):
+            hidden_cancel_input = gr.Textbox(elem_id="hidden_cancel_input", visible=False)
+            hidden_cancel_btn = gr.Button(elem_id="hidden_cancel_btn", visible=False)
+
+        def handle_hidden_cancel(tid_val):
+            if tid_val:
+                try:
+                    cancel_task_by_id(int(tid_val))
+                except Exception:
+                    pass
+            return render_dashboard_html()
+
+        hidden_cancel_btn.click(
+            fn=handle_hidden_cancel,
+            inputs=[hidden_cancel_input],
             outputs=[dashboard_component]
         )
 

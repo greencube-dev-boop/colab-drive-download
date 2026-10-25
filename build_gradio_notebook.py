@@ -94,12 +94,14 @@ import zlib
 print("=" * 68)
 print("🚀 [1/3] Checking Hardware Acceleration (NVIDIA GPU)...")
 print("=" * 68)
+has_gpu = False
 try:
     gpu_info = subprocess.check_output(
         ["nvidia-smi", "--query-gpu=name,memory.total,driver_version", "--format=csv,noheader"],
         text=True
     ).strip()
     print(f"✅ Active GPU Detected: {gpu_info}")
+    has_gpu = True
 except Exception:
     print("⚠️ No NVIDIA GPU detected. CPU encoding fallback will be used.")
 
@@ -118,6 +120,29 @@ print("📦 [3/3] Installing Dependencies & Setting Up Project Workspace...")
 print("=" * 68)
 !apt-get update -qq && apt-get install -y -qq aria2 ffmpeg > /dev/null
 !pip install -q gradio yt-dlp fastapi uvicorn requests urllib3
+
+if has_gpu:
+    try:
+        test_nv = subprocess.run(
+            ["ffmpeg", "-nostdin", "-y", "-f", "lavfi", "-i", "color=c=black:s=854x480:d=0.1", "-c:v", "hevc_nvenc", "-f", "null", "-"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5
+        )
+        if test_nv.returncode != 0:
+            print("⚡ Fetching static CUDA/NVENC-enabled FFmpeg build for Tesla T4 acceleration...")
+            fetch_script = (
+                "wget -q -O /tmp/ffmpeg.tar.xz https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz && "
+                "tar -xf /tmp/ffmpeg.tar.xz -C /tmp/ && "
+                "cp /tmp/ffmpeg-master-latest-linux64-gpl/bin/ffmpeg /usr/local/bin/ffmpeg && "
+                "cp /tmp/ffmpeg-master-latest-linux64-gpl/bin/ffprobe /usr/local/bin/ffprobe && "
+                "chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe && "
+                "rm -rf /tmp/ffmpeg.tar.xz /tmp/ffmpeg-master*"
+            )
+            subprocess.run(fetch_script, shell=True, executable="/bin/bash")
+            print("✅ High-performance CUDA/NVENC FFmpeg installed!")
+        else:
+            print("✅ System FFmpeg supports NVENC hardware acceleration.")
+    except Exception as e:
+        print(f"ℹ️ FFmpeg NVENC check notice: {e}")
 
 REPO_URL = "https://github.com/greencube-dev-boop/colab-drive-download.git"
 REPO_DIR = "/content/colab-drive-download"
