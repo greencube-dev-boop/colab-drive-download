@@ -1,0 +1,6 @@
+gradio>=4.20.0
+yt-dlp>=2024.03.10
+fastapi>=0.109.0
+uvicorn>=0.27.0
+requests>=2.31.0
+urllib3>=2.0.0

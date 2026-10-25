@@ -1,0 +1,27 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# Temporary & downloaded files
+content/
+raw/
+temp/
+*.log
+*.torrent
+*.mp4
+*.mkv
+*.ts
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
