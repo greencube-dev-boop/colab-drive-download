@@ -119,7 +119,7 @@ print("=" * 68)
 !apt-get update -qq && apt-get install -y -qq aria2 ffmpeg > /dev/null
 !pip install -q gradio yt-dlp fastapi uvicorn requests urllib3
 
-REPO_URL = "https://github.com/kkdtester01/colab-drive-download.git"
+REPO_URL = "https://github.com/greencube-dev-boop/colab-drive-download.git"
 REPO_DIR = "/content/colab-drive-download"
 
 git_synced = False

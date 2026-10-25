@@ -97,17 +97,15 @@ colab-drive-download/
 
 Because the code is now fully modularized and tracked with Git, you can push it to your personal or organization GitHub repository:
 
-### 1. Create a Repository on GitHub
-Create a new, empty repository on GitHub (e.g. `colab-drive-download`).
+### 1. Repository
+The project repository is hosted at:
+**[https://github.com/greencube-dev-boop/colab-drive-download](https://github.com/greencube-dev-boop/colab-drive-download)**
 
-### 2. Connect Your Local Git to GitHub
-In your local terminal inside `d:\code\colab drive download`:
+### 2. Connect & Push Local Git to GitHub
+In your terminal inside `d:\code\colab drive download`:
 ```bash
-# Add your GitHub remote URL
-git remote add origin https://github.com/<your-username>/<your-repo-name>.git
-
-# Ensure branch is main
-git branch -M main
+# Add GitHub remote URL
+git remote add origin https://github.com/greencube-dev-boop/colab-drive-download.git
 
 # Push code to GitHub
 git push -u origin main
