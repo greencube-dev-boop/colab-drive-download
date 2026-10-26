@@ -4,6 +4,7 @@ import argparse
 from ui import create_ui
 from config import tasks, tasks_lock
 import database
+from pipeline import ensure_daemons_running
 
 def main():
     parser = argparse.ArgumentParser(description="Two-Stage Google Drive Downloader & GPU Refiner")
@@ -17,6 +18,7 @@ def main():
     print("=" * 72)
 
     database.init_db()
+    ensure_daemons_running()
     demo = create_ui()
 
     print(f"\n🌐 Launching Web Interface on port {args.port} (share={args.share})...")

@@ -408,8 +408,9 @@ def download_aria2c_torrent(magnet_url: str, task: Dict[str, Any]) -> str:
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     ]
 
-    if task.get("torrent_file_index"):
-        aria_cmd.append(f"--select-file={task['torrent_file_index']}")
+    f_idx = task.get("torrent_file_index") or task.get("target_file_index")
+    if f_idx:
+        aria_cmd.append(f"--select-file={f_idx}")
 
     aria_cmd.append(target_torrent)
 

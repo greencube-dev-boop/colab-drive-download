@@ -144,6 +144,7 @@ def get_download_queue() -> List[Dict[str, Any]]:
                 ORDER BY 
                     CASE 
                         WHEN status = 'downloading' THEN 0 
+                        WHEN status = 'staging' THEN 0
                         WHEN status = 'pending' THEN 1 
                         ELSE 2 
                     END,
@@ -197,8 +198,8 @@ def get_refine_queue() -> List[Dict[str, Any]]:
 
 def move_queue_item(table_name: str, item_id: int, direction: str) -> bool:
     """
-    Moves a pending queue item 'up' or 'down' by swapping its order_idx
-    with the adjacent pending queue item.
+    Moves a pending queue item 'up' or 'down' by cleanly swapping its rank
+    among all pending items in the queue. 100% immune to ties and gaps.
     """
     if table_name not in ["download_queue", "refine_queue"]:
         return False
@@ -209,54 +210,81 @@ def move_queue_item(table_name: str, item_id: int, direction: str) -> bool:
         conn = _get_connection()
         try:
             cur = conn.cursor()
-            # 1. Get current item's order_idx
-            cur.execute(f"SELECT id, order_idx, status FROM {table_name} WHERE id = ?", (item_id,))
-            current = cur.fetchone()
-            if not current or current["status"] != "pending":
+            # Fetch all pending items ordered by order_idx ASC, id ASC
+            cur.execute(f"SELECT id, order_idx FROM {table_name} WHERE status = 'pending' ORDER BY order_idx ASC, id ASC")
+            rows = [dict(r) for r in cur.fetchall()]
+            if len(rows) < 2:
                 return False
 
-            curr_order = current["order_idx"]
+            item_indices = [i for i, r in enumerate(rows) if r["id"] == item_id]
+            if not item_indices:
+                return False
 
-            # 2. Find neighbor
-            if direction == "up":
-                cur.execute(f"""
-                    SELECT id, order_idx FROM {table_name}
-                    WHERE status = 'pending' AND (order_idx < ? OR (order_idx = ? AND id < ?))
-                    ORDER BY order_idx DESC, id DESC LIMIT 1
-                """, (curr_order, curr_order, item_id))
+            idx = item_indices[0]
+            if direction == "up" and idx > 0:
+                target_idx = idx - 1
+            elif direction == "down" and idx < len(rows) - 1:
+                target_idx = idx + 1
             else:
-                cur.execute(f"""
-                    SELECT id, order_idx FROM {table_name}
-                    WHERE status = 'pending' AND (order_idx > ? OR (order_idx = ? AND id > ?))
-                    ORDER BY order_idx ASC, id ASC LIMIT 1
-                """, (curr_order, curr_order, item_id))
-
-            neighbor = cur.fetchone()
-            if not neighbor:
                 return False
 
-            neighbor_id = neighbor["id"]
-            neighbor_order = neighbor["order_idx"]
+            # Swap positions
+            rows[idx], rows[target_idx] = rows[target_idx], rows[idx]
 
-            # If order_indices are identical, separate them
-            if curr_order == neighbor_order:
-                if direction == "up":
-                    neighbor_order += 1
-                else:
-                    curr_order += 1
+            now = _now_iso()
+            # Reassign clean sequential order_indices 1, 2, 3...
+            for rank, r in enumerate(rows, start=1):
+                cur.execute(f"UPDATE {table_name} SET order_idx = ?, updated_at = ? WHERE id = ?", (rank, now, r["id"]))
 
-            # 3. Swap order_idx
-            cur.execute(f"UPDATE {table_name} SET order_idx = ?, updated_at = ? WHERE id = ?", (neighbor_order, _now_iso(), item_id))
-            cur.execute(f"UPDATE {table_name} SET order_idx = ?, updated_at = ? WHERE id = ?", (curr_order, _now_iso(), neighbor_id))
             conn.commit()
             return True
         finally:
             conn.close()
 
+def claim_next_download_job() -> Optional[Dict[str, Any]]:
+    """
+    Atomically claims the next pending download job in strict order (order_idx ASC, id ASC)
+    and transitions status to 'downloading'.
+    """
+    with _db_lock:
+        conn = _get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT * FROM download_queue 
+                WHERE status = 'pending'
+                ORDER BY order_idx ASC, id ASC LIMIT 1
+            """)
+            row = cur.fetchone()
+            if not row:
+                return None
+
+            job_id = row["id"]
+            now = _now_iso()
+            cur.execute("""
+                UPDATE download_queue 
+                SET status = 'downloading', updated_at = ? 
+                WHERE id = ? AND status = 'pending'
+            """, (now, job_id))
+            conn.commit()
+
+            if cur.rowcount == 0:
+                return None
+
+            d = dict(row)
+            d["status"] = "downloading"
+            try:
+                d["refining_config"] = json.loads(d.get("refining_config", "{}"))
+            except Exception:
+                d["refining_config"] = {}
+            return d
+        finally:
+            conn.close()
+
 def claim_next_refine_job() -> Optional[Dict[str, Any]]:
     """
-    Atomically claims the next pending refining job and sets status to 'refining'.
-    Returns the job dict or None.
+    Atomically claims the next pending refining job in strict order (order_idx ASC, id ASC)
+    and transitions status to 'refining'.
     """
     with _db_lock:
         conn = _get_connection()
@@ -335,15 +363,58 @@ def complete_refine_job(job_id: int, final_size_mb: float = 0.0):
         error_msg=""
     )
 
-def cancel_queue_item(table_name: str, item_id: int) -> bool:
-    """Cancels or deletes a queue item."""
+def get_queue_item(table_name: str, item_id: int) -> Optional[Dict[str, Any]]:
+    """Retrieves a single item from the specified queue table."""
+    if table_name not in ["download_queue", "refine_queue"]:
+        return None
+    with _db_lock:
+        conn = _get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(f"SELECT * FROM {table_name} WHERE id = ?", (item_id,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            d = dict(row)
+            try:
+                d["refining_config"] = json.loads(d.get("refining_config", "{}"))
+            except Exception:
+                d["refining_config"] = {}
+            if "chunk_status" in d:
+                try:
+                    d["chunk_status"] = json.loads(d.get("chunk_status", "{}"))
+                except Exception:
+                    d["chunk_status"] = {}
+            return d
+        finally:
+            conn.close()
+
+def delete_queue_item(table_name: str, item_id: int) -> bool:
+    """Deletes an item from the specified queue table."""
     if table_name not in ["download_queue", "refine_queue"]:
         return False
     with _db_lock:
         conn = _get_connection()
         try:
             cur = conn.cursor()
-            cur.execute(f"UPDATE {table_name} SET status = 'cancelled', updated_at = ? WHERE id = ?", (_now_iso(), item_id))
+            cur.execute(f"DELETE FROM {table_name} WHERE id = ?", (item_id,))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+def cancel_queue_item(table_name: str, item_id: int, reason: str = "Cancelled by user") -> bool:
+    """Cancels a queue item and preserves or records cancellation reason."""
+    if table_name not in ["download_queue", "refine_queue"]:
+        return False
+    with _db_lock:
+        conn = _get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                f"UPDATE {table_name} SET status = 'cancelled', error_msg = CASE WHEN error_msg IS NULL OR error_msg = '' THEN ? ELSE error_msg END, updated_at = ? WHERE id = ?",
+                (reason, _now_iso(), item_id)
+            )
             conn.commit()
             return cur.rowcount > 0
         finally:

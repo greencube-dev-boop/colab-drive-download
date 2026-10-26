@@ -311,5 +311,100 @@ class TestTwoStagePipeline(unittest.TestCase):
         self.assertIsInstance(seasons, dict)
         self.assertTrue(len(seasons) > 0)
 
+    def test_ui_queue_rendering_and_history_retention(self):
+        # 1. Add download tasks: 1 pending, 1 failed, 1 cancelled, 1 completed
+        id_pending = database.enqueue_download({"title": "Upcoming Show S01E02", "url": "http://link2"})
+        id_failed = database.enqueue_download({"title": "Broken Stream S01E03", "url": "http://broken"})
+        database.update_item_status("download_queue", id_failed, status="failed", error_msg="HTTP 404 Not Found")
+        
+        id_cancelled = database.enqueue_download({"title": "Duplicate Show S01E01", "url": "http://dup"})
+        database.update_item_status("download_queue", id_cancelled, status="cancelled", error_msg="Duplicate detected in Drive")
+        
+        id_staged = database.enqueue_download({"title": "Completed Show S01E01", "url": "http://staged"})
+        database.update_item_status("download_queue", id_staged, status="completed")
+
+        dl_html = ui.render_download_queue_html()
+        self.assertIn("Upcoming Show S01E02", dl_html)
+        self.assertIn("Broken Stream S01E03", dl_html)
+        self.assertIn("HTTP 404 Not Found", dl_html)
+        self.assertIn("Duplicate Show S01E01", dl_html)
+        self.assertIn("Duplicate detected in Drive", dl_html)
+        self.assertIn("Completed Show S01E01", dl_html)
+
+        # 2. Add refine tasks: 1 pending, 1 failed with transcode error, 1 completed
+        rf_p = database.enqueue_refine({"title": "Refine Pending", "raw_drive_path": "/r/1"})
+        rf_f = database.enqueue_refine({"title": "Refine Broken NVENC", "raw_drive_path": "/r/2"})
+        database.update_item_status("refine_queue", rf_f, status="failed", error_msg="NVENC Out of Memory")
+        rf_c = database.enqueue_refine({"title": "Refine Done 1080p", "raw_drive_path": "/r/3"})
+        database.complete_refine_job(rf_c, final_size_mb=120.5)
+
+        rf_html = ui.render_refine_queue_html()
+        self.assertIn("Refine Pending", rf_html)
+        self.assertIn("Refine Broken NVENC", rf_html)
+        self.assertIn("NVENC Out of Memory", rf_html)
+        self.assertIn("Refine Done 1080p", rf_html)
+        self.assertIn("120.5 MB", rf_html)
+
+    def test_catalog_ascending_numerical_sorting(self):
+        # Record episodes in reverse / random order: Episode 4, Episode 1, Episode 2
+        metadata_manager.record_item(
+            media_type="tv_series",
+            name="Sherlock S01E04",
+            status="raw",
+            raw_path="/raw/Sherlock S01E04.mkv",
+            show_name="Sherlock",
+            season=1,
+            episode=4
+        )
+        metadata_manager.record_item(
+            media_type="tv_series",
+            name="Sherlock S01E01",
+            status="refined",
+            raw_path="",
+            refined_path="/refined/Sherlock S01E01.mkv",
+            show_name="Sherlock",
+            season=1,
+            episode=1
+        )
+        metadata_manager.record_item(
+            media_type="tv_series",
+            name="Sherlock S01E02",
+            status="raw",
+            raw_path="/raw/Sherlock S01E02.mkv",
+            show_name="Sherlock",
+            season=1,
+            episode=2
+        )
+
+        catalog_html = ui.render_catalog_html()
+        self.assertIn("Sherlock S01E01", catalog_html)
+        self.assertIn("Sherlock S01E02", catalog_html)
+        self.assertIn("Sherlock S01E04", catalog_html)
+
+        # Check ascending order in HTML string: E01 must appear before E02, which must appear before E04
+        pos_e1 = catalog_html.find("Sherlock S01E01")
+        pos_e2 = catalog_html.find("Sherlock S01E02")
+        pos_e4 = catalog_html.find("Sherlock S01E04")
+        self.assertTrue(pos_e1 < pos_e2 < pos_e4, f"Episodes not ascending: E01 at {pos_e1}, E02 at {pos_e2}, E04 at {pos_e4}")
+
+    def test_cancel_or_dismiss_task(self):
+        import pipeline
+        # Create a completed task in download_queue
+        id_item = database.enqueue_download({"title": "Finished Item", "url": "http://fin"})
+        database.update_item_status("download_queue", id_item, status="completed")
+
+        # Dismissing it should delete it from the table
+        dismissed = pipeline.cancel_task_by_id(id_item, table_name="download_queue")
+        self.assertTrue(dismissed)
+        self.assertIsNone(database.get_queue_item("download_queue", id_item))
+
+        # Cancelling an active/pending task should mark it cancelled with reason
+        id_pending = database.enqueue_download({"title": "Active Pending", "url": "http://act"})
+        cancelled = pipeline.cancel_task_by_id(id_pending, table_name="download_queue")
+        self.assertTrue(cancelled)
+        item = database.get_queue_item("download_queue", id_pending)
+        self.assertEqual(item["status"], "cancelled")
+        self.assertEqual(item["error_msg"], "Cancelled by user")
+
 if __name__ == "__main__":
     unittest.main()

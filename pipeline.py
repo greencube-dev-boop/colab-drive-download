@@ -20,9 +20,11 @@ from downloader import (
 )
 from encoder import convert_worker, register_proc, unregister_proc
 
-# Active refining task tracker for cancellation
+# Active task tracking
 _active_refine_tasks: Dict[int, Dict[str, Any]] = {}
+_active_download_tasks: Dict[int, Dict[str, Any]] = {}
 _refine_lock = threading.Lock()
+_dl_lock = threading.Lock()
 
 def cleanup_task_files(task_id: int, task: Optional[Dict[str, Any]] = None):
     """Deletes all local raw, temp, chunks, and intermediate files for a given task."""
@@ -55,19 +57,31 @@ def cleanup_task_files(task_id: int, task: Optional[Dict[str, Any]] = None):
                 except Exception:
                     pass
 
-def cancel_task_by_id(task_id: int) -> bool:
-    """Cancels an active or queued process (download or refining), kills subprocesses, and removes workspace artifacts."""
+def cancel_task_by_id(task_id: int, table_name: Optional[str] = None) -> bool:
+    """
+    Cancels an active or queued process, kills subprocesses, updates DB with reason, and removes temp files.
+    If the task has already ended (completed, failed, or cancelled), clicking cancel dismisses/removes it from the queue.
+    """
     found = False
+    tables_to_check = [table_name] if table_name in ["download_queue", "refine_queue"] else ["download_queue", "refine_queue"]
 
-    # 1. Check in-memory active tasks
+    # 1. If task is already finished/failed/cancelled, dismiss/delete it from queue table
+    for t_name in tables_to_check:
+        item = database.get_queue_item(t_name, task_id)
+        if item and item.get("status") in ["completed", "failed", "cancelled", "staged"]:
+            database.delete_queue_item(t_name, task_id)
+            with tasks_lock:
+                config.tasks = [t for t in config.tasks if str(t.get("id")) != str(task_id) and str(t.get("db_id")) != str(task_id)]
+            return True
+
+    # 2. Check in-memory active tasks
     with tasks_lock:
-        target_task = next((t for t in config.tasks if str(t.get("id")) == str(task_id)), None)
+        target_task = next((t for t in config.tasks if str(t.get("id")) == str(task_id) or str(t.get("db_id")) == str(task_id)), None)
         if target_task:
             found = True
             target_task["cancelled"] = True
-            target_task["status"] = "Cancelled"
+            target_task["status"] = "Cancelled by user"
 
-            # Kill primary and worker procs
             proc = target_task.get("active_proc")
             if proc:
                 try:
@@ -86,40 +100,67 @@ def cancel_task_by_id(task_id: int) -> bool:
             target_task["active_proc"] = None
             target_task["active_procs"] = []
             cleanup_task_files(task_id, target_task)
-            config.tasks = [item for item in config.tasks if str(item.get("id")) != str(task_id)]
 
-    # 2. Check active refining daemon tasks
-    with _refine_lock:
-        refine_task = _active_refine_tasks.get(task_id)
-        if refine_task:
+    # 3. Check active download daemon tasks
+    if table_name in [None, "download_queue"]:
+        with _dl_lock:
+            dl_task = _active_download_tasks.get(task_id)
+            if dl_task:
+                found = True
+                dl_task["cancelled"] = True
+                dl_task["status"] = "Cancelled by user"
+                proc = dl_task.get("active_proc")
+                if proc:
+                    try:
+                        proc.terminate()
+                        proc.kill()
+                    except Exception:
+                        pass
+                for p in list(dl_task.get("active_procs", [])):
+                    try:
+                        p.terminate()
+                        p.kill()
+                    except Exception:
+                        pass
+                cleanup_task_files(task_id, dl_task)
+
+    # 4. Check active refining daemon tasks
+    if table_name in [None, "refine_queue"]:
+        with _refine_lock:
+            refine_task = _active_refine_tasks.get(task_id)
+            if refine_task:
+                found = True
+                refine_task["cancelled"] = True
+                refine_task["status"] = "Cancelled by user"
+                proc = refine_task.get("active_proc")
+                if proc:
+                    try:
+                        proc.terminate()
+                        proc.kill()
+                    except Exception:
+                        pass
+                for p in list(refine_task.get("active_procs", [])):
+                    try:
+                        p.terminate()
+                        p.kill()
+                    except Exception:
+                        pass
+                cleanup_task_files(task_id, refine_task)
+
+    # 5. Cancel in persistent SQLite databases with reason
+    if table_name in [None, "download_queue"]:
+        if database.cancel_queue_item("download_queue", task_id, reason="Cancelled by user"):
             found = True
-            refine_task["cancelled"] = True
-            refine_task["status"] = "Cancelled"
-            proc = refine_task.get("active_proc")
-            if proc:
-                try:
-                    proc.terminate()
-                    proc.kill()
-                except Exception:
-                    pass
-            for p in list(refine_task.get("active_procs", [])):
-                try:
-                    p.terminate()
-                    p.kill()
-                except Exception:
-                    pass
-            cleanup_task_files(task_id, refine_task)
-
-    # 3. Cancel in persistent SQLite databases
-    database.cancel_queue_item("download_queue", task_id)
-    database.cancel_queue_item("refine_queue", task_id)
+    if table_name in [None, "refine_queue"]:
+        if database.cancel_queue_item("refine_queue", task_id, reason="Cancelled by user"):
+            found = True
 
     return found
 
 def clear_done_tasks():
     """Removes completed, errored, and cancelled tasks from in-memory registry and database tables."""
     with tasks_lock:
-        config.tasks = [t for t in config.tasks if t.get("status") not in ["Done", "Error", "Cancelled", "Completed", "Staged"]]
+        config.tasks = [t for t in config.tasks if t.get("status") not in ["Done", "Error", "Cancelled", "Completed", "Staged", "Cancelled by user"]]
     database.clear_completed("download_queue")
     database.clear_completed("refine_queue")
 
@@ -133,7 +174,6 @@ def download_worker(task: Dict[str, Any]):
     source_type = resolved["type"]
     headers = resolved["headers"]
 
-    # 2. Set title & file extension (preserve user custom title if given)
     if not task.get("has_custom_title") and resolved.get("title"):
         task["title"] = sanitize_filename(resolved["title"])
 
@@ -144,8 +184,8 @@ def download_worker(task: Dict[str, Any]):
     if task.get("cancelled"):
         return
 
-    # 3. Route to optimal downloader
-    if source_type == "local_torrent":
+    # 2. Route to optimal downloader
+    if source_type == "local_torrent" or task.get("is_torrent_file") or "magnet:?" in source_url:
         largest_fp = download_aria2c_torrent(source_url, task)
         if largest_fp and os.path.exists(largest_fp):
             ext = os.path.splitext(largest_fp)[1].lower() or ".mkv"
@@ -187,23 +227,17 @@ def run_download_pipeline(task: Dict[str, Any]):
         pre_info = classifier.classify_media(task.get("title", ""))
         exists, st_exists, existing_path = metadata_manager.check_media_exists(pre_info)
         if exists:
-            msg = f"Skipped: Already exists in Drive as {st_exists}"
-            print(f"[Deduplication] Task #{t_id} '{task.get('title')}' skipped ({msg}) -> {existing_path}")
-            task["status"] = f"Skipped (Already in Drive: {st_exists})"
+            msg = f"Skipped: Already in Drive as {st_exists} ({os.path.basename(existing_path)})"
+            print(f"[Deduplication] Task #{t_id} '{task.get('title')}' -> {msg}")
+            task["status"] = msg
             task["cancelled"] = True
             task["download_pct"] = 100.0
             database.update_item_status("download_queue", db_id, status="cancelled", error_msg=msg)
             return
 
-        task["status"] = "Queued for Download"
-        database.update_item_status("download_queue", db_id, status="pending")
-
-        with download_semaphore:
-            if task.get("cancelled"):
-                return
-            task["status"] = "Downloading"
-            database.update_item_status("download_queue", db_id, status="downloading")
-            download_worker(task)
+        task["status"] = "Downloading"
+        database.update_item_status("download_queue", db_id, status="downloading")
+        download_worker(task)
 
         if task.get("cancelled") or not os.path.exists(task.get("raw_path", "")):
             return
@@ -215,11 +249,9 @@ def run_download_pipeline(task: Dict[str, Any]):
         # DEDUPLICATION CHECK 2 (Post-Download, using actual downloaded media)
         # -------------------------------------------------------------
         downloaded_name = os.path.basename(task["raw_path"])
-        # Classify with downloaded name if title was generic
         media_info = classifier.classify_media(task.get("title", "") or downloaded_name)
         exists, st_exists, existing_path = metadata_manager.check_media_exists(media_info)
         if exists:
-            # Duplicate finished downloading! Delete local raw file immediately to save disk
             print(f"[Deduplication] Task #{t_id} downloaded duplicate detected. Purging local copy -> {task['raw_path']}")
             try:
                 if os.path.exists(task["raw_path"]):
@@ -227,7 +259,7 @@ def run_download_pipeline(task: Dict[str, Any]):
             except Exception:
                 pass
             msg = f"Cancelled: Duplicate of existing media in Drive ({st_exists})"
-            task["status"] = f"Cancelled (Duplicate: Already in Drive)"
+            task["status"] = msg
             task["cancelled"] = True
             database.update_item_status("download_queue", db_id, status="cancelled", error_msg=msg)
             return
@@ -243,7 +275,6 @@ def run_download_pipeline(task: Dict[str, Any]):
         standard_raw_filename = f"{formatted_name}{raw_ext}"
         drive_raw_path = os.path.join(config.RAW_DIR, standard_raw_filename)
 
-        # Avoid collision if same file name already exists in raw
         c = 1
         base_stem, ext = os.path.splitext(standard_raw_filename)
         while os.path.exists(drive_raw_path):
@@ -309,7 +340,6 @@ def run_download_pipeline(task: Dict[str, Any]):
             "refining_config": refining_config
         })
 
-        # Mark Stage 1 completed
         task["status"] = "Staged in Drive"
         task["download_pct"] = 100.0
         database.update_item_status(
@@ -317,20 +347,99 @@ def run_download_pipeline(task: Dict[str, Any]):
             db_id,
             status="completed",
             download_pct=100.0,
-            raw_path=drive_raw_path
+            raw_path=drive_raw_path,
+            error_msg=""
         )
 
     except Exception as e:
         if not task.get("cancelled"):
+            err_msg = str(e)
+            print(f"[DownloadWorker] Error on task #{t_id}: {err_msg}")
             task["status"] = "Error"
-            task["error_msg"] = str(e)
-            database.update_item_status("download_queue", db_id, status="failed", error_msg=str(e))
+            task["error_msg"] = err_msg
+            database.update_item_status("download_queue", db_id, status="failed", error_msg=err_msg)
     finally:
         if task.get("cancelled"):
             if not str(task.get("status", "")).startswith("Cancelled") and not str(task.get("status", "")).startswith("Skipped"):
                 task["status"] = "Cancelled"
             cleanup_task_files(t_id, task)
 
+# ---------------------------------------------------------------------
+# Dedicated Download Worker & Queue-Driven Daemon
+# ---------------------------------------------------------------------
+def _download_job_worker(job: Dict[str, Any]):
+    """Processes a claimed download job and releases download semaphore upon completion."""
+    job_id = job["id"]
+    cfg = job.get("refining_config", {})
+
+    task: Dict[str, Any] = {
+        "id": job_id,
+        "db_id": job_id,
+        "title": job.get("title", "Download"),
+        "url": job.get("url", ""),
+        "source_type": job.get("source_type", "direct"),
+        "raw_path": "",
+        "res_preset": cfg.get("res_preset", "480p"),
+        "video_codec": cfg.get("video_codec", "H.265 / HEVC"),
+        "container_format": cfg.get("container_format", "mkv"),
+        "audio_preset": cfg.get("audio_preset", "Opus 64 kbps"),
+        "crf_val": cfg.get("crf_val", 32),
+        "parallel_workers": cfg.get("parallel_workers", 3),
+        "download_connections": cfg.get("download_connections", 8),
+        "torrent_file_index": job.get("torrent_file_index") or cfg.get("torrent_file_index"),
+        "target_file_index": job.get("target_file_index") or cfg.get("target_file_index"),
+        "torrent_filename": job.get("torrent_filename") or cfg.get("torrent_filename"),
+        "rel_folder": job.get("rel_folder", "Root") or cfg.get("rel_folder", "Root"),
+        "cancelled": False,
+        "active_proc": None,
+        "active_procs": [],
+        "download_pct": 0.0,
+        "download_speed": "--",
+        "downloaded_str": "0 MB",
+        "total_str": "--"
+    }
+
+    with _dl_lock:
+        _active_download_tasks[job_id] = task
+
+    with tasks_lock:
+        existing_t = next((t for t in config.tasks if t.get("db_id") == job_id), None)
+        if not existing_t:
+            config.tasks.append(task)
+        else:
+            task = existing_t
+
+    try:
+        run_download_pipeline(task)
+    finally:
+        with _dl_lock:
+            _active_download_tasks.pop(job_id, None)
+        download_semaphore.release()
+
+def _download_daemon_loop():
+    """Continuous background loop strictly executing download jobs in order_idx ASC sequence."""
+    while True:
+        acquired = download_semaphore.acquire(blocking=False)
+        if not acquired:
+            time.sleep(1.0)
+            continue
+
+        try:
+            job = database.claim_next_download_job()
+            if job:
+                t = threading.Thread(target=_download_job_worker, args=(job,), daemon=True)
+                t.start()
+            else:
+                download_semaphore.release()
+                time.sleep(1.5)
+        except Exception as e:
+            print(f"[DownloadDaemon] Loop exception: {e}")
+            download_semaphore.release()
+            time.sleep(2.0)
+
+# ---------------------------------------------------------------------
+# Dedicated Refining Worker & Queue-Driven Daemon
+# ---------------------------------------------------------------------
 def _refine_job_worker(job: Dict[str, Any]):
     """
     Stage 2 Execution:
@@ -369,7 +478,7 @@ def _refine_job_worker(job: Dict[str, Any]):
         "cancelled": False,
         "active_proc": None,
         "active_procs": [],
-        "convert_pct": 0.0,
+        "convert_pct": 5.0,
         "chunk_status": {}
     }
 
@@ -377,14 +486,12 @@ def _refine_job_worker(job: Dict[str, Any]):
         _active_refine_tasks[job_id] = refine_task
 
     try:
-        # Step A: Copy from Drive to local VM ephemeral disk
         database.update_item_status("refine_queue", job_id, status="refining", convert_pct=5.0)
         shutil.copy2(raw_drive_path, local_raw_copy)
 
         if refine_task.get("cancelled"):
             return
 
-        # Step B: GPU VRAM chunked transcoding
         database.update_item_status("refine_queue", job_id, status="refining", convert_pct=10.0)
         convert_worker(refine_task)
 
@@ -397,18 +504,15 @@ def _refine_job_worker(job: Dict[str, Any]):
 
         final_size_mb = os.path.getsize(temp_output) / (1024 * 1024)
 
-        # Step C: Move to structured refined destination on Google Drive
         os.makedirs(os.path.dirname(target_refined_path), exist_ok=True)
         shutil.copy2(temp_output, target_refined_path)
 
-        # Step D: Strict verification on Google Drive
         if not os.path.exists(target_refined_path) or os.path.getsize(target_refined_path) == 0:
             raise RuntimeError("Verification failed: Refined file not saved to Google Drive.")
 
-        # Step E: Trash Bin Bypass Deletion of Raw File
+        # Bypass Google Drive Trash Bin
         bypass_trash_delete(raw_drive_path)
 
-        # Step F: Update metadata.json & queue.db
         metadata_manager.update_item_status(
             media_type=job.get("media_type", "other"),
             name=job.get("title", ""),
@@ -431,7 +535,7 @@ def _refine_job_worker(job: Dict[str, Any]):
             _active_refine_tasks.pop(job_id, None)
 
 def _refine_daemon_loop():
-    """Continuous background loop picking and processing jobs from persistent refine_queue."""
+    """Continuous background loop strictly executing refining jobs in order_idx ASC sequence."""
     while True:
         if not config.refine_worker_active:
             time.sleep(2.0)
@@ -454,14 +558,14 @@ def _refine_daemon_loop():
         finally:
             conversion_semaphore.release()
 
-# Start background refining daemon thread once
-_daemon_started = False
-def ensure_refine_daemon_running():
-    global _daemon_started
-    if not _daemon_started:
-        _daemon_started = True
-        t = threading.Thread(target=_refine_daemon_loop, daemon=True, name="RefineDaemon")
-        t.start()
+# Start background daemons
+_daemons_started = False
+def ensure_daemons_running():
+    global _daemons_started
+    if not _daemons_started:
+        _daemons_started = True
+        threading.Thread(target=_download_daemon_loop, daemon=True, name="DownloadDaemon").start()
+        threading.Thread(target=_refine_daemon_loop, daemon=True, name="RefineDaemon").start()
 
 def queue_direct_items(
     items_list: List[Tuple[str, str]],
@@ -475,65 +579,67 @@ def queue_direct_items(
     audio_preset: str = "Opus 64 kbps",
     crf_val: int = 32
 ) -> int:
-    """Queues new download requests into persistent SQLite download_queue and starts download pipeline."""
+    """Queues new download requests into persistent SQLite download_queue with auto torrent splitting."""
     database.init_db()
-    ensure_refine_daemon_running()
+    ensure_daemons_running()
     queued_count = 0
 
-    with tasks_lock:
-        for url, title in items_list:
-            config.task_counter += 1
-            t_id = config.task_counter
-            queued_count += 1
+    for url, title in items_list:
+        clean_url = (url or "").strip()
+        if not clean_url:
+            continue
 
-            refining_cfg = {
-                "res_preset": res_preset,
-                "video_codec": v_codec,
-                "container_format": container.lower(),
-                "audio_preset": audio_preset,
-                "crf_val": int(crf_val),
-                "parallel_workers": int(workers_val)
-            }
+        is_torrent = (".torrent" in clean_url.lower() or "magnet:?" in clean_url.lower())
 
-            # Enqueue to persistent database
-            db_id = database.enqueue_download({
-                "title": sanitize_filename(title),
-                "url": url,
-                "source_type": "torrent" if (".torrent" in url.lower() or "magnet:" in url.lower()) else "direct",
-                "refining_config": refining_cfg
-            })
+        # Auto-Inspect Multi-Video Torrents when added without inspecting
+        if is_torrent:
+            try:
+                from torrent_parser import fetch_torrent_metadata
+                meta = fetch_torrent_metadata(clean_url)
+                vids = [f for f in meta.get("files", []) if f.get("is_video")]
+                if len(vids) > 1:
+                    print(f"[TorrentAutoSplit] Torrent '{meta.get('name')}' contains {len(vids)} video files. Enqueueing each individually...")
+                    for vf in vids:
+                        refining_cfg = {
+                            "res_preset": res_preset,
+                            "video_codec": v_codec,
+                            "container_format": container.lower(),
+                            "audio_preset": audio_preset,
+                            "crf_val": int(crf_val),
+                            "parallel_workers": int(workers_val),
+                            "download_connections": int(download_conn),
+                            "torrent_file_index": vf.get("index"),
+                            "target_file_index": vf.get("index"),
+                            "torrent_filename": vf.get("filename"),
+                            "rel_folder": vf.get("folder", "Root")
+                        }
+                        database.enqueue_download({
+                            "title": sanitize_filename(vf.get("filename_clean")),
+                            "url": meta.get("cached_file_path") or clean_url,
+                            "source_type": "torrent",
+                            "refining_config": refining_cfg
+                        })
+                        queued_count += 1
+                    continue
+            except Exception as e:
+                print(f"[TorrentAutoSplit] Notice: {e}. Falling back to standard queue.")
 
-            new_task = {
-                "id": t_id,
-                "db_id": db_id,
-                "url": url,
-                "is_torrent_file": False,
-                "title": sanitize_filename(title),
-                "has_custom_title": True,
-                "debrid_provider": debrid_prov,
-                "debrid_key": debrid_k,
-                "download_connections": int(download_conn),
-                "parallel_workers": int(workers_val),
-                "res_preset": res_preset,
-                "video_codec": v_codec,
-                "container_format": container.lower(),
-                "audio_preset": audio_preset,
-                "crf_val": int(crf_val),
-                "status": "Queued for Download",
-                "download_pct": 0.0,
-                "download_speed": "--",
-                "downloaded_str": "0 MB",
-                "total_str": "--",
-                "convert_pct": 0.0,
-                "raw_size_mb": 0.0,
-                "final_size_mb": 0.0,
-                "chunk_status": {},
-                "error_msg": "",
-                "cancelled": False,
-                "active_proc": None,
-                "active_procs": []
-            }
-            config.tasks.append(new_task)
-            threading.Thread(target=run_download_pipeline, args=(new_task,), daemon=True).start()
+        refining_cfg = {
+            "res_preset": res_preset,
+            "video_codec": v_codec,
+            "container_format": container.lower(),
+            "audio_preset": audio_preset,
+            "crf_val": int(crf_val),
+            "parallel_workers": int(workers_val),
+            "download_connections": int(download_conn)
+        }
+
+        database.enqueue_download({
+            "title": sanitize_filename(title) if title else "Video Download",
+            "url": clean_url,
+            "source_type": "torrent" if is_torrent else "direct",
+            "refining_config": refining_cfg
+        })
+        queued_count += 1
 
     return queued_count

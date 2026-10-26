@@ -306,6 +306,14 @@ def convert_worker(task: Dict[str, Any]):
             "status": "Queued"
         }
 
+    def _update_overall_progress():
+        chunks = task.get("chunk_status", {})
+        if chunks:
+            total_curr = sum(c.get("curr_sec", 0.0) for c in chunks.values())
+            total_dur = sum(c.get("dur_sec", 1.0) for c in chunks.values())
+            if total_dur > 0:
+                task["convert_pct"] = min(99.0, max(5.0, (total_curr / total_dur) * 100.0))
+
     # 6. Parallel Encoding of Chunks with Auto CPU Fallback
     def encode_single_chunk(idx: int, chunk_path: str) -> str:
         base = os.path.splitext(os.path.basename(chunk_path))[0]
@@ -341,6 +349,7 @@ def convert_worker(task: Dict[str, Any]):
                                 task["chunk_status"][idx]["curr_sec"] = curr_sec
                                 dur_s = task["chunk_status"][idx]["dur_sec"]
                                 task["chunk_status"][idx]["pct"] = min(100.0, (curr_sec / dur_s) * 100)
+                                _update_overall_progress()
                             except ValueError:
                                 pass
                         elif line.startswith("speed="):
@@ -349,6 +358,7 @@ def convert_worker(task: Dict[str, Any]):
                             task["chunk_status"][idx]["curr_sec"] = task["chunk_status"][idx]["dur_sec"]
                             task["chunk_status"][idx]["pct"] = 100.0
                             task["chunk_status"][idx]["status"] = "Done"
+                            _update_overall_progress()
                             break
                     proc.wait()
                     return proc.returncode

@@ -25,7 +25,7 @@ import threading
 # ---------------------------------------------------------
 
 def render_download_queue_html() -> str:
-    """Renders active downloads and pending download queue with reordering (⬆️/⬇️) buttons."""
+    """Renders active downloads, pending download queue with reordering (⬆️/⬇️), and full persistent history."""
     db_items = database.get_download_queue()
 
     with tasks_lock:
@@ -33,16 +33,16 @@ def render_download_queue_html() -> str:
 
     active_items = []
     pending_items = []
-    finished_items = []
+    history_items = []
 
     for item in db_items:
-        st = item.get("status", "pending")
+        st = item.get("status", "pending").lower()
         if st in ["downloading", "staging"]:
             active_items.append(item)
         elif st == "pending":
             pending_items.append(item)
         else:
-            finished_items.append(item)
+            history_items.append(item)
 
     html_parts = ['<div style="display: flex; flex-direction: column; gap: 16px; font-family: system-ui, -apple-system, sans-serif;">']
 
@@ -75,7 +75,7 @@ def render_download_queue_html() -> str:
                         <span style="background: #1e3a5f; color: #89b4fa; border: 1px solid #89b4fa; font-weight: 600; font-size: 11px; padding: 2px 10px; border-radius: 12px;">
                             {st_text}
                         </span>
-                        <button onclick="window.cancelTask({i_id})" title="Cancel download" style="background: rgba(243, 139, 168, 0.15); color: #f38ba8; border: 1px solid rgba(243, 139, 168, 0.4); font-weight: 600; font-size: 11px; padding: 3px 8px; border-radius: 6px; cursor: pointer;">
+                        <button onclick="window.cancelTask('download_queue', {i_id})" title="Cancel download" style="background: rgba(243, 139, 168, 0.15); color: #f38ba8; border: 1px solid rgba(243, 139, 168, 0.4); font-weight: 600; font-size: 11px; padding: 3px 8px; border-radius: 6px; cursor: pointer;">
                             ✕ Cancel
                         </button>
                     </div>
@@ -120,26 +120,57 @@ def render_download_queue_html() -> str:
                     <button onclick="window.moveQueueItem('download_queue', {i_id}, 'down')" title="Move Down" style="background: #313244; color: #cdd6f4; border: 1px solid #45475a; border-radius: 4px; padding: 3px 8px; font-size: 11px; cursor: pointer;">
                         ⬇️ Down
                     </button>
-                    <button onclick="window.cancelTask({i_id})" title="Remove from queue" style="background: rgba(243, 139, 168, 0.1); color: #f38ba8; border: 1px solid rgba(243, 139, 168, 0.3); border-radius: 4px; padding: 3px 8px; font-size: 11px; cursor: pointer;">
+                    <button onclick="window.cancelTask('download_queue', {i_id})" title="Remove from queue" style="background: rgba(243, 139, 168, 0.1); color: #f38ba8; border: 1px solid rgba(243, 139, 168, 0.3); border-radius: 4px; padding: 3px 8px; font-size: 11px; cursor: pointer;">
                         ✕
                     </button>
                 </div>
             </div>
             """)
 
-    # 3. Finished Downloads (Collapsed / Summary)
-    if finished_items:
-        html_parts.append(f"""
-        <div style="font-size: 12px; color: #6c7086; margin-top: 8px; text-align: right;">
-            ✅ Completed / Staged: <b>{len(finished_items)}</b> item(s) in Drive raw
-        </div>
-        """)
+    # 3. Finished Downloads (History: Completed, Failed with reason, Cancelled with reason)
+    if history_items:
+        html_parts.append('<div style="font-weight: 700; font-size: 14px; color: #a6adc8; display: flex; align-items: center; gap: 8px; margin-top: 14px;">📜 Finished & Staged History (' + str(len(history_items)) + ')</div>')
+        for it in history_items:
+            i_id = it["id"]
+            title = html.escape(it.get("title", "Download"))
+            st = it.get("status", "completed").lower()
+            err_msg = html.escape((it.get("error_msg") or "").strip())
+            src_type = it.get("source_type", "direct")
+            badge_icon = "🧲" if src_type == "torrent" else "🔗"
+
+            if st in ["completed", "staged"]:
+                badge_html = '<span style="background: rgba(166, 227, 161, 0.15); color: #a6e3a1; border: 1px solid rgba(166, 227, 161, 0.4); font-weight: 700; font-size: 10px; padding: 2px 8px; border-radius: 10px;">✅ STAGED IN DRIVE</span>'
+                callout_html = '<div style="font-size: 12px; color: #6c7086; margin-top: 4px;">Saved to Google Drive raw/ and queued for GPU refining.</div>'
+            elif st == "failed":
+                badge_html = '<span style="background: rgba(243, 139, 168, 0.15); color: #f38ba8; border: 1px solid rgba(243, 139, 168, 0.4); font-weight: 700; font-size: 10px; padding: 2px 8px; border-radius: 10px;">❌ FAILED</span>'
+                callout_html = f'<div style="margin-top: 6px; padding: 6px 10px; background: rgba(243, 139, 168, 0.1); border-left: 3px solid #f38ba8; border-radius: 4px; font-size: 12px; color: #f38ba8;">❌ Error Reason: {err_msg or "Download interrupted or network failure."}</div>'
+            else:
+                # Cancelled / Skipped
+                badge_html = '<span style="background: rgba(249, 226, 175, 0.15); color: #f9e2af; border: 1px solid rgba(249, 226, 175, 0.4); font-weight: 700; font-size: 10px; padding: 2px 8px; border-radius: 10px;">⚠️ CANCELLED</span>'
+                callout_html = f'<div style="margin-top: 6px; padding: 6px 10px; background: rgba(249, 226, 175, 0.1); border-left: 3px solid #f9e2af; border-radius: 4px; font-size: 12px; color: #f9e2af;">⚠️ Reason: {err_msg or "Cancelled by user."}</div>'
+
+            html_parts.append(f"""
+            <div style="background: #181825; border: 1px solid #313244; border-radius: 8px; padding: 10px 14px; margin-bottom: 4px;">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <div style="font-size: 13px; color: #cdd6f4; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 75%;">
+                        {badge_icon} #{i_id}: {title}
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        {badge_html}
+                        <button onclick="window.cancelTask('download_queue', {i_id})" title="Dismiss from list" style="background: transparent; color: #6c7086; border: 1px solid #313244; border-radius: 4px; padding: 2px 6px; font-size: 10px; cursor: pointer;">
+                            ✕
+                        </button>
+                    </div>
+                </div>
+                {callout_html}
+            </div>
+            """)
 
     html_parts.append('</div>')
     return "\n".join(html_parts)
 
 def render_refine_queue_html() -> str:
-    """Renders persistent refining queue from queue.db, active GPU chunk progress, and reordering."""
+    """Renders persistent refining queue from queue.db, active GPU chunk progress, and full history."""
     db_items = database.get_refine_queue()
 
     with _refine_lock:
@@ -147,7 +178,7 @@ def render_refine_queue_html() -> str:
 
     active_jobs = [it for it in db_items if it.get("status") == "refining"]
     pending_jobs = [it for it in db_items if it.get("status") == "pending"]
-    completed_jobs = [it for it in db_items if it.get("status") == "completed"]
+    history_jobs = [it for it in db_items if it.get("status") in ["completed", "failed", "cancelled"]]
 
     html_parts = ['<div style="display: flex; flex-direction: column; gap: 16px; font-family: system-ui, -apple-system, sans-serif;">']
 
@@ -164,12 +195,18 @@ def render_refine_queue_html() -> str:
             j_id = job["id"]
             m_task = active_mem.get(j_id, {})
             pct = m_task.get("convert_pct", job.get("convert_pct", 0.0))
+            chunks = m_task.get("chunk_status", {})
+            if chunks:
+                total_curr = sum(c.get("curr_sec", 0.0) for c in chunks.values())
+                total_dur = sum(c.get("dur_sec", 1.0) for c in chunks.values())
+                if total_dur > 0:
+                    pct = max(pct, min(99.9, (total_curr / total_dur) * 100.0))
+
             cfg = job.get("refining_config", {})
             res_tag = cfg.get("res_preset", "480p").split()[0]
             v_codec = "H.265" if "265" in cfg.get("video_codec", "H.265") else "H.264"
             cont = cfg.get("container_format", "mkv").upper()
             title = html.escape(job.get("title", "Media"))
-            chunks = m_task.get("chunk_status", {})
 
             html_parts.append(f"""
             <div id="refine-card-{j_id}" style="background: #1e1e2e; border: 1px solid #cba6f7; border-radius: 10px; padding: 16px 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.3);">
@@ -184,7 +221,7 @@ def render_refine_queue_html() -> str:
                         <span style="background: #38234a; color: #cba6f7; border: 1px solid #cba6f7; font-weight: 600; font-size: 11px; padding: 2px 10px; border-radius: 12px;">
                             Refining
                         </span>
-                        <button onclick="window.cancelTask({j_id})" title="Cancel and abort" style="background: rgba(243, 139, 168, 0.15); color: #f38ba8; border: 1px solid rgba(243, 139, 168, 0.4); font-weight: 600; font-size: 11px; padding: 3px 8px; border-radius: 6px; cursor: pointer;">
+                        <button onclick="window.cancelTask('refine_queue', {j_id})" title="Cancel and abort" style="background: rgba(243, 139, 168, 0.15); color: #f38ba8; border: 1px solid rgba(243, 139, 168, 0.4); font-weight: 600; font-size: 11px; padding: 3px 8px; border-radius: 6px; cursor: pointer;">
                             ✕ Cancel
                         </button>
                     </div>
@@ -207,11 +244,10 @@ def render_refine_queue_html() -> str:
                 for c_idx, c_st in sorted(chunks.items()):
                     c_pct = c_st.get("pct", 0.0)
                     c_spd = c_st.get("speed", "--")
-                    c_stat = c_st.get("status", "Queued")
                     html_parts.append(f"""
                         <div style="background: #11111b; border: 1px solid #313244; border-radius: 6px; padding: 4px 8px;">
                             <div style="display: flex; justify-content: space-between; font-size: 10px; color: #a6adc8; margin-bottom: 2px;">
-                                <span>Slice #{int(c_idx) + 1}</span>
+                                <span>Slice #{int(c_idx) + 1} ({c_spd})</span>
                                 <span>{c_pct:.0f}%</span>
                             </div>
                             <div style="background: #313244; border-radius: 3px; height: 4px; width: 100%; overflow: hidden;">
@@ -256,31 +292,67 @@ def render_refine_queue_html() -> str:
                     <button onclick="window.moveQueueItem('refine_queue', {j_id}, 'down')" title="Move Down in Refining Queue" style="background: #313244; color: #cdd6f4; border: 1px solid #45475a; border-radius: 4px; padding: 3px 8px; font-size: 11px; cursor: pointer;">
                         ⬇️ Down
                     </button>
-                    <button onclick="window.cancelTask({j_id})" title="Remove from refining queue" style="background: rgba(243, 139, 168, 0.1); color: #f38ba8; border: 1px solid rgba(243, 139, 168, 0.3); border-radius: 4px; padding: 3px 8px; font-size: 11px; cursor: pointer;">
+                    <button onclick="window.cancelTask('refine_queue', {j_id})" title="Remove from refining queue" style="background: rgba(243, 139, 168, 0.1); color: #f38ba8; border: 1px solid rgba(243, 139, 168, 0.3); border-radius: 4px; padding: 3px 8px; font-size: 11px; cursor: pointer;">
                         ✕
                     </button>
                 </div>
             </div>
             """)
 
-    # 3. Completed Summary
-    if completed_jobs:
-        html_parts.append(f"""
-        <div style="font-size: 12px; color: #a6e3a1; margin-top: 8px; text-align: right;">
-            ✨ Total Refined & Staged: <b>{len(completed_jobs)}</b> video(s)
-        </div>
-        """)
+    # 3. History: Completed, Failed with reason, Cancelled with reason
+    if history_jobs:
+        html_parts.append('<div style="font-weight: 700; font-size: 14px; color: #a6adc8; display: flex; align-items: center; gap: 8px; margin-top: 14px;">📜 Refined & Processed History (' + str(len(history_jobs)) + ')</div>')
+        for job in history_jobs:
+            j_id = job["id"]
+            title = html.escape(job.get("title", "Media"))
+            st = job.get("status", "completed").lower()
+            err_msg = html.escape((job.get("error_msg") or "").strip())
+            m_type = job.get("media_type", "other")
+            badge_icon = "🎬" if m_type == "movie" else ("📺" if m_type == "tv_series" else "📁")
+
+            if st == "completed":
+                f_size = job.get("final_size_mb", 0.0)
+                dest = html.escape(os.path.basename(job.get("target_refined_path", "") or "Google Drive"))
+                badge_html = '<span style="background: rgba(166, 227, 161, 0.15); color: #a6e3a1; border: 1px solid rgba(166, 227, 161, 0.4); font-weight: 700; font-size: 10px; padding: 2px 8px; border-radius: 10px;">✨ REFINED</span>'
+                callout_html = f'<div style="font-size: 12px; color: #a6adc8; margin-top: 4px;">Saved: <b>{dest}</b> ({f_size:.1f} MB) • Raw Drive file unlinked via trash bypass.</div>'
+            elif st == "failed":
+                badge_html = '<span style="background: rgba(243, 139, 168, 0.15); color: #f38ba8; border: 1px solid rgba(243, 139, 168, 0.4); font-weight: 700; font-size: 10px; padding: 2px 8px; border-radius: 10px;">❌ FAILED</span>'
+                callout_html = f'<div style="margin-top: 6px; padding: 6px 10px; background: rgba(243, 139, 168, 0.1); border-left: 3px solid #f38ba8; border-radius: 4px; font-size: 12px; color: #f38ba8;">❌ Error Reason: {err_msg or "Refining transcode failed."}</div>'
+            else:
+                badge_html = '<span style="background: rgba(249, 226, 175, 0.15); color: #f9e2af; border: 1px solid rgba(249, 226, 175, 0.4); font-weight: 700; font-size: 10px; padding: 2px 8px; border-radius: 10px;">⚠️ CANCELLED</span>'
+                callout_html = f'<div style="margin-top: 6px; padding: 6px 10px; background: rgba(249, 226, 175, 0.1); border-left: 3px solid #f9e2af; border-radius: 4px; font-size: 12px; color: #f9e2af;">⚠️ Reason: {err_msg or "Cancelled by user."}</div>'
+
+            html_parts.append(f"""
+            <div style="background: #181825; border: 1px solid #313244; border-radius: 8px; padding: 10px 14px; margin-bottom: 4px;">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <div style="font-size: 13px; color: #cdd6f4; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 75%;">
+                        {badge_icon} #{j_id}: {title}
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        {badge_html}
+                        <button onclick="window.cancelTask('refine_queue', {j_id})" title="Dismiss from list" style="background: transparent; color: #6c7086; border: 1px solid #313244; border-radius: 4px; padding: 2px 6px; font-size: 10px; cursor: pointer;">
+                            ✕
+                        </button>
+                    </div>
+                </div>
+                {callout_html}
+            </div>
+            """)
 
     html_parts.append('</div>')
     return "\n".join(html_parts)
 
 def render_catalog_html() -> str:
-    """Renders real-time media catalog from drive/downloader/data/metadata.json."""
+    """Renders real-time media catalog from drive/downloader/data/metadata.json in strict ascending numerical order."""
     data = metadata_manager.load_metadata()
 
     movies = data.get("movies", [])
     tv_shows = data.get("tvseris", [])
     other = data.get("other", [])
+
+    def _extract_num(key_str: Any) -> int:
+        m = re.search(r'\d+', str(key_str))
+        return int(m.group(0)) if m else 999999
 
     html_parts = ['<div style="display: flex; flex-direction: column; gap: 20px; font-family: system-ui, -apple-system, sans-serif;">']
 
@@ -311,12 +383,12 @@ def render_catalog_html() -> str:
             </div>
             """)
 
-    # Section 2: TV Series
+    # Section 2: TV Series (Strictly ascending Season and Episode numbers)
     html_parts.append(f'<div style="font-weight: 700; font-size: 16px; color: #89b4fa; display: flex; align-items: center; gap: 8px; margin-top: 10px;">📺 TV Series ({len(tv_shows)})</div>')
     if not tv_shows:
         html_parts.append('<div style="background: #181825; border: 1px dashed #313244; border-radius: 8px; padding: 12px; color: #6c7086; font-size: 13px;">No TV series recorded yet.</div>')
     else:
-        for s in tv_shows:
+        for s in sorted(tv_shows, key=lambda x: str(x.get("name", "")).lower()):
             show_name = html.escape(s.get("name", "Show"))
             seasons = s.get("seasons", {})
             total_eps = sum(len(eps) for eps in seasons.values())
@@ -327,12 +399,19 @@ def render_catalog_html() -> str:
                     📺 {show_name} <span style="font-size: 12px; color: #7f849c; font-weight: 400;">({total_eps} episode(s) tracked)</span>
                 </div>
             """)
-            for s_key, eps in seasons.items():
+            # Sort seasons in ascending order: Season 1, Season 2...
+            sorted_seasons = sorted(seasons.items(), key=lambda item: _extract_num(item[0]))
+            for s_key, eps in sorted_seasons:
                 s_label = s_key.replace("_", " ").title()
                 html_parts.append(f'<div style="font-size: 12px; font-weight: 600; color: #89b4fa; margin: 6px 0 4px 8px;">• {s_label}:</div>')
-                for ep_key, ep_data in eps.items():
-                    ep_name = html.escape(ep_data.get("name", ep_key))
-                    st = ep_data.get("status", "raw")
+                # Sort episodes in ascending order: Episode 1, Episode 2...
+                sorted_eps = sorted(
+                    eps.items(),
+                    key=lambda item: item[1].get("episode", _extract_num(item[0])) if isinstance(item[1], dict) and item[1].get("episode") is not None else _extract_num(item[0])
+                )
+                for ep_key, ep_data in sorted_eps:
+                    ep_name = html.escape(ep_data.get("name", ep_key) if isinstance(ep_data, dict) else str(ep_key))
+                    st = ep_data.get("status", "raw") if isinstance(ep_data, dict) else "raw"
                     is_ref = (st == "refined")
                     badge_bg = "#1e382b" if is_ref else "#3e3b24"
                     badge_fg = "#a6e3a1" if is_ref else "#f9e2af"
@@ -379,34 +458,59 @@ def create_ui():
     .panel-box { background: #161622 !important; border: 1px solid #2a2b3d !important; border-radius: 12px !important; padding: 16px !important; }
     .primary-btn { background: linear-gradient(135deg, #89b4fa, #b4befe) !important; color: #11111b !important; font-weight: 700 !important; border: none !important; border-radius: 8px !important; }
     .accent-btn { background: linear-gradient(135deg, #cba6f7, #f5c2e7) !important; color: #11111b !important; font-weight: 700 !important; border: none !important; border-radius: 8px !important; }
+    .hidden-action-component { position: fixed !important; left: -9999px !important; top: -9999px !important; width: 1px !important; height: 1px !important; opacity: 0.001 !important; pointer-events: none !important; z-index: -9999 !important; }
     """
 
     client_js = """
     <script>
-    window.cancelTask = function(taskId) {
-        fetch('/api/task/' + taskId + '/cancel', { method: 'POST' })
-            .then(r => r.json())
-            .then(data => {
-                const dlCard = document.getElementById('dl-card-' + taskId);
-                if (dlCard) dlCard.remove();
-                const rfCard = document.getElementById('refine-card-' + taskId);
-                if (rfCard) rfCard.remove();
-            })
-            .catch(err => console.error(err));
+    window.queueAction = function(action, table, id, direction) {
+        try {
+            const payload = JSON.stringify({ action: action, table: table || '', id: id, direction: direction || 'up' });
+            
+            // 1. Dispatch via native Gradio component in DOM
+            const inp = document.querySelector('#queue_action_input textarea') || 
+                        document.querySelector('#queue_action_input input');
+            const btn = document.querySelector('#queue_action_btn');
+            if (inp && btn) {
+                inp.value = payload;
+                inp.dispatchEvent(new Event('input', { bubbles: true }));
+                btn.click();
+            }
+        } catch(err) {
+            console.error("[QueueAction] DOM dispatch error:", err);
+        }
+
+        // 2. Dual fallback to HTTP API endpoint
+        try {
+            if (action === 'move') {
+                fetch('/api/queue/move/' + table + '/' + id + '/' + (direction || 'up'), { method: 'POST' }).catch(e => {});
+            } else if (action === 'cancel') {
+                const ep = table ? ('/api/task/' + id + '/cancel?table=' + table) : ('/api/task/' + id + '/cancel');
+                fetch(ep, { method: 'POST' }).catch(e => {});
+            }
+        } catch(e) {}
     };
 
-    window.moveQueueItem = function(tableName, itemId, direction) {
-        fetch('/api/queue/move/' + tableName + '/' + itemId + '/' + direction, { method: 'POST' })
-            .then(r => r.json())
-            .then(data => {
-                // UI timer refreshes queue smoothly
-            })
-            .catch(err => console.error(err));
+    window.cancelTask = function(tableOrId, maybeId) {
+        let table = '';
+        let id = tableOrId;
+        if (maybeId !== undefined) {
+            table = tableOrId;
+            id = maybeId;
+        }
+        window.queueAction('cancel', table, id, '');
+    };
+
+    window.moveQueueItem = function(table, id, direction) {
+        window.queueAction('move', table, id, direction);
     };
     </script>
     """
 
     with gr.Blocks(title="Google Drive Video Downloader & GPU Refiner", theme=gr.themes.Default(), css=custom_css, head=client_js) as demo:
+        # Native hidden elements for instant, iframe-immune reordering & cancellation
+        queue_action_input = gr.Textbox(elem_id="queue_action_input", elem_classes=["hidden-action-component"], label="ActionInput")
+        queue_action_btn = gr.Button(elem_id="queue_action_btn", elem_classes=["hidden-action-component"])
         # Title & System Header
         gr.Markdown(
             """
@@ -660,6 +764,31 @@ def create_ui():
         btn_refresh_refine_queue.click(fn=render_refine_queue_html, outputs=[refine_queue_html])
         btn_refresh_catalog.click(fn=render_catalog_html, outputs=[catalog_html_component])
 
+        # Native Queue Reordering & Cancellation Handler (Dual Gradio DOM + API mechanism)
+        def handle_queue_action(action_str: str):
+            if not action_str:
+                return render_download_queue_html(), render_refine_queue_html()
+            try:
+                data = json.loads(action_str)
+                action = data.get("action")
+                table = data.get("table", "")
+                item_id = int(data.get("id", 0))
+                direction = data.get("direction", "up")
+
+                if action == "move" and item_id > 0 and table:
+                    database.move_queue_item(table, item_id, direction)
+                elif action == "cancel" and item_id > 0:
+                    cancel_task_by_id(item_id, table_name=table if table else None)
+            except Exception as e:
+                print(f"[QueueAction] Handler error: {e}")
+            return render_download_queue_html(), render_refine_queue_html()
+
+        queue_action_btn.click(
+            fn=handle_queue_action,
+            inputs=[queue_action_input],
+            outputs=[download_queue_html, refine_queue_html]
+        )
+
         # 1. Queue Direct Items
         def handle_queue_direct(urls_text, title_override, d_conn, debrid_p, debrid_k, res_p, v_cod, cont, aud_p, workers, crf_v):
             if not urls_text.strip():
@@ -809,57 +938,24 @@ def create_ui():
                     "container_format": str(cont).lower(),
                     "audio_preset": str(aud_p),
                     "crf_val": int(crf_v),
-                    "parallel_workers": int(workers)
+                    "parallel_workers": int(workers),
+                    "download_connections": int(d_conn),
+                    "torrent_file_index": f.get("index", 1),
+                    "target_file_index": f.get("index", 1),
+                    "torrent_filename": f.get("filename"),
+                    "rel_folder": f.get("folder", "Root")
                 }
 
-                with tasks_lock:
-                    config.task_counter += 1
-                    t_id = config.task_counter
+                database.enqueue_download({
+                    "title": sanitize_filename(f["filename_clean"]),
+                    "url": source_url,
+                    "source_type": "torrent",
+                    "refining_config": refining_cfg
+                })
+                count += 1
 
-                    db_id = database.enqueue_download({
-                        "title": sanitize_filename(f["filename_clean"]),
-                        "url": source_url,
-                        "source_type": "torrent",
-                        "refining_config": refining_cfg
-                    })
-
-                    new_task = {
-                        "id": t_id,
-                        "db_id": db_id,
-                        "url": source_url,
-                        "title": sanitize_filename(f["filename_clean"]),
-                        "has_custom_title": True,
-                        "is_torrent_file": True if meta.get("cached_file_path") else False,
-                        "torrent_name": torrent_name,
-                        "rel_folder": f.get("folder", "Root"),
-                        "target_file_index": f.get("index", 1),
-                        "debrid_provider": str(debrid_p),
-                        "debrid_key": (str(debrid_k) or "").strip(),
-                        "download_connections": int(d_conn),
-                        "parallel_workers": int(workers),
-                        "res_preset": str(res_p),
-                        "video_codec": str(v_cod),
-                        "container_format": str(cont).lower(),
-                        "audio_preset": str(aud_p),
-                        "crf_val": int(crf_v),
-                        "status": "Queued for Download",
-                        "download_pct": 0.0,
-                        "download_speed": "--",
-                        "downloaded_str": "0 MB",
-                        "total_str": f.get("size_str", "Unknown"),
-                        "convert_pct": 0.0,
-                        "raw_size_mb": 0.0,
-                        "final_size_mb": 0.0,
-                        "chunk_status": {},
-                        "error_msg": "",
-                        "cancelled": False,
-                        "active_proc": None,
-                        "active_procs": []
-                    }
-                    config.tasks.append(new_task)
-                    from pipeline import run_download_pipeline
-                    threading.Thread(target=run_download_pipeline, args=(new_task,), daemon=True).start()
-                    count += 1
+            from pipeline import ensure_daemons_running
+            ensure_daemons_running()
 
             msg = f"✅ Ingested {count} video(s) from '{torrent_name}' into Download Queue!"
             return msg, render_download_queue_html(), gr.Tabs(selected="tab_queue")
@@ -1169,8 +1265,8 @@ def create_ui():
     # Attach FastAPI endpoints for real-time cancel and reordering
     @demo.app.post("/api/task/{task_id}/cancel")
     @demo.app.get("/api/task/{task_id}/cancel")
-    def api_cancel_task(task_id: int):
-        cancelled = cancel_task_by_id(task_id)
+    def api_cancel_task(task_id: int, table: Optional[str] = None):
+        cancelled = cancel_task_by_id(task_id, table_name=table)
         return {"status": "ok", "task_id": task_id, "cancelled": cancelled}
 
     @demo.app.post("/api/queue/move/{table_name}/{item_id}/{direction}")
