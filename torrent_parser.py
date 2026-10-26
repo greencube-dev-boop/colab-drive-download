@@ -163,10 +163,17 @@ def fetch_torrent_metadata(source: str) -> Dict[str, Any]:
         xt_match = re.search(r'urn:btih:([a-zA-Z0-9]+)', source, re.I)
         if not xt_match:
             raise ValueError("Invalid magnet link: missing 'urn:btih:' hash.")
-        btih = xt_match.group(1).upper()
-        cache_path = os.path.join(meta_cache_dir, f"{btih}.torrent")
+        btih = xt_match.group(1)
+        cache_path_upper = os.path.join(meta_cache_dir, f"{btih.upper()}.torrent")
+        cache_path_lower = os.path.join(meta_cache_dir, f"{btih.lower()}.torrent")
 
-        if os.path.isfile(cache_path) and os.path.getsize(cache_path) > 100:
+        cache_path = None
+        for cand in [cache_path_lower, cache_path_upper]:
+            if os.path.isfile(cand) and os.path.getsize(cand) > 100:
+                cache_path = cand
+                break
+
+        if cache_path:
             with open(cache_path, "rb") as f:
                 data = f.read()
             res = parse_torrent_bytes(data)
@@ -175,17 +182,17 @@ def fetch_torrent_metadata(source: str) -> Dict[str, Any]:
             return res
 
         # Attempt online torrent cache download (itorrents.org)
-        itorrents_url = f"https://itorrents.org/torrent/{btih}.torrent"
+        itorrents_url = f"https://itorrents.org/torrent/{btih.upper()}.torrent"
         try:
             req = urllib.request.Request(itorrents_url, headers={'User-Agent': 'Mozilla/5.0'})
             with urllib.request.urlopen(req, timeout=6) as resp:
                 if resp.status == 200:
                     data = resp.read()
                     if b"d8:announce" in data or b"4:info" in data:
-                        with open(cache_path, "wb") as f:
+                        with open(cache_path_lower, "wb") as f:
                             f.write(data)
                         res = parse_torrent_bytes(data)
-                        res["cached_file_path"] = cache_path
+                        res["cached_file_path"] = cache_path_lower
                         res["source_url"] = source
                         return res
         except Exception:
@@ -205,11 +212,23 @@ def fetch_torrent_metadata(source: str) -> Dict[str, Any]:
             ]
             try:
                 subprocess.run(cmd, capture_output=True, timeout=28)
-                if os.path.isfile(cache_path) and os.path.getsize(cache_path) > 100:
-                    with open(cache_path, "rb") as f:
+                found = None
+                for cand in [cache_path_lower, cache_path_upper]:
+                    if os.path.isfile(cand) and os.path.getsize(cand) > 100:
+                        found = cand
+                        break
+                if not found:
+                    for fn in os.listdir(meta_cache_dir):
+                        if fn.endswith(".torrent"):
+                            cand = os.path.join(meta_cache_dir, fn)
+                            if os.path.getsize(cand) > 100:
+                                found = cand
+                                break
+                if found:
+                    with open(found, "rb") as f:
                         data = f.read()
                     res = parse_torrent_bytes(data)
-                    res["cached_file_path"] = cache_path
+                    res["cached_file_path"] = found
                     res["source_url"] = source
                     return res
             except Exception:

@@ -393,18 +393,81 @@ class TestTwoStagePipeline(unittest.TestCase):
         id_item = database.enqueue_download({"title": "Finished Item", "url": "http://fin"})
         database.update_item_status("download_queue", id_item, status="completed")
 
-        # Dismissing it should delete it from the table
-        dismissed = pipeline.cancel_task_by_id(id_item, table_name="download_queue")
+        # Cancelling with dismiss=False does not delete completed item
+        pipeline.cancel_task_by_id(id_item, table_name="download_queue", dismiss=False)
+        self.assertIsNotNone(database.get_queue_item("download_queue", id_item))
+
+        # Explicit dismiss deletes it from the table
+        dismissed = pipeline.cancel_task_by_id(id_item, table_name="download_queue", dismiss=True)
         self.assertTrue(dismissed)
         self.assertIsNone(database.get_queue_item("download_queue", id_item))
 
-        # Cancelling an active/pending task should mark it cancelled with reason
+        # Cancelling an active/pending task should mark it cancelled with reason and keep in DB
         id_pending = database.enqueue_download({"title": "Active Pending", "url": "http://act"})
-        cancelled = pipeline.cancel_task_by_id(id_pending, table_name="download_queue")
+        cancelled = pipeline.cancel_task_by_id(id_pending, table_name="download_queue", dismiss=False)
         self.assertTrue(cancelled)
         item = database.get_queue_item("download_queue", id_pending)
         self.assertEqual(item["status"], "cancelled")
         self.assertEqual(item["error_msg"], "Cancelled by user")
+
+    def test_torrent_selective_title_preservation(self):
+        import pipeline
+        # Task representing an inspected video episode
+        task = {
+            "id": 999,
+            "db_id": 999,
+            "title": "Mentalist S01E02",
+            "url": "magnet:?xt=urn:btih:ABCDEF1234567890ABCDEF1234567890ABCDEF12&dn=The.Mentalist.Season.1.Complete",
+            "has_custom_title": True,
+            "torrent_file_index": 2,
+            "target_file_index": 2,
+            "cancelled": False
+        }
+
+        # Mock resolve_video_source and download_aria2c_torrent
+        with patch("pipeline.resolve_video_source") as mock_resolve, \
+             patch("pipeline.download_aria2c_torrent") as mock_aria:
+            mock_resolve.return_value = {
+                "url": task["url"],
+                "type": "local_torrent",
+                "title": "The.Mentalist.Season.1.Complete",
+                "headers": {}
+            }
+            fake_video = os.path.join(config.LOCAL_RAW_DIR, "fake_dl.mkv")
+            with open(fake_video, "wb") as f:
+                f.write(b"fake video data 123456")
+            mock_aria.return_value = fake_video
+
+            pipeline.download_worker(task)
+
+            # Crucial assertion: task["title"] MUST NOT be overwritten by "The.Mentalist.Season.1.Complete"
+            self.assertEqual(task["title"], "Mentalist S01E02")
+            self.assertTrue(os.path.exists(task["raw_path"]))
+            self.assertIn("Mentalist S01E02", os.path.basename(task["raw_path"]))
+
+    def test_torrent_auto_split_enqueues_individual_episodes(self):
+        import pipeline
+        magnet = "magnet:?xt=urn:btih:1111111111111111111111111111111111111111&dn=Show.Season.1"
+
+        mock_meta = {
+            "name": "Show.Season.1",
+            "cached_file_path": "/fake/cached.torrent",
+            "files": [
+                {"index": 1, "filename": "Show.S01E01.mkv", "filename_clean": "Show S01E01", "is_video": True, "folder": "Root"},
+                {"index": 2, "filename": "Show.S01E02.mkv", "filename_clean": "Show S01E02", "is_video": True, "folder": "Root"},
+                {"index": 3, "filename": "sample.mp4", "filename_clean": "sample", "is_video": False, "folder": "Root"}
+            ]
+        }
+
+        with patch("torrent_parser.fetch_torrent_metadata", return_value=mock_meta):
+            count = pipeline.queue_direct_items([(magnet, "")])
+            # Should enqueue 2 video episodes, ignoring the sample
+            self.assertEqual(count, 2)
+
+            q_items = database.get_download_queue()
+            titles = [i["title"] for i in q_items]
+            self.assertIn("Show S01E01", titles)
+            self.assertIn("Show S01E02", titles)
 
 if __name__ == "__main__":
     unittest.main()

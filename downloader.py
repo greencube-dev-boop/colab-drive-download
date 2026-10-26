@@ -11,7 +11,36 @@ except ImportError:
     requests = None
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, Optional
-from config import RAW_DIR
+import config
+from config import RAW_DIR, LOCAL_RAW_DIR, TEMP_DIR, tasks_lock
+
+def _kill_proc(proc: Optional[subprocess.Popen]):
+    """Forcefully terminates a subprocess and its child process tree."""
+    if not proc:
+        return
+    try:
+        proc.terminate()
+        proc.kill()
+    except Exception:
+        pass
+    try:
+        if os.name == 'nt':
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            import signal
+            try:
+                pgid = os.getpgid(proc.pid)
+                if pgid != os.getpgrp():
+                    os.killpg(pgid, signal.SIGKILL)
+                else:
+                    os.kill(proc.pid, signal.SIGKILL)
+            except Exception:
+                try:
+                    os.kill(proc.pid, signal.SIGKILL)
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 def unmask_ts(d: bytes) -> bytes:
     """Strips PNG camouflage prefix used by video CDN hosts."""
@@ -348,32 +377,10 @@ def download_aria2c_or_requests(url: str, raw_path: str, task: Dict[str, Any]):
 def download_aria2c_torrent(magnet_url: str, task: Dict[str, Any]) -> str:
     """
     Direct BitTorrent downloader using aria2c with DHT, active public trackers,
-    pre-fetched metadata cache, and zero seeding limit.
+    pre-fetched metadata cache, zero seeding limit, and selective file support.
     """
-    raw_dir = os.path.join(RAW_DIR, f"task_{task['id']}_torrent")
+    raw_dir = os.path.join(LOCAL_RAW_DIR, f"task_{task['id']}_torrent")
     os.makedirs(raw_dir, exist_ok=True)
-
-    target_torrent = magnet_url
-    if task.get("torrent_cached_path") and os.path.isfile(task["torrent_cached_path"]):
-        target_torrent = task["torrent_cached_path"]
-        task["download_speed"] = "Loading pre-cached metadata..."
-    elif magnet_url.startswith("magnet:?"):
-        m_hash = re.search(r'urn:btih:([a-fA-F0-9]{40}|[a-zA-Z2-7]{32})', magnet_url)
-        if m_hash:
-            info_hash = m_hash.group(1).upper()
-            cache_path = os.path.join(raw_dir, "metadata.torrent")
-            try:
-                creq = urllib.request.Request(f"https://itorrents.org/torrent/{info_hash}.torrent", headers={'User-Agent': 'Mozilla/5.0'})
-                with urllib.request.urlopen(creq, timeout=3) as c_resp:
-                    if c_resp.status == 200:
-                        c_bytes = c_resp.read()
-                        if len(c_bytes) > 200:
-                            with open(cache_path, 'wb') as cf:
-                                cf.write(c_bytes)
-                            target_torrent = cache_path
-                            task["download_speed"] = "Metadata resolved from cache!"
-            except Exception:
-                pass
 
     trackers = [
         "udp://tracker.opentrackr.org:1337/announce",
@@ -388,6 +395,109 @@ def download_aria2c_torrent(magnet_url: str, task: Dict[str, Any]) -> str:
         "udp://tracker.tiny-vps.com:6969/announce"
     ]
 
+    f_idx = task.get("torrent_file_index") or task.get("target_file_index")
+    target_torrent = magnet_url
+
+    # Check 1: pre-cached metadata path in task
+    if task.get("torrent_cached_path") and os.path.isfile(task["torrent_cached_path"]) and os.path.getsize(task["torrent_cached_path"]) > 100:
+        target_torrent = task["torrent_cached_path"]
+        task["download_speed"] = "Loading pre-cached metadata..."
+    elif target_torrent.startswith("magnet:?"):
+        m_hash = re.search(r'urn:btih:([a-fA-F0-9]{40}|[a-zA-Z2-7]{32})', target_torrent, re.I)
+        btih = m_hash.group(1) if m_hash else ""
+        meta_cache_dir = os.path.join(TEMP_DIR, "torrent_meta")
+        os.makedirs(meta_cache_dir, exist_ok=True)
+
+        found_torrent = None
+        # Check cache directory for existing .torrent
+        for cand_name in [f"{btih.upper()}.torrent", f"{btih.lower()}.torrent", "metadata.torrent"]:
+            cand_p = os.path.join(meta_cache_dir, cand_name)
+            if os.path.isfile(cand_p) and os.path.getsize(cand_p) > 100:
+                found_torrent = cand_p
+                break
+
+        # Check online cache (itorrents.org)
+        if not found_torrent and btih:
+            try:
+                creq = urllib.request.Request(f"https://itorrents.org/torrent/{btih.upper()}.torrent", headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(creq, timeout=3) as c_resp:
+                    if c_resp.status == 200:
+                        c_bytes = c_resp.read()
+                        if len(c_bytes) > 200 and (b"d8:announce" in c_bytes or b"4:info" in c_bytes):
+                            out_p = os.path.join(meta_cache_dir, f"{btih.lower()}.torrent")
+                            with open(out_p, "wb") as cf:
+                                cf.write(c_bytes)
+                            found_torrent = out_p
+            except Exception:
+                pass
+
+        # If selective downloading is requested on a magnet, aria2c requires a .torrent file
+        if not found_torrent and f_idx:
+            task["download_speed"] = "Resolving torrent metadata for selective file..."
+            meta_cmd = [
+                "aria2c",
+                "--bt-metadata-only=true",
+                "--bt-save-metadata=true",
+                f"--dir={meta_cache_dir}",
+                "--seed-time=0",
+                "--enable-dht=true",
+                "--dht-entry-point=router.bittorrent.com:6881",
+                "--dht-entry-point6=dht.transmissionbt.com:6881",
+                "--bt-enable-lpd=true",
+                "--bt-max-peers=80",
+                "--bt-tracker=" + ",".join(trackers),
+                "--bt-stop-timeout=35",
+                "--summary-interval=1",
+                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                target_torrent
+            ]
+            popen_meta_kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT, "text": True, "bufsize": 1}
+            if os.name != 'nt':
+                popen_meta_kwargs["start_new_session"] = True
+            try:
+                m_proc = subprocess.Popen(meta_cmd, **popen_meta_kwargs)
+                task["active_proc"] = m_proc
+                task.setdefault("active_procs", []).append(m_proc)
+                for m_line in m_proc.stdout:
+                    if task.get("cancelled"):
+                        _kill_proc(m_proc)
+                        return ""
+                    m_cn = re.search(r'CN:(\d+)', m_line)
+                    peers_str = f" ({m_cn.group(1)} peers)" if m_cn else ""
+                    task["download_speed"] = f"Fetching torrent metadata...{peers_str}"
+                m_proc.wait()
+            finally:
+                if task.get("cancelled") or (m_proc and m_proc.poll() is None):
+                    _kill_proc(m_proc)
+                task["active_proc"] = None
+                if m_proc in task.get("active_procs", []):
+                    task["active_procs"].remove(m_proc)
+
+            if task.get("cancelled"):
+                return ""
+
+            # Check if aria2c created the .torrent file
+            for cand_name in [f"{btih.lower()}.torrent", f"{btih.upper()}.torrent"]:
+                cand_p = os.path.join(meta_cache_dir, cand_name)
+                if os.path.isfile(cand_p) and os.path.getsize(cand_p) > 100:
+                    found_torrent = cand_p
+                    break
+
+            if not found_torrent:
+                for fn in os.listdir(meta_cache_dir):
+                    if fn.endswith(".torrent"):
+                        cand_p = os.path.join(meta_cache_dir, fn)
+                        if os.path.getsize(cand_p) > 100:
+                            found_torrent = cand_p
+                            break
+
+        if found_torrent:
+            target_torrent = found_torrent
+            task["torrent_cached_path"] = found_torrent
+
+    if f_idx and target_torrent.startswith("magnet:?"):
+        raise RuntimeError(f"Could not retrieve torrent metadata for selective file #{f_idx}. Magnet link may have no active seeders.")
+
     aria_cmd = [
         "aria2c",
         "--dir", raw_dir,
@@ -401,22 +511,30 @@ def download_aria2c_torrent(magnet_url: str, task: Dict[str, Any]) -> str:
         "--bt-tracker=" + ",".join(trackers),
         "--bt-require-crypto=false",
         "--bt-min-crypto-level=plain",
-        "--follow-torrent=mem",
-        "--bt-save-metadata=true",
         "--file-allocation=none",
         "--summary-interval=1",
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     ]
 
-    f_idx = task.get("torrent_file_index") or task.get("target_file_index")
+    if target_torrent.endswith(".torrent") or os.path.isfile(target_torrent):
+        aria_cmd.append("--follow-torrent=mem")
+    else:
+        aria_cmd.append("--follow-torrent=mem")
+        aria_cmd.append("--bt-save-metadata=true")
+
     if f_idx:
         aria_cmd.append(f"--select-file={f_idx}")
+        aria_cmd.append("--bt-remove-unselected-file=true")
 
     aria_cmd.append(target_torrent)
 
     task["download_speed"] = "Connecting to swarm..."
-    proc = subprocess.Popen(aria_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    popen_kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT, "text": True, "bufsize": 1}
+    if os.name != 'nt':
+        popen_kwargs["start_new_session"] = True
+    proc = subprocess.Popen(aria_cmd, **popen_kwargs)
     task["active_proc"] = proc
+    task.setdefault("active_procs", []).append(proc)
 
     pat_progress = re.compile(r'([\d.]+[KMGT]i?B)/([\d.]+[KMGT]i?B)\s*\((\d+)%\).*?(?:CN:(\d+))?.*?DL:([\d.]+[KMGT]i?B)')
     pat_peers = re.compile(r'CN:(\d+)')
@@ -426,8 +544,7 @@ def download_aria2c_torrent(magnet_url: str, task: Dict[str, Any]) -> str:
     try:
         for line in proc.stdout:
             if task.get("cancelled"):
-                proc.terminate()
-                proc.kill()
+                _kill_proc(proc)
                 return ""
 
             m = pat_progress.search(line)
@@ -447,7 +564,11 @@ def download_aria2c_torrent(magnet_url: str, task: Dict[str, Any]) -> str:
                     task["download_speed"] = f"Fetching metadata...{peers_str}"
         proc.wait()
     finally:
+        if task.get("cancelled") or (proc and proc.poll() is None):
+            _kill_proc(proc)
         task["active_proc"] = None
+        if proc in task.get("active_procs", []):
+            task["active_procs"].remove(proc)
 
     if task.get("cancelled"):
         return ""
@@ -463,7 +584,7 @@ def download_aria2c_torrent(magnet_url: str, task: Dict[str, Any]) -> str:
 
     for root, _, files in os.walk(raw_dir):
         for f in files:
-            if f.endswith(".aria2"):
+            if f.endswith(".aria2") or f.endswith(".torrent"):
                 continue
             fp = os.path.join(root, f)
             sz = os.path.getsize(fp)

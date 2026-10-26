@@ -157,7 +157,7 @@ def render_download_queue_html() -> str:
                     </div>
                     <div style="display: flex; align-items: center; gap: 8px;">
                         {badge_html}
-                        <button onclick="window.cancelTask('download_queue', {i_id})" title="Dismiss from list" style="background: transparent; color: #6c7086; border: 1px solid #313244; border-radius: 4px; padding: 2px 6px; font-size: 10px; cursor: pointer;">
+                        <button onclick="window.dismissTask('download_queue', {i_id})" title="Dismiss from list" style="background: transparent; color: #6c7086; border: 1px solid #313244; border-radius: 4px; padding: 2px 6px; font-size: 10px; cursor: pointer;">
                             ✕
                         </button>
                     </div>
@@ -330,7 +330,7 @@ def render_refine_queue_html() -> str:
                     </div>
                     <div style="display: flex; align-items: center; gap: 8px;">
                         {badge_html}
-                        <button onclick="window.cancelTask('refine_queue', {j_id})" title="Dismiss from list" style="background: transparent; color: #6c7086; border: 1px solid #313244; border-radius: 4px; padding: 2px 6px; font-size: 10px; cursor: pointer;">
+                        <button onclick="window.dismissTask('refine_queue', {j_id})" title="Dismiss from list" style="background: transparent; color: #6c7086; border: 1px solid #313244; border-radius: 4px; padding: 2px 6px; font-size: 10px; cursor: pointer;">
                             ✕
                         </button>
                     </div>
@@ -487,6 +487,9 @@ def create_ui():
             } else if (action === 'cancel') {
                 const ep = table ? ('/api/task/' + id + '/cancel?table=' + table) : ('/api/task/' + id + '/cancel');
                 fetch(ep, { method: 'POST' }).catch(e => {});
+            } else if (action === 'dismiss') {
+                const ep = table ? ('/api/task/' + id + '/dismiss?table=' + table) : ('/api/task/' + id + '/dismiss');
+                fetch(ep, { method: 'POST' }).catch(e => {});
             }
         } catch(e) {}
     };
@@ -499,6 +502,16 @@ def create_ui():
             id = maybeId;
         }
         window.queueAction('cancel', table, id, '');
+    };
+
+    window.dismissTask = function(tableOrId, maybeId) {
+        let table = '';
+        let id = tableOrId;
+        if (maybeId !== undefined) {
+            table = tableOrId;
+            id = maybeId;
+        }
+        window.queueAction('dismiss', table, id, '');
     };
 
     window.moveQueueItem = function(table, id, direction) {
@@ -618,7 +631,9 @@ def create_ui():
                                 scale=2
                             )
 
-                        btn_inspect_torrent = gr.Button("🔍 Inspect Torrent Files & Folder Structure", elem_classes=["accent-btn"])
+                        with gr.Row():
+                            btn_inspect_torrent = gr.Button("🔍 Inspect Torrent Files & Folder Structure", elem_classes=["accent-btn"], scale=2)
+                            btn_quick_ingest_torrent = gr.Button("⚡ Ingest All Videos (Auto-Detect)", elem_classes=["primary-btn"], scale=2)
                         torrent_action_msg = gr.Markdown(visible=False)
                         torrent_meta_state = gr.State({})
 
@@ -777,8 +792,10 @@ def create_ui():
 
                 if action == "move" and item_id > 0 and table:
                     database.move_queue_item(table, item_id, direction)
+                elif action == "dismiss" and item_id > 0 and table:
+                    cancel_task_by_id(item_id, table_name=table, dismiss=True)
                 elif action == "cancel" and item_id > 0:
-                    cancel_task_by_id(item_id, table_name=table if table else None)
+                    cancel_task_by_id(item_id, table_name=table if table else None, dismiss=False)
             except Exception as e:
                 print(f"[QueueAction] Handler error: {e}")
             return render_download_queue_html(), render_refine_queue_html()
@@ -943,7 +960,9 @@ def create_ui():
                     "torrent_file_index": f.get("index", 1),
                     "target_file_index": f.get("index", 1),
                     "torrent_filename": f.get("filename"),
-                    "rel_folder": f.get("folder", "Root")
+                    "rel_folder": f.get("folder", "Root"),
+                    "torrent_cached_path": meta.get("cached_file_path"),
+                    "has_custom_title": True
                 }
 
                 database.enqueue_download({
@@ -964,6 +983,71 @@ def create_ui():
             fn=handle_queue_torrent_videos,
             inputs=[
                 torrent_videos_checkbox, torrent_meta_state,
+                download_conn_slider, debrid_provider, debrid_api_key,
+                res_preset, v_codec, container_format, audio_preset,
+                parallel_workers_slider, crf_slider
+            ],
+            outputs=[torrent_action_msg, download_queue_html, main_tabs]
+        )
+
+        # Quick Ingest: Automatically inspects and adds all detected video files
+        def handle_quick_ingest_torrent(magnet_str, file_obj, d_conn, debrid_p, debrid_k, res_p, v_cod, cont, aud_p, workers, crf_v):
+            source = (magnet_str or "").strip()
+            if file_obj:
+                fp = extract_file_path(file_obj)
+                if fp and os.path.exists(fp):
+                    source = fp
+
+            if not source:
+                return gr.update(visible=True, value="⚠️ Please paste a magnet link or upload a .torrent file."), render_download_queue_html(), gr.update()
+
+            try:
+                meta = fetch_torrent_metadata(source)
+                vids = [f for f in meta.get("files", []) if f.get("is_video")]
+                if not vids:
+                    return gr.update(visible=True, value="⚠️ No video files detected in this torrent."), render_download_queue_html(), gr.update()
+
+                source_url = meta.get("cached_file_path") or meta.get("source_url") or source
+                torrent_name = meta.get("name", "Torrent")
+
+                count = 0
+                for f in vids:
+                    refining_cfg = {
+                        "res_preset": str(res_p),
+                        "video_codec": str(v_cod),
+                        "container_format": str(cont).lower(),
+                        "audio_preset": str(aud_p),
+                        "crf_val": int(crf_v),
+                        "parallel_workers": int(workers),
+                        "download_connections": int(d_conn),
+                        "torrent_file_index": f.get("index", 1),
+                        "target_file_index": f.get("index", 1),
+                        "torrent_filename": f.get("filename"),
+                        "rel_folder": f.get("folder", "Root"),
+                        "torrent_cached_path": meta.get("cached_file_path"),
+                        "has_custom_title": True
+                    }
+
+                    database.enqueue_download({
+                        "title": sanitize_filename(f["filename_clean"]),
+                        "url": source_url,
+                        "source_type": "torrent",
+                        "refining_config": refining_cfg
+                    })
+                    count += 1
+
+                from pipeline import ensure_daemons_running
+                ensure_daemons_running()
+
+                msg = f"✅ Auto-detected and ingested {count} video(s) from '{torrent_name}' into Download Queue!"
+                return gr.update(visible=True, value=msg), render_download_queue_html(), gr.Tabs(selected="tab_queue")
+            except Exception as e:
+                return gr.update(visible=True, value=f"❌ Error: {e}"), render_download_queue_html(), gr.update()
+
+        btn_quick_ingest_torrent.click(
+            fn=handle_quick_ingest_torrent,
+            inputs=[
+                torrent_magnet_input, torrent_file_upload,
                 download_conn_slider, debrid_provider, debrid_api_key,
                 res_preset, v_codec, container_format, audio_preset,
                 parallel_workers_slider, crf_slider
@@ -1266,8 +1350,14 @@ def create_ui():
     @demo.app.post("/api/task/{task_id}/cancel")
     @demo.app.get("/api/task/{task_id}/cancel")
     def api_cancel_task(task_id: int, table: Optional[str] = None):
-        cancelled = cancel_task_by_id(task_id, table_name=table)
+        cancelled = cancel_task_by_id(task_id, table_name=table, dismiss=False)
         return {"status": "ok", "task_id": task_id, "cancelled": cancelled}
+
+    @demo.app.post("/api/task/{task_id}/dismiss")
+    @demo.app.get("/api/task/{task_id}/dismiss")
+    def api_dismiss_task(task_id: int, table: Optional[str] = None):
+        dismissed = cancel_task_by_id(task_id, table_name=table, dismiss=True)
+        return {"status": "ok", "task_id": task_id, "dismissed": dismissed}
 
     @demo.app.post("/api/queue/move/{table_name}/{item_id}/{direction}")
     def api_move_queue(table_name: str, item_id: int, direction: str):
