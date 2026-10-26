@@ -221,6 +221,33 @@ def run_download_pipeline(task: Dict[str, Any]):
         database.update_item_status("download_queue", db_id, status="downloading")
         download_worker(task)
 
+        # 1. Check for Watchdog start timeout (90s)
+        if task.get("timed_out_start"):
+            requeued, retry_num = database.requeue_download_for_retry(db_id, max_retries=config.MAX_DOWNLOAD_START_RETRIES)
+            if requeued:
+                msg = f"Start timeout (90s): Moved to end of queue for retry ({retry_num}/3)"
+                print(f"[Pipeline] Task #{t_id} {msg}")
+                task["status"] = msg
+                task["cancelled"] = True
+            else:
+                msg = "Timeout: Failed to start after 3 attempts (no active swarm/seeds)"
+                print(f"[Pipeline] Task #{t_id} {msg}")
+                task["status"] = msg
+                task["error_msg"] = msg
+                task["cancelled"] = True
+            cleanup_task_files(t_id, task)
+            return
+
+        # 2. Check for Low Speed demote (< 100 KB/s for 120s)
+        if task.get("demote_low_speed"):
+            msg = "Demoted to Low-Speed Queue (< 100 KB/s for 120s)"
+            print(f"[Pipeline] Task #{t_id} {msg}")
+            database.demote_to_low_speed_queue(db_id, reason=msg)
+            task["status"] = msg
+            task["cancelled"] = True
+            cleanup_task_files(t_id, task)
+            return
+
         if task.get("cancelled"):
             return
 
@@ -344,7 +371,7 @@ def run_download_pipeline(task: Dict[str, Any]):
             task["error_msg"] = err_msg
             database.update_item_status("download_queue", db_id, status="failed", error_msg=err_msg)
     finally:
-        if task.get("cancelled"):
+        if task.get("cancelled") and not task.get("timed_out_start") and not task.get("demote_low_speed"):
             if not str(task.get("status", "")).startswith("Cancelled") and not str(task.get("status", "")).startswith("Skipped"):
                 task["status"] = "Cancelled"
             database.update_item_status("download_queue", db_id, status="cancelled", error_msg=task.get("status") or "Cancelled by user")
@@ -353,10 +380,11 @@ def run_download_pipeline(task: Dict[str, Any]):
 # ---------------------------------------------------------------------
 # Dedicated Download Worker & Queue-Driven Daemon
 # ---------------------------------------------------------------------
-def _download_job_worker(job: Dict[str, Any]):
+def _download_job_worker(job: Dict[str, Any], is_low_speed: bool = False):
     """Processes a claimed download job and releases download semaphore upon completion."""
     job_id = job["id"]
     cfg = job.get("refining_config", {})
+    job_is_low = bool(job.get("is_low_speed") or is_low_speed)
 
     task: Dict[str, Any] = {
         "id": job_id,
@@ -364,6 +392,8 @@ def _download_job_worker(job: Dict[str, Any]):
         "title": job.get("title", "Download"),
         "url": job.get("url", ""),
         "source_type": job.get("source_type", "direct"),
+        "is_low_speed": job_is_low,
+        "retry_count": job.get("retry_count", 0),
         "has_custom_title": bool(job.get("has_custom_title", False) or cfg.get("has_custom_title", False) or job.get("torrent_file_index") or cfg.get("torrent_file_index")),
         "torrent_cached_path": cfg.get("torrent_cached_path") or job.get("torrent_cached_path"),
         "raw_path": "",
@@ -399,27 +429,57 @@ def _download_job_worker(job: Dict[str, Any]):
     finally:
         with _dl_lock:
             _active_download_tasks.pop(job_id, None)
-        download_semaphore.release()
+        if job_is_low:
+            config.low_speed_download_semaphore.release()
+        else:
+            config.download_semaphore.release()
 
 def _download_daemon_loop():
-    """Continuous background loop strictly executing download jobs in order_idx ASC sequence."""
+    """Continuous background loop strictly executing high-speed download jobs in order_idx ASC sequence."""
     while True:
-        acquired = download_semaphore.acquire(blocking=False)
+        if not getattr(config, "download_worker_active", True):
+            time.sleep(0.5)
+            continue
+        acquired = config.download_semaphore.acquire(blocking=False)
         if not acquired:
             time.sleep(1.0)
             continue
 
         try:
-            job = database.claim_next_download_job()
+            job = database.claim_next_download_job(is_low_speed=False)
             if job:
-                t = threading.Thread(target=_download_job_worker, args=(job,), daemon=True)
+                t = threading.Thread(target=_download_job_worker, args=(job, False), daemon=True)
                 t.start()
             else:
-                download_semaphore.release()
+                config.download_semaphore.release()
                 time.sleep(1.5)
         except Exception as e:
             print(f"[DownloadDaemon] Loop exception: {e}")
-            download_semaphore.release()
+            config.download_semaphore.release()
+            time.sleep(2.0)
+
+def _low_speed_download_daemon_loop():
+    """Continuous background loop executing slow-lane trickle downloads without blocking the high-speed queue."""
+    while True:
+        if not getattr(config, "download_worker_active", True):
+            time.sleep(0.5)
+            continue
+        acquired = config.low_speed_download_semaphore.acquire(blocking=False)
+        if not acquired:
+            time.sleep(1.0)
+            continue
+
+        try:
+            job = database.claim_next_download_job(is_low_speed=True)
+            if job:
+                t = threading.Thread(target=_download_job_worker, args=(job, True), daemon=True)
+                t.start()
+            else:
+                config.low_speed_download_semaphore.release()
+                time.sleep(2.0)
+        except Exception as e:
+            print(f"[LowSpeedDaemon] Loop exception: {e}")
+            config.low_speed_download_semaphore.release()
             time.sleep(2.0)
 
 # ---------------------------------------------------------------------
@@ -550,6 +610,7 @@ def ensure_daemons_running():
     if not _daemons_started:
         _daemons_started = True
         threading.Thread(target=_download_daemon_loop, daemon=True, name="DownloadDaemon").start()
+        threading.Thread(target=_low_speed_download_daemon_loop, daemon=True, name="LowSpeedDownloadDaemon").start()
         threading.Thread(target=_refine_daemon_loop, daemon=True, name="RefineDaemon").start()
 
 def queue_direct_items(

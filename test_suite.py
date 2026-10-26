@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import json
 import unittest
 import tempfile
@@ -15,11 +16,13 @@ import metadata_manager
 import classifier
 from torrent_parser import format_torrent_size, bdecode, parse_torrent_bytes
 from media_search import search_media_imdb, get_tv_seasons_data
+from downloader import DownloadWatchdog, parse_speed_to_bps, parse_size_to_bytes
 import ui
 
 class TestTwoStagePipeline(unittest.TestCase):
 
     def setUp(self):
+        config.download_worker_active = False
         config.refine_worker_active = False
         self.test_dir = tempfile.mkdtemp()
         self.orig_downloader = config.DOWNLOADER_DIR
@@ -53,6 +56,7 @@ class TestTwoStagePipeline(unittest.TestCase):
         database.init_db()
 
     def tearDown(self):
+        config.download_worker_active = False
         config.refine_worker_active = False
         config.DOWNLOADER_DIR = self.orig_downloader
         config.RAW_DIR = self.orig_raw
@@ -468,6 +472,134 @@ class TestTwoStagePipeline(unittest.TestCase):
             titles = [i["title"] for i in q_items]
             self.assertIn("Show S01E01", titles)
             self.assertIn("Show S01E02", titles)
+
+    def test_download_start_timeout_requeue_and_fail(self):
+        # 1. Enqueue job 1 and job 2
+        id1 = database.enqueue_download({"title": "Timeout Movie 1", "url": "http://slow1"})
+        id2 = database.enqueue_download({"title": "Upcoming Movie 2", "url": "http://slow2"})
+
+        q = database.get_download_queue()
+        self.assertEqual(len(q), 2)
+        self.assertEqual(q[0]["id"], id1)
+        self.assertEqual(q[0]["retry_count"], 0)
+
+        # Retry 1: requeue id1
+        requeued, retry_num = database.requeue_download_for_retry(id1, max_retries=2)
+        self.assertTrue(requeued)
+        self.assertEqual(retry_num, 1)
+
+        # Confirm id1 moved to the END of the queue, after id2
+        q1 = database.get_download_queue()
+        self.assertEqual(q1[0]["id"], id2)
+        self.assertEqual(q1[1]["id"], id1)
+        self.assertEqual(q1[1]["retry_count"], 1)
+        self.assertEqual(q1[1]["status"], "pending")
+
+        # Retry 2: requeue id1 again
+        requeued2, retry_num2 = database.requeue_download_for_retry(id1, max_retries=2)
+        self.assertTrue(requeued2)
+        self.assertEqual(retry_num2, 2)
+        item1 = database.get_queue_item("download_queue", id1)
+        self.assertEqual(item1["retry_count"], 2)
+        self.assertEqual(item1["status"], "pending")
+
+        # Retry 3: 3rd attempt exceeds max_retries=2 -> must fail
+        requeued3, retry_num3 = database.requeue_download_for_retry(id1, max_retries=2)
+        self.assertFalse(requeued3)
+        self.assertEqual(retry_num3, 3)
+
+        item1_failed = database.get_queue_item("download_queue", id1)
+        self.assertEqual(item1_failed["status"], "failed")
+        self.assertIn("3 attempts", item1_failed["error_msg"])
+
+    def test_low_speed_demote_and_dual_queue_lanes(self):
+        # 1. Enqueue 2 high-speed jobs
+        id_fast = database.enqueue_download({"title": "Fast Torrent S01E01", "url": "magnet:fast", "is_low_speed": 0})
+        id_crawl = database.enqueue_download({"title": "Crawling Torrent S01E02", "url": "magnet:crawl", "is_low_speed": 0})
+
+        # Claim the first high-speed job
+        claimed_high = database.claim_next_download_job(is_low_speed=False)
+        self.assertIsNotNone(claimed_high)
+        self.assertEqual(claimed_high["id"], id_fast)
+
+        # Demote the crawling torrent to low speed trickle queue
+        demoted = database.demote_to_low_speed_queue(id_crawl, reason="< 100 KB/s for 120s")
+        self.assertTrue(demoted)
+
+        crawl_item = database.get_queue_item("download_queue", id_crawl)
+        self.assertEqual(crawl_item["is_low_speed"], 1)
+        self.assertEqual(crawl_item["status"], "pending")
+        self.assertIn("100 KB/s", crawl_item["error_msg"])
+
+        # High-speed daemon should find NO more high-speed jobs (since id_fast is downloading, and id_crawl is low-speed)
+        next_high = database.claim_next_download_job(is_low_speed=False)
+        self.assertIsNone(next_high)
+
+        # Low-speed daemon should successfully claim id_crawl
+        claimed_low = database.claim_next_download_job(is_low_speed=True)
+        self.assertIsNotNone(claimed_low)
+        self.assertEqual(claimed_low["id"], id_crawl)
+
+        # Test toggle_download_queue_speed
+        # Reset job to pending, then toggle back to fast lane
+        database.update_item_status("download_queue", id_crawl, status="pending")
+        toggled_to_fast = database.toggle_download_queue_speed(id_crawl)
+        self.assertTrue(toggled_to_fast)
+        self.assertEqual(database.get_queue_item("download_queue", id_crawl)["is_low_speed"], 0)
+
+        # Toggle back to slow lane
+        toggled_to_slow = database.toggle_download_queue_speed(id_crawl)
+        self.assertTrue(toggled_to_slow)
+        self.assertEqual(database.get_queue_item("download_queue", id_crawl)["is_low_speed"], 1)
+
+    def test_download_watchdog_timeout_detection(self):
+        # 1. Test speed & size parsers
+        self.assertEqual(parse_speed_to_bps("100KiB"), 100 * 1024)
+        self.assertEqual(parse_speed_to_bps("1.5MiB"), 1.5 * 1024 * 1024)
+        self.assertEqual(parse_speed_to_bps("500B"), 500)
+        self.assertEqual(parse_size_to_bytes("50MiB"), 50 * 1024 * 1024)
+        self.assertEqual(parse_size_to_bytes("1.2GiB"), int(1.2 * 1024 * 1024 * 1024))
+
+        # 2. Test Watchdog Start Timeout: hasn't started after 90s
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None
+        task_start_timeout = {"id": 201, "download_pct": 0, "is_low_speed": False, "active_proc": mock_proc}
+        watchdog1 = DownloadWatchdog(task_start_timeout)
+        # Simulate elapsed time of 95 seconds without download starting
+        watchdog1.t_start = time.time() - (config.DOWNLOAD_START_TIMEOUT_SEC + 5)
+        watchdog1.download_started = False
+        triggered1 = watchdog1.check_conditions()
+
+        self.assertTrue(triggered1)
+        self.assertTrue(task_start_timeout.get("timed_out_start"))
+        mock_proc.kill.assert_called()
+
+        # 3. Test Watchdog Low Speed Demote: speed under 100KB/s for 120s
+        mock_proc2 = MagicMock()
+        mock_proc2.poll.return_value = None
+        task_slow = {"id": 202, "download_pct": 10, "is_low_speed": False, "active_proc": mock_proc2}
+        watchdog2 = DownloadWatchdog(task_slow)
+        watchdog2.download_started = True
+        # Simulate running for 125 seconds below 100KB/s
+        watchdog2.low_speed_start = time.time() - (config.DOWNLOAD_LOW_SPEED_TIMEOUT_SEC + 5)
+        triggered2 = watchdog2.check_conditions()
+
+        self.assertTrue(triggered2)
+        self.assertTrue(task_slow.get("demote_low_speed"))
+        mock_proc2.kill.assert_called()
+
+        # 4. Test Watchdog on Low-Speed lane: should NOT demote even if below 100KB/s
+        mock_proc3 = MagicMock()
+        mock_proc3.poll.return_value = None
+        task_already_slow = {"id": 203, "download_pct": 5, "is_low_speed": True, "active_proc": mock_proc3}
+        watchdog3 = DownloadWatchdog(task_already_slow)
+        watchdog3.download_started = True
+        watchdog3.low_speed_start = time.time() - (config.DOWNLOAD_LOW_SPEED_TIMEOUT_SEC + 5)
+        triggered3 = watchdog3.check_conditions()
+
+        self.assertFalse(triggered3)
+        self.assertFalse(task_already_slow.get("demote_low_speed", False))
+        mock_proc3.kill.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

@@ -25,107 +25,206 @@ import threading
 # ---------------------------------------------------------
 
 def render_download_queue_html() -> str:
-    """Renders active downloads, pending download queue with reordering (⬆️/⬇️), and full persistent history."""
+    """Renders active downloads, pending download queue with reordering (⬆️/⬇️), speed lanes, and full persistent history."""
     db_items = database.get_download_queue()
 
     with tasks_lock:
         mem_tasks = {t.get("db_id", t.get("id")): t for t in config.tasks}
 
-    active_items = []
-    pending_items = []
+    high_active = []
+    low_active = []
+    high_pending = []
+    low_pending = []
     history_items = []
 
     for item in db_items:
         st = item.get("status", "pending").lower()
+        is_low = bool(item.get("is_low_speed", 0))
         if st in ["downloading", "staging"]:
-            active_items.append(item)
+            if is_low:
+                low_active.append(item)
+            else:
+                high_active.append(item)
         elif st == "pending":
-            pending_items.append(item)
+            if is_low:
+                low_pending.append(item)
+            else:
+                high_pending.append(item)
         else:
             history_items.append(item)
 
     html_parts = ['<div style="display: flex; flex-direction: column; gap: 16px; font-family: system-ui, -apple-system, sans-serif;">']
 
-    # 1. Active / Ongoing Downloads Section
-    html_parts.append('<div style="font-weight: 700; font-size: 15px; color: #89b4fa; display: flex; align-items: center; gap: 8px;">⚡ Ongoing Downloads (' + str(len(active_items)) + ')</div>')
-    if not active_items:
-        html_parts.append("""
-        <div style="background: #181825; border: 1px dashed #313244; border-radius: 10px; padding: 18px; text-align: center; color: #6c7086; font-size: 13px;">
-            No downloads currently in progress. Add links or torrents from the <b>📥 Fetch & Ingest</b> tab.
-        </div>
-        """)
-    else:
-        for it in active_items:
-            i_id = it["id"]
-            m_task = mem_tasks.get(i_id, {})
-            pct = m_task.get("download_pct", it.get("download_pct", 0.0))
-            spd = m_task.get("download_speed", it.get("download_speed", "--"))
-            dl_str = m_task.get("downloaded_str", "0 MB")
-            tot_str = m_task.get("total_str", "--")
-            st_text = m_task.get("status", it.get("status", "Downloading"))
-            title = html.escape(it.get("title", "Download"))
+    # Helper function to render active download card
+    def render_active_card(it, is_low_lane=False):
+        i_id = it["id"]
+        m_task = mem_tasks.get(i_id, {})
+        pct = m_task.get("download_pct", it.get("download_pct", 0.0))
+        spd = m_task.get("download_speed", it.get("download_speed", "--"))
+        dl_str = m_task.get("downloaded_str", "0 MB")
+        tot_str = m_task.get("total_str", "--")
+        st_text = m_task.get("status", it.get("status", "Downloading"))
+        title = html.escape(it.get("title", "Download"))
 
-            html_parts.append(f"""
-            <div id="dl-card-{i_id}" style="background: #1e1e2e; border: 1px solid #89b4fa; border-radius: 10px; padding: 14px 18px; box-shadow: 0 4px 10px rgba(0,0,0,0.3);">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                    <div style="font-weight: 600; font-size: 14px; color: #cdd6f4; max-width: 75%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
-                        📥 #{i_id}: {title}
-                    </div>
-                    <div style="display: flex; align-items: center; gap: 8px;">
-                        <span style="background: #1e3a5f; color: #89b4fa; border: 1px solid #89b4fa; font-weight: 600; font-size: 11px; padding: 2px 10px; border-radius: 12px;">
-                            {st_text}
-                        </span>
-                        <button onclick="window.cancelTask('download_queue', {i_id})" title="Cancel download" style="background: rgba(243, 139, 168, 0.15); color: #f38ba8; border: 1px solid rgba(243, 139, 168, 0.4); font-weight: 600; font-size: 11px; padding: 3px 8px; border-radius: 6px; cursor: pointer;">
-                            ✕ Cancel
-                        </button>
-                    </div>
+        border_col = "#f9e2af" if is_low_lane else "#89b4fa"
+        badge_bg = "rgba(249, 226, 175, 0.15)" if is_low_lane else "#1e3a5f"
+        badge_col = "#f9e2af" if is_low_lane else "#89b4fa"
+        lane_label = "🐢 Slow Lane (<100 KB/s)" if is_low_lane else "⚡ High-Speed"
+
+        return f"""
+        <div id="dl-card-{i_id}" style="background: #1e1e2e; border: 1px solid {border_col}; border-radius: 10px; padding: 14px 18px; box-shadow: 0 4px 10px rgba(0,0,0,0.3);">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                <div style="font-weight: 600; font-size: 14px; color: #cdd6f4; max-width: 65%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                    📥 #{i_id}: {title}
                 </div>
-                <div style="background: #313244; border-radius: 6px; height: 10px; width: 100%; overflow: hidden; margin: 6px 0;">
-                    <div style="background: linear-gradient(90deg, #89b4fa, #b4befe); height: 100%; width: {pct:.1f}%; transition: width 0.3s ease;"></div>
-                </div>
-                <div style="display: flex; justify-content: space-between; font-size: 12px; color: #a6adc8;">
-                    <span>Progress: <b>{pct:.1f}%</b> ({dl_str} / {tot_str})</span>
-                    <span>⚡ Speed: <b>{spd}</b></span>
+                <div style="display: flex; align-items: center; gap: 6px;">
+                    <span style="background: {badge_bg}; color: {badge_col}; border: 1px solid {border_col}; font-weight: 600; font-size: 10px; padding: 2px 8px; border-radius: 12px;">
+                        {lane_label}
+                    </span>
+                    <span style="background: #181825; color: #bac2de; border: 1px solid #313244; font-weight: 600; font-size: 11px; padding: 2px 8px; border-radius: 12px;">
+                        {st_text}
+                    </span>
+                    <button onclick="window.cancelTask('download_queue', {i_id})" title="Cancel download" style="background: rgba(243, 139, 168, 0.15); color: #f38ba8; border: 1px solid rgba(243, 139, 168, 0.4); font-weight: 600; font-size: 11px; padding: 3px 8px; border-radius: 6px; cursor: pointer;">
+                        ✕ Cancel
+                    </button>
                 </div>
             </div>
-            """)
+            <div style="background: #313244; border-radius: 6px; height: 10px; width: 100%; overflow: hidden; margin: 6px 0;">
+                <div style="background: linear-gradient(90deg, {border_col}, #b4befe); height: 100%; width: {pct:.1f}%; transition: width 0.3s ease;"></div>
+            </div>
+            <div style="display: flex; justify-content: space-between; font-size: 12px; color: #a6adc8;">
+                <span>Progress: <b>{pct:.1f}%</b> ({dl_str} / {tot_str})</span>
+                <span>⚡ Speed: <b>{spd}</b></span>
+            </div>
+        </div>
+        """
 
-    # 2. Upcoming / Queued Downloads Section
-    html_parts.append('<div style="font-weight: 700; font-size: 15px; color: #bac2de; display: flex; align-items: center; gap: 8px; margin-top: 10px;">📋 Upcoming Queue (' + str(len(pending_items)) + ')</div>')
-    if not pending_items:
+    # Helper function to render pending item row
+    def render_pending_row(it, idx, is_low_lane=False):
+        i_id = it["id"]
+        title = html.escape(it.get("title", "Media"))
+        src_type = it.get("source_type", "direct")
+        retries = it.get("retry_count", 0)
+        badge_icon = "🧲" if src_type == "torrent" else "🔗"
+
+        retry_badge = ""
+        if retries > 0:
+            retry_badge = f'<span style="background: rgba(249, 226, 175, 0.15); color: #f9e2af; border: 1px solid rgba(249, 226, 175, 0.3); font-size: 10px; padding: 1px 6px; border-radius: 8px; font-weight: 600;">⚠️ Retry {retries}/3</span>'
+
+        lane_switch_btn = f"""
+        <button onclick="window.switchQueueSpeed('download_queue', {i_id})" title="Switch to High-Speed Fast Lane" style="background: #1e3a5f; color: #89b4fa; border: 1px solid #89b4fa; border-radius: 4px; padding: 3px 8px; font-size: 11px; cursor: pointer;">
+            ⚡ Fast
+        </button>
+        """ if is_low_lane else f"""
+        <button onclick="window.switchQueueSpeed('download_queue', {i_id})" title="Move to Low-Speed Slow Lane" style="background: #313244; color: #f9e2af; border: 1px solid #f9e2af; border-radius: 4px; padding: 3px 8px; font-size: 11px; cursor: pointer;">
+            🐢 Slow
+        </button>
+        """
+
+        return f"""
+        <div style="background: #181825; border: 1px solid #313244; border-radius: 8px; padding: 10px 14px; display: flex; justify-content: space-between; align-items: center;">
+            <div style="display: flex; align-items: center; gap: 8px; max-width: 65%;">
+                <span style="font-size: 12px; font-weight: 700; color: #585b70; width: 24px;">#{idx + 1}</span>
+                <span style="font-size: 14px; color: #cdd6f4; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                    {badge_icon} {title}
+                </span>
+                {retry_badge}
+            </div>
+            <div style="display: flex; align-items: center; gap: 6px;">
+                <button onclick="window.moveQueueItem('download_queue', {i_id}, 'up')" title="Move Up" style="background: #313244; color: #cdd6f4; border: 1px solid #45475a; border-radius: 4px; padding: 3px 8px; font-size: 11px; cursor: pointer;">
+                    ⬆️ Up
+                </button>
+                <button onclick="window.moveQueueItem('download_queue', {i_id}, 'down')" title="Move Down" style="background: #313244; color: #cdd6f4; border: 1px solid #45475a; border-radius: 4px; padding: 3px 8px; font-size: 11px; cursor: pointer;">
+                    ⬇️ Down
+                </button>
+                {lane_switch_btn}
+                <button onclick="window.cancelTask('download_queue', {i_id})" title="Remove from queue" style="background: rgba(243, 139, 168, 0.1); color: #f38ba8; border: 1px solid rgba(243, 139, 168, 0.3); border-radius: 4px; padding: 3px 8px; font-size: 11px; cursor: pointer;">
+                    ✕
+                </button>
+            </div>
+        </div>
+        """
+
+    # 1. High-Speed Ongoing Section
+    html_parts.append('<div style="font-weight: 700; font-size: 15px; color: #89b4fa; display: flex; align-items: center; gap: 8px;">⚡ Ongoing High-Speed Downloads (' + str(len(high_active)) + '/' + str(config.MAX_DOWNLOAD_WORKERS) + ')</div>')
+    if not high_active:
         html_parts.append("""
         <div style="background: #181825; border: 1px dashed #313244; border-radius: 10px; padding: 14px; text-align: center; color: #6c7086; font-size: 13px;">
-            Queue is currently empty.
+            No high-speed downloads active. Fast slots are ready.
         </div>
         """)
     else:
-        for idx, it in enumerate(pending_items):
+        for it in high_active:
+            html_parts.append(render_active_card(it, is_low_lane=False))
+
+    # 2. High-Speed Upcoming Queue Section
+    html_parts.append('<div style="font-weight: 700; font-size: 15px; color: #bac2de; display: flex; align-items: center; gap: 8px; margin-top: 8px;">📋 Upcoming High-Speed Queue (' + str(len(high_pending)) + ')</div>')
+    if not high_pending:
+        html_parts.append("""
+        <div style="background: #181825; border: 1px dashed #313244; border-radius: 10px; padding: 12px; text-align: center; color: #6c7086; font-size: 13px;">
+            High-speed queue is empty.
+        </div>
+        """)
+    else:
+        for idx, it in enumerate(high_pending):
+            html_parts.append(render_pending_row(it, idx, is_low_lane=False))
+
+    # 3. Low-Speed Trickle Queue Section (Dedicated slow lane)
+    total_low = len(low_active) + len(low_pending)
+    html_parts.append('<div style="font-weight: 700; font-size: 15px; color: #f9e2af; display: flex; align-items: center; gap: 8px; margin-top: 14px;">🐢 Low-Speed Trickle Queue (<100 KB/s Lane: ' + str(len(low_active)) + ' active, ' + str(len(low_pending)) + ' queued)</div>')
+    if total_low == 0:
+        html_parts.append("""
+        <div style="background: #181825; border: 1px dashed #313244; border-radius: 10px; padding: 12px; text-align: center; color: #6c7086; font-size: 13px;">
+            No low-speed downloads demoted. High-speed queue is running smoothly.
+        </div>
+        """)
+    else:
+        for it in low_active:
+            html_parts.append(render_active_card(it, is_low_lane=True))
+        for idx, it in enumerate(low_pending):
+            html_parts.append(render_pending_row(it, idx, is_low_lane=True))
+
+    # 4. Finished Downloads (History: Completed, Failed with reason, Cancelled with reason)
+    if history_items:
+        html_parts.append('<div style="font-weight: 700; font-size: 14px; color: #a6adc8; display: flex; align-items: center; gap: 8px; margin-top: 14px;">📜 Finished & Staged History (' + str(len(history_items)) + ')</div>')
+        for it in history_items:
             i_id = it["id"]
-            title = html.escape(it.get("title", "Media"))
+            title = html.escape(it.get("title", "Download"))
+            st = it.get("status", "completed").lower()
+            err_msg = html.escape((it.get("error_msg") or "").strip())
             src_type = it.get("source_type", "direct")
             badge_icon = "🧲" if src_type == "torrent" else "🔗"
 
+            if st in ["completed", "staged"]:
+                badge_html = '<span style="background: rgba(166, 227, 161, 0.15); color: #a6e3a1; border: 1px solid rgba(166, 227, 161, 0.4); font-weight: 700; font-size: 10px; padding: 2px 8px; border-radius: 10px;">✅ STAGED IN DRIVE</span>'
+                callout_html = '<div style="font-size: 12px; color: #6c7086; margin-top: 4px;">Saved to Google Drive raw/ and queued for GPU refining.</div>'
+            elif st == "failed":
+                badge_html = '<span style="background: rgba(243, 139, 168, 0.15); color: #f38ba8; border: 1px solid rgba(243, 139, 168, 0.4); font-weight: 700; font-size: 10px; padding: 2px 8px; border-radius: 10px;">❌ FAILED</span>'
+                callout_html = f'<div style="margin-top: 6px; padding: 6px 10px; background: rgba(243, 139, 168, 0.1); border-left: 3px solid #f38ba8; border-radius: 4px; font-size: 12px; color: #f38ba8;">❌ Error Reason: {err_msg or "Download interrupted or network failure."}</div>'
+            else:
+                # Cancelled / Skipped
+                badge_html = '<span style="background: rgba(249, 226, 175, 0.15); color: #f9e2af; border: 1px solid rgba(249, 226, 175, 0.4); font-weight: 700; font-size: 10px; padding: 2px 8px; border-radius: 10px;">⚠️ CANCELLED</span>'
+                callout_html = f'<div style="margin-top: 6px; padding: 6px 10px; background: rgba(249, 226, 175, 0.1); border-left: 3px solid #f9e2af; border-radius: 4px; font-size: 12px; color: #f9e2af;">⚠️ Reason: {err_msg or "Cancelled by user."}</div>'
+
             html_parts.append(f"""
-            <div style="background: #181825; border: 1px solid #313244; border-radius: 8px; padding: 10px 14px; display: flex; justify-content: space-between; align-items: center;">
-                <div style="display: flex; align-items: center; gap: 10px; max-width: 70%;">
-                    <span style="font-size: 12px; font-weight: 700; color: #585b70; width: 24px;">#{idx + 1}</span>
-                    <span style="font-size: 14px; color: #cdd6f4; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
-                        {badge_icon} {title}
-                    </span>
+            <div style="background: #181825; border: 1px solid #313244; border-radius: 8px; padding: 10px 14px; margin-bottom: 4px;">
+                <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <div style="font-size: 13px; color: #cdd6f4; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 75%;">
+                        {badge_icon} #{i_id}: {title}
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                        {badge_html}
+                        <button onclick="window.dismissTask('download_queue', {i_id})" title="Dismiss from list" style="background: transparent; color: #6c7086; border: 1px solid #313244; border-radius: 4px; padding: 2px 6px; font-size: 10px; cursor: pointer;">
+                            ✕
+                        </button>
+                    </div>
                 </div>
-                <div style="display: flex; align-items: center; gap: 6px;">
-                    <button onclick="window.moveQueueItem('download_queue', {i_id}, 'up')" title="Move Up" style="background: #313244; color: #cdd6f4; border: 1px solid #45475a; border-radius: 4px; padding: 3px 8px; font-size: 11px; cursor: pointer;">
-                        ⬆️ Up
-                    </button>
-                    <button onclick="window.moveQueueItem('download_queue', {i_id}, 'down')" title="Move Down" style="background: #313244; color: #cdd6f4; border: 1px solid #45475a; border-radius: 4px; padding: 3px 8px; font-size: 11px; cursor: pointer;">
-                        ⬇️ Down
-                    </button>
-                    <button onclick="window.cancelTask('download_queue', {i_id})" title="Remove from queue" style="background: rgba(243, 139, 168, 0.1); color: #f38ba8; border: 1px solid rgba(243, 139, 168, 0.3); border-radius: 4px; padding: 3px 8px; font-size: 11px; cursor: pointer;">
-                        ✕
-                    </button>
-                </div>
+                {callout_html}
             </div>
             """)
+
+    html_parts.append('</div>')
+    return "\n".join(html_parts)
 
     # 3. Finished Downloads (History: Completed, Failed with reason, Cancelled with reason)
     if history_items:
@@ -484,6 +583,8 @@ def create_ui():
         try {
             if (action === 'move') {
                 fetch('/api/queue/move/' + table + '/' + id + '/' + (direction || 'up'), { method: 'POST' }).catch(e => {});
+            } else if (action === 'switch_speed') {
+                fetch('/api/queue/switch_speed/' + id, { method: 'POST' }).catch(e => {});
             } else if (action === 'cancel') {
                 const ep = table ? ('/api/task/' + id + '/cancel?table=' + table) : ('/api/task/' + id + '/cancel');
                 fetch(ep, { method: 'POST' }).catch(e => {});
@@ -492,6 +593,10 @@ def create_ui():
                 fetch(ep, { method: 'POST' }).catch(e => {});
             }
         } catch(e) {}
+    };
+
+    window.switchQueueSpeed = function(table, id) {
+        window.queueAction('switch_speed', table, id, '');
     };
 
     window.cancelTask = function(tableOrId, maybeId) {
@@ -792,6 +897,8 @@ def create_ui():
 
                 if action == "move" and item_id > 0 and table:
                     database.move_queue_item(table, item_id, direction)
+                elif action == "switch_speed" and item_id > 0:
+                    database.toggle_download_queue_speed(item_id)
                 elif action == "dismiss" and item_id > 0 and table:
                     cancel_task_by_id(item_id, table_name=table, dismiss=True)
                 elif action == "cancel" and item_id > 0:
@@ -1363,6 +1470,12 @@ def create_ui():
     def api_move_queue(table_name: str, item_id: int, direction: str):
         success = database.move_queue_item(table_name, item_id, direction)
         return {"status": "ok", "success": success}
+
+    @demo.app.post("/api/queue/switch_speed/{item_id}")
+    @demo.app.get("/api/queue/switch_speed/{item_id}")
+    def api_switch_queue_speed(item_id: int):
+        success = database.toggle_download_queue_speed(item_id)
+        return {"status": "ok", "success": success, "item_id": item_id}
 
     @demo.app.get("/api/queue/download")
     def api_download_queue():

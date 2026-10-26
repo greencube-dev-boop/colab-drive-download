@@ -5,6 +5,7 @@ import time
 import urllib.parse
 import urllib.request
 import subprocess
+import threading
 try:
     import requests
 except ImportError:
@@ -41,6 +42,135 @@ def _kill_proc(proc: Optional[subprocess.Popen]):
                     pass
     except Exception:
         pass
+
+def parse_speed_to_bps(speed_str: str) -> float:
+    """Parses speed strings (e.g. '54KiB/s', '1.2MiB/s', '350KB/s') to bytes per second."""
+    if not speed_str or speed_str == "--":
+        return 0.0
+    m = re.match(r'([\d.]+)\s*([KMGT]?)(?:i?B)?', speed_str.strip(), re.I)
+    if not m:
+        return 0.0
+    val = float(m.group(1))
+    unit = m.group(2).upper()
+    if unit == 'K':
+        return val * 1024.0
+    elif unit == 'M':
+        return val * 1024.0 * 1024.0
+    elif unit == 'G':
+        return val * 1024.0 * 1024.0 * 1024.0
+    elif unit == 'T':
+        return val * 1024.0 * 1024.0 * 1024.0 * 1024.0
+    return val
+
+def parse_size_to_bytes(size_str: str) -> int:
+    """Parses size strings (e.g. '12.5MiB', '500KiB') to integer bytes."""
+    if not size_str or size_str == "--":
+        return 0
+    m = re.match(r'([\d.]+)\s*([KMGT]?)(?:i?B)?', size_str.strip(), re.I)
+    if not m:
+        return 0
+    val = float(m.group(1))
+    unit = m.group(2).upper()
+    if unit == 'K':
+        return int(val * 1024)
+    elif unit == 'M':
+        return int(val * 1024 * 1024)
+    elif unit == 'G':
+        return int(val * 1024 * 1024 * 1024)
+    elif unit == 'T':
+        return int(val * 1024 * 1024 * 1024 * 1024)
+    return int(val)
+
+class DownloadWatchdog:
+    """
+    Monitors download process runtime speed and activity:
+    1. If download does not start within timeout_start_sec (default 90s), triggers start timeout.
+    2. If download speed remains continuously under low_speed_threshold_bps (default 100 KB/s)
+       for low_speed_sec (default 120s), triggers demotion to the low-speed queue.
+       (Only applies if task is not already in the low-speed queue).
+    """
+    def __init__(
+        self,
+        task: Dict[str, Any],
+        timeout_start_sec: Optional[float] = None,
+        low_speed_threshold_bps: Optional[float] = None,
+        low_speed_sec: Optional[float] = None
+    ):
+        self.task = task
+        self.timeout_start_sec = timeout_start_sec if timeout_start_sec is not None else getattr(config, "DOWNLOAD_START_TIMEOUT_SEC", 90.0)
+        self.low_speed_threshold_bps = low_speed_threshold_bps if low_speed_threshold_bps is not None else getattr(config, "DOWNLOAD_LOW_SPEED_THRESHOLD_BPS", 100 * 1024.0)
+        self.low_speed_sec = low_speed_sec if low_speed_sec is not None else getattr(config, "DOWNLOAD_LOW_SPEED_TIMEOUT_SEC", 120.0)
+        self.t_start = time.time()
+        self.low_speed_start: Optional[float] = None
+        self.download_started = False
+        self.stop_event = threading.Event()
+        self.thread: Optional[threading.Thread] = None
+
+    def start(self):
+        self.t_start = time.time()
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+
+    def update_progress(self, current_bytes: int, speed_bps: float):
+        if current_bytes > 0 or speed_bps > 0:
+            if not self.download_started:
+                self.download_started = True
+                self.task["download_started"] = True
+
+        if self.download_started:
+            if speed_bps < self.low_speed_threshold_bps:
+                if self.low_speed_start is None:
+                    self.low_speed_start = time.time()
+            else:
+                self.low_speed_start = None
+
+    def check_conditions(self, now: Optional[float] = None) -> bool:
+        """Evaluates watchdog rules at timestamp `now`. Returns True if timeout/demote condition triggered."""
+        if now is None:
+            now = time.time()
+        if self.task.get("cancelled") or self.task.get("timed_out_start") or self.task.get("demote_low_speed"):
+            return False
+
+        # 1. Start timeout check (90s)
+        if not self.download_started:
+            elapsed = now - self.t_start
+            if elapsed >= self.timeout_start_sec:
+                print(f"[Watchdog] Task #{self.task.get('id')} '{self.task.get('title')}' did not start within {self.timeout_start_sec}s. Aborting for retry.")
+                self.task["timed_out_start"] = True
+                self.task["status"] = f"Start Timeout ({self.timeout_start_sec}s)"
+                proc = self.task.get("active_proc")
+                if proc:
+                    _kill_proc(proc)
+                for p in list(self.task.get("active_procs", [])):
+                    _kill_proc(p)
+                return True
+
+        # 2. Continuous low speed check (< 100 KB/s for 120s)
+        # Only demote if the task is NOT already in the low-speed queue
+        elif not self.task.get("is_low_speed", False):
+            if self.low_speed_start is not None:
+                duration = now - self.low_speed_start
+                if duration >= self.low_speed_sec:
+                    print(f"[Watchdog] Task #{self.task.get('id')} '{self.task.get('title')}' speed under 100 KB/s for {duration:.1f}s. Demoting to Low-Speed Queue.")
+                    self.task["demote_low_speed"] = True
+                    self.task["status"] = "Demoting to Low-Speed Queue (< 100 KB/s)"
+                    proc = self.task.get("active_proc")
+                    if proc:
+                        _kill_proc(proc)
+                    for p in list(self.task.get("active_procs", [])):
+                        _kill_proc(p)
+                    return True
+
+        return False
+
+    def _run(self):
+        while not self.stop_event.wait(1.0):
+            if self.check_conditions():
+                break
 
 def unmask_ts(d: bytes) -> bytes:
     """Strips PNG camouflage prefix used by video CDN hosts."""
@@ -182,46 +312,54 @@ def download_hls_stream(stream_url: str, headers: Dict[str, str], raw_path: str,
     t_prev = t_start
     bytes_prev = 0
 
-    with open(raw_path, "wb") as f_out:
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-            while next_write_idx < total_segs:
-                if task.get("cancelled"):
-                    break
+    watchdog = DownloadWatchdog(task)
+    watchdog.start()
 
-                while next_submit_idx < total_segs and (next_submit_idx - next_write_idx) < SLIDING_WINDOW:
-                    s_idx = next_submit_idx
-                    s_url = segments[s_idx]
-                    futures[s_idx] = pool.submit(fetch_seg_resilient, s_idx, s_url)
-                    next_submit_idx += 1
+    try:
+        with open(raw_path, "wb") as f_out:
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+                while next_write_idx < total_segs:
+                    if task.get("cancelled") or task.get("timed_out_start") or task.get("demote_low_speed"):
+                        break
 
-                if next_write_idx in futures:
-                    fut = futures[next_write_idx]
-                    try:
-                        chunk = fut.result(timeout=20)
-                    except Exception:
-                        chunk = b''
-                    del futures[next_write_idx]
+                    while next_submit_idx < total_segs and (next_submit_idx - next_write_idx) < SLIDING_WINDOW:
+                        s_idx = next_submit_idx
+                        s_url = segments[s_idx]
+                        futures[s_idx] = pool.submit(fetch_seg_resilient, s_idx, s_url)
+                        next_submit_idx += 1
 
-                    if chunk:
-                        f_out.write(chunk)
-                        total_bytes += len(chunk)
+                    if next_write_idx in futures:
+                        fut = futures[next_write_idx]
+                        try:
+                            chunk = fut.result(timeout=20)
+                        except Exception:
+                            chunk = b''
+                        del futures[next_write_idx]
 
-                    next_write_idx += 1
+                        if chunk:
+                            f_out.write(chunk)
+                            total_bytes += len(chunk)
 
-                    t_now = time.time()
-                    if t_now - t_prev >= 0.5 or next_write_idx == total_segs:
-                        spd_mb = ((total_bytes - bytes_prev) / max(0.001, t_now - t_prev)) / (1024 * 1024)
-                        pct = (next_write_idx / total_segs) * 100
-                        task["download_pct"] = pct
-                        task["download_speed"] = f"{spd_mb:.1f} MB/s"
-                        task["downloaded_str"] = f"{total_bytes / (1024*1024):.1f} MB"
-                        task["total_str"] = f"{next_write_idx}/{total_segs} segs"
-                        t_prev = t_now
-                        bytes_prev = total_bytes
-                else:
-                    time.sleep(0.02)
+                        next_write_idx += 1
 
-    if task.get("cancelled"):
+                        t_now = time.time()
+                        if t_now - t_prev >= 0.5 or next_write_idx == total_segs:
+                            spd_bps = (total_bytes - bytes_prev) / max(0.001, t_now - t_prev)
+                            spd_mb = spd_bps / (1024 * 1024)
+                            pct = (next_write_idx / total_segs) * 100
+                            task["download_pct"] = pct
+                            task["download_speed"] = f"{spd_mb:.1f} MB/s"
+                            task["downloaded_str"] = f"{total_bytes / (1024*1024):.1f} MB"
+                            task["total_str"] = f"{next_write_idx}/{total_segs} segs"
+                            watchdog.update_progress(total_bytes, spd_bps)
+                            t_prev = t_now
+                            bytes_prev = total_bytes
+                    else:
+                        time.sleep(0.02)
+    finally:
+        watchdog.stop()
+
+    if task.get("cancelled") or task.get("timed_out_start") or task.get("demote_low_speed"):
         return
 
     task["download_pct"] = 100.0
@@ -245,12 +383,14 @@ def download_ytdlp(url: str, raw_path: str, headers: Dict[str, str], task: Dict[
 
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     task["active_proc"] = proc
+    task.setdefault("active_procs", []).append(proc)
+    watchdog = DownloadWatchdog(task)
+    watchdog.start()
     pat = re.compile(r'\[download\]\s+([\d.]+)%\s+of\s+~?([\d.]+[KMGT]i?B)\s+at\s+([\d.]+[KMGT]i?B/s)')
     try:
         for line in proc.stdout:
-            if task.get("cancelled"):
-                proc.terminate()
-                proc.kill()
+            if task.get("cancelled") or task.get("timed_out_start") or task.get("demote_low_speed"):
+                _kill_proc(proc)
                 return
             m = pat.search(line)
             if m:
@@ -258,11 +398,17 @@ def download_ytdlp(url: str, raw_path: str, headers: Dict[str, str], task: Dict[
                 task["total_str"] = m.group(2)
                 task["download_speed"] = m.group(3)
                 task["downloaded_str"] = f"{float(m.group(1)):.1f}%"
+                watchdog.update_progress(parse_size_to_bytes(m.group(2)), parse_speed_to_bps(m.group(3)))
         proc.wait()
     finally:
+        watchdog.stop()
+        if task.get("cancelled") or task.get("timed_out_start") or task.get("demote_low_speed") or (proc and proc.poll() is None):
+            _kill_proc(proc)
         task["active_proc"] = None
+        if proc in task.get("active_procs", []):
+            task["active_procs"].remove(proc)
 
-    if task.get("cancelled"):
+    if task.get("cancelled") or task.get("timed_out_start") or task.get("demote_low_speed"):
         return
     if proc.returncode != 0 or not os.path.exists(raw_path):
         raise RuntimeError(f"yt-dlp download failed with exit code {proc.returncode}")
@@ -291,14 +437,17 @@ def download_aria2c_or_requests(url: str, raw_path: str, task: Dict[str, Any]):
     ]
 
     aria_success = False
+    proc = None
+    watchdog = DownloadWatchdog(task)
+    watchdog.start()
     try:
         proc = subprocess.Popen(aria_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
         task["active_proc"] = proc
+        task.setdefault("active_procs", []).append(proc)
         pattern = re.compile(r'([\d.]+[KMGT]iB)/([\d.]+[KMGT]iB)\s*\((\d+)%\).*DL:([\d.]+[KMGT]iB)')
         for line in proc.stdout:
-            if task.get("cancelled"):
-                proc.terminate()
-                proc.kill()
+            if task.get("cancelled") or task.get("timed_out_start") or task.get("demote_low_speed"):
+                _kill_proc(proc)
                 return
             m = pattern.search(line)
             if m:
@@ -306,69 +455,84 @@ def download_aria2c_or_requests(url: str, raw_path: str, task: Dict[str, Any]):
                 task["total_str"] = m.group(2)
                 task["download_pct"] = float(m.group(3))
                 task["download_speed"] = f"{m.group(4)}/s"
+                watchdog.update_progress(parse_size_to_bytes(m.group(1)), parse_speed_to_bps(m.group(4)))
         proc.wait()
         if proc.returncode == 0 and os.path.exists(raw_path) and os.path.getsize(raw_path) > 1024:
             aria_success = True
     except Exception:
         pass
     finally:
+        watchdog.stop()
+        if task.get("cancelled") or task.get("timed_out_start") or task.get("demote_low_speed") or (proc and proc.poll() is None):
+            _kill_proc(proc)
         task["active_proc"] = None
+        if proc and proc in task.get("active_procs", []):
+            task["active_procs"].remove(proc)
 
-    if task.get("cancelled"):
+    if task.get("cancelled") or task.get("timed_out_start") or task.get("demote_low_speed"):
         return
 
     if not aria_success:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        if requests is not None:
-            with requests.get(url, headers=headers, stream=True, timeout=30) as r:
-                r.raise_for_status()
-                total_size = int(r.headers.get('content-length', 0))
-                downloaded = 0
-                t_prev = time.time()
-                bytes_prev = 0
-                with open(raw_path, 'wb') as f:
-                    for chunk in r.iter_content(chunk_size=1024 * 1024):
-                        if task.get("cancelled"):
-                            return
-                        if chunk:
+        try:
+            if requests is not None:
+                with requests.get(url, headers=headers, stream=True, timeout=30) as r:
+                    r.raise_for_status()
+                    total_size = int(r.headers.get('content-length', 0))
+                    downloaded = 0
+                    t_prev = time.time()
+                    bytes_prev = 0
+                    with open(raw_path, 'wb') as f:
+                        for chunk in r.iter_content(chunk_size=1024 * 1024):
+                            if task.get("cancelled") or task.get("timed_out_start") or task.get("demote_low_speed"):
+                                return
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                t_now = time.time()
+                                if t_now - t_prev >= 0.5:
+                                    spd_bps = (downloaded - bytes_prev) / max(0.001, t_now - t_prev)
+                                    speed_mb = spd_bps / (1024 * 1024)
+                                    pct = (downloaded / total_size) * 100 if total_size > 0 else 0
+                                    task["download_pct"] = pct
+                                    task["download_speed"] = f"{speed_mb:.1f} MB/s"
+                                    task["downloaded_str"] = f"{downloaded / (1024*1024):.1f} MB"
+                                    task["total_str"] = f"{total_size / (1024*1024):.1f} MB" if total_size > 0 else "Unknown"
+                                    watchdog.update_progress(downloaded, spd_bps)
+                                    t_prev = t_now
+                                    bytes_prev = downloaded
+            else:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    total_size = int(r.headers.get('Content-Length', 0))
+                    downloaded = 0
+                    t_prev = time.time()
+                    bytes_prev = 0
+                    with open(raw_path, 'wb') as f:
+                        while True:
+                            if task.get("cancelled") or task.get("timed_out_start") or task.get("demote_low_speed"):
+                                return
+                            chunk = r.read(1024 * 1024)
+                            if not chunk:
+                                break
                             f.write(chunk)
                             downloaded += len(chunk)
                             t_now = time.time()
                             if t_now - t_prev >= 0.5:
-                                speed_mb = ((downloaded - bytes_prev) / (t_now - t_prev)) / (1024 * 1024)
+                                spd_bps = (downloaded - bytes_prev) / max(0.001, t_now - t_prev)
+                                speed_mb = spd_bps / (1024 * 1024)
                                 pct = (downloaded / total_size) * 100 if total_size > 0 else 0
                                 task["download_pct"] = pct
                                 task["download_speed"] = f"{speed_mb:.1f} MB/s"
                                 task["downloaded_str"] = f"{downloaded / (1024*1024):.1f} MB"
                                 task["total_str"] = f"{total_size / (1024*1024):.1f} MB" if total_size > 0 else "Unknown"
+                                watchdog.update_progress(downloaded, spd_bps)
                                 t_prev = t_now
                                 bytes_prev = downloaded
-        else:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=30) as r:
-                total_size = int(r.headers.get('Content-Length', 0))
-                downloaded = 0
-                t_prev = time.time()
-                bytes_prev = 0
-                with open(raw_path, 'wb') as f:
-                    while True:
-                        if task.get("cancelled"):
-                            return
-                        chunk = r.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        t_now = time.time()
-                        if t_now - t_prev >= 0.5:
-                            speed_mb = ((downloaded - bytes_prev) / (t_now - t_prev)) / (1024 * 1024)
-                            pct = (downloaded / total_size) * 100 if total_size > 0 else 0
-                            task["download_pct"] = pct
-                            task["download_speed"] = f"{speed_mb:.1f} MB/s"
-                            task["downloaded_str"] = f"{downloaded / (1024*1024):.1f} MB"
-                            task["total_str"] = f"{total_size / (1024*1024):.1f} MB" if total_size > 0 else "Unknown"
-                            t_prev = t_now
-                            bytes_prev = downloaded
+        finally:
+            watchdog.stop()
+    else:
+        watchdog.stop()
 
     task["download_pct"] = 100.0
     if os.path.exists(raw_path):
@@ -454,6 +618,7 @@ def download_aria2c_torrent(magnet_url: str, task: Dict[str, Any]) -> str:
             popen_meta_kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT, "text": True, "bufsize": 1}
             if os.name != 'nt':
                 popen_meta_kwargs["start_new_session"] = True
+            m_proc = None
             try:
                 m_proc = subprocess.Popen(meta_cmd, **popen_meta_kwargs)
                 task["active_proc"] = m_proc
@@ -470,7 +635,7 @@ def download_aria2c_torrent(magnet_url: str, task: Dict[str, Any]) -> str:
                 if task.get("cancelled") or (m_proc and m_proc.poll() is None):
                     _kill_proc(m_proc)
                 task["active_proc"] = None
-                if m_proc in task.get("active_procs", []):
+                if m_proc and m_proc in task.get("active_procs", []):
                     task["active_procs"].remove(m_proc)
 
             if task.get("cancelled"):
@@ -532,9 +697,9 @@ def download_aria2c_torrent(magnet_url: str, task: Dict[str, Any]) -> str:
     popen_kwargs = {"stdout": subprocess.PIPE, "stderr": subprocess.STDOUT, "text": True, "bufsize": 1}
     if os.name != 'nt':
         popen_kwargs["start_new_session"] = True
-    proc = subprocess.Popen(aria_cmd, **popen_kwargs)
-    task["active_proc"] = proc
-    task.setdefault("active_procs", []).append(proc)
+    proc = None
+    watchdog = DownloadWatchdog(task)
+    watchdog.start()
 
     pat_progress = re.compile(r'([\d.]+[KMGT]i?B)/([\d.]+[KMGT]i?B)\s*\((\d+)%\).*?(?:CN:(\d+))?.*?DL:([\d.]+[KMGT]i?B)')
     pat_peers = re.compile(r'CN:(\d+)')
@@ -542,8 +707,11 @@ def download_aria2c_torrent(magnet_url: str, task: Dict[str, Any]) -> str:
     pat_meta = re.compile(r'(?:allocating|metadata|fetching)', re.I)
 
     try:
+        proc = subprocess.Popen(aria_cmd, **popen_kwargs)
+        task["active_proc"] = proc
+        task.setdefault("active_procs", []).append(proc)
         for line in proc.stdout:
-            if task.get("cancelled"):
+            if task.get("cancelled") or task.get("timed_out_start") or task.get("demote_low_speed"):
                 _kill_proc(proc)
                 return ""
 
@@ -554,23 +722,26 @@ def download_aria2c_torrent(magnet_url: str, task: Dict[str, Any]) -> str:
                 task["download_pct"] = float(m.group(3))
                 peers_str = f" ({m.group(4)} peers)" if m.group(4) else ""
                 task["download_speed"] = f"{m.group(5)}/s{peers_str}"
+                watchdog.update_progress(parse_size_to_bytes(m.group(1)), parse_speed_to_bps(m.group(5)))
             else:
                 cn_m = pat_peers.search(line)
                 dl_m = pat_dl.search(line)
                 if dl_m:
                     task["download_speed"] = f"{dl_m.group(1)}/s" + (f" ({cn_m.group(1)} peers)" if cn_m else "")
+                    watchdog.update_progress(0, parse_speed_to_bps(dl_m.group(1)))
                 elif pat_meta.search(line):
                     peers_str = f" ({cn_m.group(1)} peers)" if cn_m else ""
                     task["download_speed"] = f"Fetching metadata...{peers_str}"
         proc.wait()
     finally:
-        if task.get("cancelled") or (proc and proc.poll() is None):
+        watchdog.stop()
+        if task.get("cancelled") or task.get("timed_out_start") or task.get("demote_low_speed") or (proc and proc.poll() is None):
             _kill_proc(proc)
         task["active_proc"] = None
-        if proc in task.get("active_procs", []):
+        if proc and proc in task.get("active_procs", []):
             task["active_procs"].remove(proc)
 
-    if task.get("cancelled"):
+    if task.get("cancelled") or task.get("timed_out_start") or task.get("demote_low_speed"):
         return ""
 
     if proc.returncode != 0:

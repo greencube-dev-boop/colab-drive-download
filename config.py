@@ -46,17 +46,26 @@ for d in [
 
 # Concurrency Semaphores & Worker Limits
 MAX_DOWNLOAD_WORKERS = 3
+MAX_LOW_SPEED_DOWNLOAD_WORKERS = 2
 MAX_REFINE_WORKERS = 1
 
 download_semaphore = threading.Semaphore(MAX_DOWNLOAD_WORKERS)
+low_speed_download_semaphore = threading.Semaphore(MAX_LOW_SPEED_DOWNLOAD_WORKERS)
 conversion_semaphore = threading.Semaphore(MAX_REFINE_WORKERS)
+
+# Timeout and Speed Watchdog Rules
+DOWNLOAD_START_TIMEOUT_SEC = 90.0
+DOWNLOAD_LOW_SPEED_THRESHOLD_BPS = 100 * 1024.0  # 100 KB/s
+DOWNLOAD_LOW_SPEED_TIMEOUT_SEC = 120.0
+MAX_DOWNLOAD_START_RETRIES = 2  # Initial + 2 retries = 3 total attempts
 
 # In-memory Task Tracking for real-time live monitoring
 tasks = []
 tasks_lock = threading.Lock()
 task_counter = 0
 
-# Global refine worker control
+# Global worker controls
+download_worker_active = True
 refine_worker_active = True
 refine_worker_lock = threading.Lock()
 
