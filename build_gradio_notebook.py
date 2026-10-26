@@ -220,6 +220,7 @@ if __name__ == "__main__":
                 print(f"[FAIL] Cell {i} syntax error: {e}")
                 raise
 
-    with open("video_to_480p_mkv_drive.ipynb", "w", encoding="utf-8") as f:
+    NOTEBOOK_NAME = "drive_downloader_gpu_refiner.ipynb"
+    with open(NOTEBOOK_NAME, "w", encoding="utf-8") as f:
         json.dump(nb, f, indent=1)
-    print("Clean, modular notebook successfully generated: video_to_480p_mkv_drive.ipynb")
+    print(f"Clean, modular notebook successfully generated: {NOTEBOOK_NAME}")

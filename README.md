@@ -1,123 +1,111 @@
-# 🎬 Colab Video Downloader & Universal Transcode Engine
+# 🚀 Two-Stage Google Drive Downloader & GPU Refiner
 
-An asynchronous batch video processing web application running natively in Google Colab with an interactive **Gradio** dashboard, hardware NVENC GPU encoding, and direct Google Drive preservation.
+An enterprise-grade, asynchronous batch media ingestion and transcoding system running natively in Google Colab with an interactive **Gradio** dashboard, persistent SQLite queue, Gemini AI media classification, hardware NVENC GPU encoding, and direct Google Drive preservation.
 
 ---
 
 ## 🌟 Key Architecture & Capabilities
 
-### 1. ⚙️ Universal Settings Bar (Top Persistent Controls)
-* **📥 Download Settings**:
-  * **Download Connections / Chunks**: Configurable slider (1 to 16 concurrent streams for aria2c and HLS).
-  * **Cloud Debrid Bridge**: Optional TorBox or Real-Debrid routing for 100% P2P-insulated direct downloads.
+### 1. ⚙️ Universal Settings Bar (Top Persistent Header)
+* **📥 Ingestion & Download Rules**:
+  * **Aria2c Connections / Stream Chunks**: Configurable slider (1 to 16 concurrent streams for aria2c and HLS).
+  * **Max Concurrent Downloads**: Real-time semaphore controller (1 to 5 parallel downloads).
+  * **Debrid Acceleration**: Support for Real-Debrid, AllDebrid, TorBox, and Debrid-Link.
 * **🎚️ Output Transcoding & Container Options**:
   * **Resolution Presets**: `480p (Default - Ultra Compact)`, `360p (Mobile Ultra-Low)`, `240p (Data Saver)`, `720p (HD)`, `1080p (Full HD)`, or `Original / Passthrough`.
-  * **Video Codecs**: `H.265 / HEVC` (high compression) or `H.264 / AVC` (broad device compatibility) with GPU NVENC hardware acceleration and transparent CPU fallback.
+  * **Video Codecs**: `H.265 / HEVC` (high compression) or `H.264 / AVC` (broad device playback) with GPU NVENC hardware acceleration and transparent CPU fallback.
   * **Container Formats**: `MKV` (multi-track resilient) or `MP4` (`+faststart` streaming).
-  * **Audio Presets**: `Opus 64 kbps` (recommended zero-drift audio), `Opus 48 kbps`, `AAC 96 kbps`, `AAC 128 kbps`, or `Copy Original Audio`.
-  * **Parallel Conversion Chunks**: Configurable worker threads (1 to 6 GPU/CPU slices).
-  * **Quality CRF Slider**: Customizable visual quality (18 to 40, default: 32).
+  * **Audio Presets**: `Opus 64 kbps` (zero-desync frame-perfect), `Opus 48 kbps`, `AAC 128 kbps`, `AAC 96 kbps`, or `Direct Copy (Passthrough)`.
+  * **GPU VRAM Slicing Chunks**: Slicing slider (1 to 8 parallel GPU chunks).
+  * **Quality CRF Slider**: Customizable visual quality factor (18 to 36, default: 32).
+  * **Max Concurrent Refiners**: Worker thread limit (1 to 3 parallel transcode jobs).
 
-### 2. 2-Tab Layout with Instant Navigation
-* **Main Tab 1: 📥 Fetch & Queue**:
-  * **Sub-Tab 1: 🔗 Direct Download**: Paste direct MP4/MKV links, Videm/VidSrc embeds, and HLS M3U8 playlists.
-  * **Sub-Tab 2: 🧲 Torrent & Magnet Download**: Unified hub for magnet links or `.torrent` file uploads with folder hierarchy tree, selective episode picking, and Drive folder preservation.
-  * **Sub-Tab 3: 🔎 Title Search & Swarm Explorer**: Search any movie or TV series, browse official episodes, and query live multi-tracker torrent swarms across The Pirate Bay (`apibay.org`) and YTS.
-* **Main Tab 2: 📊 Downloads & Processes**:
-  * **Automated Tab Switching**: Adding downloads from any sub-tab instantly switches to this tab!
-  * **Working 1-Click Clear & Cancel**: Immediate subprocess termination (`ffmpeg`, `aria2c`), workspace cleanup, and instant removal from the process cards.
-  * Single **`🧹 Clear Completed`** button to clean all finished/errored tasks.
+---
 
-### 2. Reliable Stream & Embed Ingestion
-* **Videm 5-Server Multi-Probing**:
-  * Simultaneously tests all 5 upstream server endpoints (Server XPM1, Server VNH, Server AL, Server AK, Server PL) to bypass isolated 502/offline nodes.
-  * Sliding-window HLS downloader with 8 concurrent workers, automatic token refresh (`fresh=1`) on CDN expiration, and 120-byte PNG camouflage unmasking on the fly.
-* **VidSrc / vsembed Engine**:
-  * Resolves stream sources from `data.vidsrc.sh` and maps TMDb identifiers to official IMDb series metadata.
+### 2. Two-Stage Decoupled Workflow
 
-### 3. Responsive Process Controls & Workspace Cleanup
-* **Working 1-Click Cancel Button (`✕ Clear`)**:
-  * Located directly on every process card header.
-  * Interacts with a native FastAPI route (`POST /api/task/{id}/cancel`).
-  * Immediately terminates active subprocesses (`aria2c`, `ffmpeg`, `yt-dlp`).
-  * Cleans up all task temporary chunks, audio streams, and raw video files from disk.
-  * Releases download/conversion semaphores immediately.
-* **Clean Process Panel**:
-  * Removed redundant top-menu clear buttons; now features a single, prominent `🧹 Clear Completed` button.
-  * Real-time visual progress tiles (download %, speed, ETA, parallel GPU chunk bars).
+```
+[Fetch & Ingest] 
+      │
+      ▼
+Stage 1: Ingestion
+  1. Download video directly into local VM ephemeral disk (`/content/temp/raw_in/`)
+  2. Classify via Gemini AI or scene heuristic regex:
+     • Movie  -> "Movie Title (Year)" (e.g. "Avatar Fire And Ash (2025)")
+     • TV     -> "Show Name S01E04" (e.g. "Mentalist S01E04")
+     • Other  -> Clean title
+  3. Move raw video to Google Drive: `drive/downloader/raw/<standardized_name>.<ext>`
+  4. Record entry in `drive/downloader/data/metadata.json` (status: "raw")
+  5. Enqueue into persistent SQLite database: `drive/downloader/data/queue.db` (`refine_queue`)
+      │
+      ▼
+Stage 2: Persistent Refining (Background Daemon)
+  1. Daemon continuously monitors `refine_queue` in `queue.db`
+  2. Copies video from Drive `raw/` to Colab VM disk (`/content/temp/refining/`)
+  3. Chunks video, loads slices into GPU VRAM, encodes with NVENC
+  4. Stitches refined chunks with continuous Opus audio
+  5. Moves refined file to Google Drive:
+     • TV:    `drive/downloader/refined/tv_series/<Show Name>/Season <NN>/<Show SxxExx>.<ext>`
+     • Movie: `drive/downloader/refined/movies/<Movie (Year)>.<ext>`
+     • Other: `drive/downloader/refined/other/<Clean Title>.<ext>`
+  6. Verifies destination file exists on Google Drive and is > 0 bytes
+  7. **Drive Trash Bin Bypass**: Moves raw video from Drive to local VM disk, then unlinks locally
+  8. Updates status to "refined" in `metadata.json` and marks job "completed" in `queue.db`
+```
 
-### 4. GPU Acceleration & Zero-Desync Audio
-* **Continuous Opus Audio**:
-  * Audio is extracted and encoded once as a single continuous `audio.opus` file. Slicing video without slicing audio guarantees 100% frame-perfect sync with zero seam clicks or drift.
-* **Hardware Accelerated Transcoding**:
-  * Employs `-hwaccel cuda` and `hevc_nvenc` on Colab's Tesla T4 with `-cq:v 32 -b:v 0 -maxrate 550k` (Ultra-Compact Profile: ~180–230 MB for an 80–90 min video).
-  * Transparent CPU fallback (`libx265`) if running in a CPU-only environment.
+---
 
-### 5. Persistent Cell Keep-Alive Heartbeat
-* Includes an active **heartbeat keep-alive loop** running continuously in the foreground (`[*]`). It prints a live in-place status line every 5 seconds (uptime, active downloads, conversions, and completed count), ensuring Colab stays actively busy for up to the full 12-hour session limit without timing out.
+### 3. Responsive 3-Tab Interface with Auto-Switch
+
+* **Tab 1: 📥 Fetch & Ingest**:
+  * **Sub-Tab 1: 🔗 Direct & Streaming Download**: Direct MP4/MKV links, Videm/VidSrc embeds, and HLS M3U8 playlists.
+  * **Sub-Tab 2: 🧲 Torrent & Magnet Download**: Unified hub for magnet links or `.torrent` file uploads with interactive folder hierarchy tree and selective file picking.
+  * **Sub-Tab 3: 🔎 Title Search & Swarm Explorer**: Search any movie or TV series, browse official episodes, and query live multi-tracker torrent swarms across The Pirate Bay (`apibay.org`) and YTS (`en.yts.lu`).
+  * *Adding any download automatically switches to Tab 2.*
+
+* **Tab 2: 📋 Queue & Process Manager**:
+  * **Sub-Tab 1: 📥 Download Queue**: Real-time download speeds, progress %, and upcoming queued downloads with **⬆️ Up** and **⬇️ Down** reordering buttons + single `🧹 Clear Completed`.
+  * **Sub-Tab 2: ⚙️ Refining Queue (Persistent queue.db)**: Live GPU transcode progress, parallel VRAM chunk mini-bars, and upcoming jobs with **⬆️ Up** and **⬇️ Down** reorder buttons, pause/resume toggle, and single `🧹 Clear Completed`.
+  * *If a Colab session ends or disconnects, pending refining jobs automatically resume in the next session without re-downloading!*
+
+* **Tab 3: 📚 Drive Media Catalog**:
+  * Live interactive browser reading `drive/downloader/data/metadata.json` showing:
+    * 🎬 Movies with `[RAW]` vs `[REFINED]` status badges.
+    * 📺 TV Series organized by show name $\rightarrow$ seasons $\rightarrow$ episodes.
+    * 📁 Other media.
 
 ---
 
 ## 📁 Modular Project Structure
 
-The project has been refactored into a clean, maintainable modular structure:
-
 ```
 colab-drive-download/
-├── config.py                 # Paths, directories, dual semaphores, task state
-├── torrent_parser.py         # Pure-Python bencode decoder, metadata & folder inspector
-├── torrent_search.py         # en.yts.lu multi-tracker torrent search & quality classifier
-├── media_search.py           # IMDb & TVmaze search, seasons & episode discovery
-├── resolvers.py              # Videm 5-server probing, VidSrc, Real-Debrid, TorBox
-├── downloader.py             # Sliding-window HLS, aria2c multi-connection, selective torrents
-├── encoder.py                # GPU NVENC 480p encoding, continuous Opus, folder preservation
-├── pipeline.py               # Asynchronous task scheduler, queue worker, task cancellation
-├── ui.py                     # 3-tab Gradio UI, native FastAPI cancel route, CSS/JS
-├── app.py                    # Server launcher CLI (--port, --share) & telemetry loop
-├── build_gradio_notebook.py  # Builder script for video_to_480p_mkv_drive.ipynb
-├── video_to_480p_mkv_drive.ipynb # Clean 2-cell Google Colab notebook
-├── requirements.txt          # Minimal runtime dependencies
-└── README.md                 # Project documentation & usage instructions
+├── config.py                        # Path layouts, semaphores, trash bypass logic
+├── database.py                      # SQLite queue manager (queue.db) with reordering
+├── metadata_manager.py              # Master metadata.json catalog manager
+├── classifier.py                    # Gemini AI & regex title standardizer
+├── torrent_parser.py                # Pure-Python bencode decoder & folder tree parser
+├── torrent_search.py                # Multi-tracker swarm search (APIBay & YTS.lu)
+├── media_search.py                  # IMDb & TVmaze search, seasons & episode discovery
+├── resolvers.py                     # Videm 5-server multi-probing, VidSrc, Debrid
+├── downloader.py                    # Sliding-window HLS & aria2c multi-connection
+├── encoder.py                       # GPU NVENC transcode, chunked VRAM, continuous audio
+├── pipeline.py                      # Two-stage scheduler & persistent refining daemon
+├── ui.py                            # 3-tab Gradio UI with universal header & live updates
+├── app.py                           # Application entry point with keep-alive loop
+├── build_gradio_notebook.py         # Notebook compiler script
+├── drive_downloader_gpu_refiner.ipynb # The clean 2-cell Google Colab notebook
+├── test_suite.py                    # Comprehensive unit tests
+├── requirements.txt                 # Runtime dependencies
+└── README.md                        # Documentation
 ```
 
 ---
 
 ## 🚀 How to Run in Google Colab
 
-### Method A: Use the 2-Cell Notebook Directly
 1. Open [Google Colab](https://colab.research.google.com/).
-2. Click **File > Upload notebook** and select [`video_to_480p_mkv_drive.ipynb`](video_to_480p_mkv_drive.ipynb).
+2. Click **File > Upload notebook** and select [`drive_downloader_gpu_refiner.ipynb`](drive_downloader_gpu_refiner.ipynb).
 3. Set your runtime to GPU: **Runtime > Change runtime type > T4 GPU**.
-4. Run **Step 1**: Mounts Google Drive, installs dependencies, and syncs the project from GitHub (or extracts the embedded fallback bundle).
+4. Run **Step 1**: Mounts Google Drive, installs system packages (`aria2`, `ffmpeg` with NVENC), and syncs the project from GitHub.
 5. Run **Step 2**: Launches the Gradio web interface with a public link and starts the keep-alive telemetry loop.
-
----
-
-## 🔄 How to Push & Sync with Your GitHub Repository
-
-Because the code is now fully modularized and tracked with Git, you can push it to your personal or organization GitHub repository:
-
-### 1. Repository
-The project repository is hosted at:
-**[https://github.com/greencube-dev-boop/colab-drive-download](https://github.com/greencube-dev-boop/colab-drive-download)**
-
-### 2. Connect & Push Local Git to GitHub
-In your terminal inside `d:\code\colab drive download`:
-```bash
-# Add GitHub remote URL
-git remote add origin https://github.com/greencube-dev-boop/colab-drive-download.git
-
-# Push code to GitHub
-git push -u origin main
-```
-
-### 3. Update the Repository URL in the Notebook (Optional)
-If you fork or host this on your own GitHub account, update `REPO_URL` in `build_gradio_notebook.py` (line 122):
-```python
-REPO_URL = "https://github.com/<your-username>/<your-repo-name>.git"
-```
-Then run:
-```bash
-python build_gradio_notebook.py
-```
-This regenerates `video_to_480p_mkv_drive.ipynb` so that whenever Step 1 is executed in Colab, it will automatically `git clone` or `git pull` the latest updates from your repository!
