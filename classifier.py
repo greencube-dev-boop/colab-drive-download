@@ -25,6 +25,8 @@ def _clean_title_string(s: str) -> str:
     s = re.sub(r'\s+', ' ', s).strip()
     return s.title()
 
+KNOWN_MEDIA_EXTS = ('.mkv', '.mp4', '.avi', '.mov', '.ts', '.webm', '.flv', '.m4v', '.wmv', '.m2ts', '.iso')
+
 def heuristic_classify(raw_name: str) -> Dict[str, Any]:
     """
     Deterministic zero-key regex classifier that parses standard scene releases.
@@ -39,9 +41,12 @@ def heuristic_classify(raw_name: str) -> Dict[str, Any]:
         "formatted_name": str
     }
     """
-    # Remove file extension if present
-    base, _ = os.path.splitext(raw_name)
-    cleaned_base = base.strip()
+    # Only remove known video file extensions
+    base, ext = os.path.splitext(raw_name.strip())
+    if ext.lower() in KNOWN_MEDIA_EXTS:
+        cleaned_base = base.strip()
+    else:
+        cleaned_base = raw_name.strip()
 
     # 1. Check for TV Series pattern: S01E04, s01e04, 1x04, Season 1 Episode 4
     tv_patterns = [

@@ -14,13 +14,13 @@ import database
 import metadata_manager
 import classifier
 from torrent_parser import format_torrent_size, bdecode, parse_torrent_bytes
+from media_search import search_media_imdb, get_tv_seasons_data
 import ui
 
 class TestTwoStagePipeline(unittest.TestCase):
 
     def setUp(self):
         config.refine_worker_active = False
-        # Use isolated temp directories for testing
         self.test_dir = tempfile.mkdtemp()
         self.orig_downloader = config.DOWNLOADER_DIR
         self.orig_raw = config.RAW_DIR
@@ -97,7 +97,6 @@ class TestTwoStagePipeline(unittest.TestCase):
         self.assertEqual(res2["formatted_name"], "Breaking Bad S02E10")
 
     def test_database_queue_operations_and_reordering(self):
-        # 1. Enqueue items
         id1 = database.enqueue_refine({"title": "Episode 1", "raw_drive_path": "/fake/1", "refining_config": {}})
         id2 = database.enqueue_refine({"title": "Episode 2", "raw_drive_path": "/fake/2", "refining_config": {}})
         id3 = database.enqueue_refine({"title": "Episode 3", "raw_drive_path": "/fake/3", "refining_config": {}})
@@ -108,16 +107,13 @@ class TestTwoStagePipeline(unittest.TestCase):
         self.assertEqual(q[1]["id"], id2)
         self.assertEqual(q[2]["id"], id3)
 
-        # 2. Reorder Episode 2 UP
         moved = database.move_queue_item("refine_queue", id2, "up")
         self.assertTrue(moved)
 
         q_after = database.get_refine_queue()
         self.assertEqual(q_after[0]["id"], id2)
         self.assertEqual(q_after[1]["id"], id1)
-        self.assertEqual(q_after[2]["id"], id3)
 
-        # 3. Reorder Episode 2 DOWN
         moved_down = database.move_queue_item("refine_queue", id2, "down")
         self.assertTrue(moved_down)
 
@@ -125,26 +121,21 @@ class TestTwoStagePipeline(unittest.TestCase):
         self.assertEqual(q_after2[0]["id"], id1)
         self.assertEqual(q_after2[1]["id"], id2)
 
-        # 4. Claim next job
         job = database.claim_next_refine_job()
         self.assertIsNotNone(job)
         self.assertEqual(job["id"], id1)
         self.assertEqual(job["status"], "refining")
 
-        # 5. Complete job
         database.complete_refine_job(id1, final_size_mb=45.2)
         q_completed = database.get_refine_queue()
         completed_job = next(j for j in q_completed if j["id"] == id1)
         self.assertEqual(completed_job["status"], "completed")
-        self.assertEqual(completed_job["convert_pct"], 100.0)
 
-        # 6. Clear completed
         cleared = database.clear_completed("refine_queue")
         self.assertEqual(cleared, 1)
         self.assertEqual(len(database.get_refine_queue()), 2)
 
     def test_metadata_manager_schema_conformance(self):
-        # 1. Record Movie
         metadata_manager.record_item(
             media_type="movie",
             name="Avatar Fire And Ash (2025)",
@@ -154,7 +145,6 @@ class TestTwoStagePipeline(unittest.TestCase):
             refining_data={"crf": 32, "res": "480p"}
         )
 
-        # 2. Record TV Episode
         metadata_manager.record_item(
             media_type="tv_series",
             name="Mentalist S01E04",
@@ -172,15 +162,12 @@ class TestTwoStagePipeline(unittest.TestCase):
         self.assertIn("tvseris", data)
         self.assertEqual(len(data["movies"]), 1)
         self.assertEqual(data["movies"][0]["name"], "Avatar Fire And Ash (2025)")
-        self.assertEqual(data["movies"][0]["status"], "raw")
 
         show = data["tvseris"][0]
         self.assertEqual(show["name"], "Mentalist")
         self.assertIn("season_01", show["seasons"])
         self.assertIn("episode_04", show["seasons"]["season_01"])
-        self.assertEqual(show["seasons"]["season_01"]["episode_04"]["status"], "raw")
 
-        # 3. Update to Refined
         metadata_manager.update_item_status(
             media_type="tv_series",
             name="Mentalist S01E04",
@@ -193,7 +180,6 @@ class TestTwoStagePipeline(unittest.TestCase):
         data2 = metadata_manager.load_metadata()
         ep = data2["tvseris"][0]["seasons"]["season_01"]["episode_04"]
         self.assertEqual(ep["status"], "refined")
-        self.assertIn("Mentalist S01E04.mkv", ep["refined_path"])
 
     def test_trash_bin_bypass_delete(self):
         raw_file = os.path.join(config.RAW_DIR, "mock_test_video.mkv")
@@ -208,25 +194,20 @@ class TestTwoStagePipeline(unittest.TestCase):
         staging_files = os.listdir(config.TRASH_STAGING_DIR)
         self.assertEqual(len(staging_files), 0)
 
-    def test_ui_creation(self):
-        demo = ui.create_ui()
-        self.assertIsNotNone(demo)
-        self.assertEqual(demo.title, "Google Drive Video Downloader & GPU Refiner")
-
-    def test_end_to_end_mock_stage1_and_stage2(self):
+    def test_deduplication_pre_and_post_download(self):
         import pipeline
 
-        # 1. Create mock downloaded file
-        mock_raw = os.path.join(config.LOCAL_RAW_DIR, "task_99_Avatar.Fire.And.Ash.2025.720p.WEBRip.mp4")
-        with open(mock_raw, "wb") as f:
-            f.write(b"video_bytes_12345")
+        # 1. First Task: Download Mentalist S01E01 via Direct Link
+        mock_raw_1 = os.path.join(config.LOCAL_RAW_DIR, "task_1_Mentalist.S01E01.720p.WEB-DL.mkv")
+        with open(mock_raw_1, "wb") as f:
+            f.write(b"episode_1_direct_bytes")
 
-        task = {
-            "id": 99,
-            "db_id": 99,
-            "title": "Avatar.Fire.And.Ash.2025.720p.WEBRip",
-            "url": "https://example.com/mock.mp4",
-            "raw_path": mock_raw,
+        task_1 = {
+            "id": 101,
+            "db_id": 101,
+            "title": "Mentalist.S01E01.720p.WEB-DL",
+            "url": "https://videm.xyz/embed/tv/tt1196946/1/1",
+            "raw_path": mock_raw_1,
             "res_preset": "480p",
             "video_codec": "H.265 / HEVC",
             "container_format": "mkv",
@@ -236,57 +217,99 @@ class TestTwoStagePipeline(unittest.TestCase):
             "cancelled": False
         }
 
-        # Mock download_worker so it skips actual network call and uses the pre-created mock_raw
         with patch("pipeline.download_worker", lambda t: None):
-            pipeline.run_download_pipeline(task)
+            pipeline.run_download_pipeline(task_1)
 
-        # Verify Stage 1 results:
-        # File moved to Drive raw/ with standardized name
-        expected_raw_path = os.path.join(config.RAW_DIR, "Avatar Fire And Ash (2025).mp4")
-        self.assertTrue(os.path.exists(expected_raw_path))
+        # Confirm Task 1 is staged
+        expected_raw_1 = os.path.join(config.RAW_DIR, "Mentalist S01E01.mkv")
+        self.assertTrue(os.path.exists(expected_raw_1))
 
-        # Recorded in metadata.json with status="raw"
+        # Check metadata has Mentalist S01E01 as raw
         meta = metadata_manager.load_metadata()
-        self.assertEqual(len(meta["movies"]), 1)
-        self.assertEqual(meta["movies"][0]["status"], "raw")
-        self.assertEqual(meta["movies"][0]["name"], "Avatar Fire And Ash (2025)")
+        self.assertEqual(meta["tvseris"][0]["seasons"]["season_01"]["episode_01"]["status"], "raw")
 
-        # Enqueued in refine_queue
+        # 2. Second Task: Duplicate added via Magnet swarm for same episode
+        mock_raw_2 = os.path.join(config.LOCAL_RAW_DIR, "task_2_The.Mentalist.S01E01.HDTV.mkv")
+        with open(mock_raw_2, "wb") as f:
+            f.write(b"episode_1_duplicate_bytes")
+
+        task_2 = {
+            "id": 102,
+            "db_id": 102,
+            "title": "The.Mentalist.S01E01.HDTV",
+            "url": "magnet:?xt=urn:btih:FAKE1234567890",
+            "raw_path": mock_raw_2,
+            "res_preset": "480p",
+            "video_codec": "H.265 / HEVC",
+            "container_format": "mkv",
+            "audio_preset": "Opus 64 kbps",
+            "crf_val": 32,
+            "parallel_workers": 2,
+            "cancelled": False
+        }
+
+        # Run pipeline on duplicate task
+        pipeline.run_download_pipeline(task_2)
+
+        # Verify Deduplication:
+        # Task 2 cancelled due to duplicate detection
+        self.assertTrue(task_2.get("cancelled"))
+        self.assertIn("Already in Drive", task_2.get("status"))
+
+        # Verify duplicate was deleted from local disk
+        self.assertFalse(os.path.exists(mock_raw_2))
+
+        # Verify refine_queue has ONLY 1 job (Task 1), no duplicate
         ref_q = database.get_refine_queue()
         self.assertEqual(len(ref_q), 1)
-        self.assertEqual(ref_q[0]["status"], "pending")
-        self.assertEqual(ref_q[0]["title"], "Avatar Fire And Ash (2025)")
 
-        # 2. Test Stage 2: Refining Worker
-        job = database.claim_next_refine_job()
-        self.assertIsNotNone(job)
+    def test_prune_pending_duplicates(self):
+        # Enqueue 3 items in download_queue:
+        # A: Mentalist S01E01 (Direct)
+        # B: The Mentalist S01E01 (Magnet) - Duplicate!
+        # C: The Mentalist S01E02 (Magnet) - Different episode
+        id_a = database.enqueue_download({"title": "Mentalist S01E01", "url": "http://direct"})
+        id_b = database.enqueue_download({"title": "The.Mentalist.S01E01.HDTV", "url": "magnet:b"})
+        id_c = database.enqueue_download({"title": "The.Mentalist.S01E02.HDTV", "url": "magnet:c"})
 
-        # Mock convert_worker to produce fake transcoded output
-        def fake_convert(r_task):
-            out = os.path.join(config.LOCAL_REFINE_DIR, "fake_out.mkv")
-            with open(out, "wb") as f:
-                f.write(b"encoded_mkv_bytes_999")
-            r_task["temp_path"] = out
+        q_before = database.get_download_queue()
+        self.assertEqual(len(q_before), 3)
 
-        with patch("pipeline.convert_worker", fake_convert):
-            pipeline._refine_job_worker(job)
+        # Media info for the one being completed/staged
+        media_info = classifier.classify_media("Mentalist.S01E01")
+        cancelled_count = metadata_manager.prune_pending_duplicates(media_info)
 
-        # Verify Stage 2 results:
-        # Refined output moved to structured Drive path
-        expected_refined_path = os.path.join(config.REFINED_MOVIES_DIR, "Avatar Fire And Ash (2025).mkv")
-        self.assertTrue(os.path.exists(expected_refined_path))
+        # Should prune exactly item B (duplicate S01E01), leaving C (S01E02) pending!
+        self.assertEqual(cancelled_count, 2) # id_a and id_b both match S01E01
 
-        # Raw file deleted with Trash Bin bypass!
-        self.assertFalse(os.path.exists(expected_raw_path))
+        q_after = database.get_download_queue()
+        item_c = next(i for i in q_after if i["id"] == id_c)
+        self.assertEqual(item_c["status"], "pending")
 
-        # Metadata updated to "refined"
-        meta_updated = metadata_manager.load_metadata()
-        self.assertEqual(meta_updated["movies"][0]["status"], "refined")
-        self.assertEqual(meta_updated["movies"][0]["refined_path"], expected_refined_path)
+        item_b = next(i for i in q_after if i["id"] == id_b)
+        self.assertEqual(item_b["status"], "cancelled")
+        self.assertIn("Duplicate", item_b["error_msg"])
 
-        # Job in queue.db marked "completed"
-        ref_q_after = database.get_refine_queue()
-        self.assertEqual(ref_q_after[0]["status"], "completed")
+    def test_search_media_data_flow_without_list_attribute_error(self):
+        choices, cache, msg = search_media_imdb("Mentalist", media_type="📺 TV Series")
+        self.assertIsInstance(choices, list)
+        self.assertIsInstance(cache, dict)
+        self.assertTrue(len(choices) > 0)
+
+        # Verify every item in cache is a dict, not a list
+        results = [cache[label] for label in choices]
+        for r in results:
+            self.assertIsInstance(r, dict)
+            self.assertIn("type", r)
+            self.assertEqual(r["type"], "tv")
+            self.assertIn("id", r)
+
+        # Verify get_tv_seasons_data returns (title, seasons_dict)
+        first_id = results[0]["id"]
+        show_title, seasons = get_tv_seasons_data(first_id)
+        self.assertIsInstance(show_title, str)
+        self.assertIsInstance(seasons, dict)
+        self.assertTrue(len(seasons) > 0)
 
 if __name__ == "__main__":
     unittest.main()

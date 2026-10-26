@@ -877,18 +877,16 @@ def create_ui():
 
         # 3. Title Search & Swarm Search
         def handle_run_search(query, search_type):
-            if not query.strip():
+            if not query or not query.strip():
                 return gr.update(visible=False), [], "⚠️ Please enter a title to search.", gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
-            results = search_media_imdb(query.strip())
-            if search_type == "Movie":
-                results = [r for r in results if r.get("type") == "movie"]
-            elif search_type == "TV Series":
-                results = [r for r in results if r.get("type") == "tv"]
 
-            if not results:
+            m_filter = "🎬 Movies" if search_type == "Movie" else ("📺 TV Series" if search_type == "TV Series" else "All")
+            choices, cache, msg = search_media_imdb(query.strip(), media_type=m_filter)
+
+            if not choices:
                 return gr.update(visible=False), [], f"❌ No results found for '{query}'.", gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
 
-            choices = [f"[{r.get('type','').upper()}] {r.get('title','')} ({r.get('year','N/A')})" for r in results]
+            results = [cache[label] for label in choices]
             return (
                 gr.update(visible=True, choices=choices, value=choices[0]),
                 results,
@@ -912,8 +910,15 @@ def create_ui():
                     gr.update(visible=False), gr.update(visible=False), gr.update(visible=False),
                     None, {}, {}, gr.update(choices=[]), "", "", gr.update(choices=[])
                 )
-            idx = [f"[{r.get('type','').upper()}] {r.get('title','')} ({r.get('year','N/A')})" for r in results].index(choice)
-            media = results[idx]
+
+            media = next((r for r in results if r.get("display") == choice), None)
+            if not media:
+                try:
+                    idx = [r.get("display") for r in results].index(choice)
+                    media = results[idx]
+                except Exception:
+                    media = results[0]
+
             m_type = media.get("type", "movie")
             title = media.get("title", "")
             year = media.get("year", "")
@@ -930,12 +935,12 @@ def create_ui():
                     info_text, "", gr.update(choices=[])
                 )
             else:
-                seasons_data = get_tv_seasons_data(media.get("id"))
+                show_title, seasons_data = get_tv_seasons_data(media.get("id"))
                 s_choices = [f"Season {s}" for s in sorted(seasons_data.keys())]
                 first_s = min(seasons_data.keys()) if seasons_data else 1
                 first_eps = seasons_data.get(first_s, [])
                 ep_choices = [e["label"] for e in first_eps]
-                info_text = f"### 📺 {title} ({year})\n*Loaded {len(seasons_data)} seasons and live torrent swarms.*"
+                info_text = f"### 📺 {show_title or title} ({year})\n*Loaded {len(seasons_data)} season(s) and live torrent swarms.*"
                 return (
                     gr.update(visible=False), gr.update(visible=True), gr.update(visible=True),
                     media, seasons_data, torrent_map,
@@ -958,11 +963,13 @@ def create_ui():
         def handle_season_change(season_str, seasons_data, media):
             if not season_str or not seasons_data:
                 return gr.update(choices=[], value=[]), gr.update(choices=[]), {}
-            s_num = int(re.search(r'\d+', season_str).group(0))
+            m = re.search(r'\d+', season_str)
+            s_num = int(m.group(0)) if m else 1
             eps = seasons_data.get(s_num, [])
             labels = [e["label"] for e in eps]
-            # Search season specific torrents
-            t_choices, t_map = search_live_torrents(media.get("title", ""), year=media.get("year", ""), mode="tv", season=s_num)
+            t_title = media.get("title", "") if media else ""
+            t_year = media.get("year", "") if media else ""
+            t_choices, t_map = search_live_torrents(t_title, year=t_year, mode="tv", season=s_num)
             return (
                 gr.update(choices=labels, value=labels),
                 gr.update(choices=t_choices, value=t_choices[0] if t_choices else None),

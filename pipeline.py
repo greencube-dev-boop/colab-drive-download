@@ -167,17 +167,32 @@ def download_worker(task: Dict[str, Any]):
 
 def run_download_pipeline(task: Dict[str, Any]):
     """
-    Stage 1 Execution:
-    1. Download video to local Colab workspace
-    2. Classify media using AI / Heuristic Regex
-    3. Move raw video to Google Drive (drive/downloader/raw/<formatted_name>.<ext>)
-    4. Record in drive/downloader/data/metadata.json (status='raw')
-    5. Enqueue into persistent SQLite queue (drive/downloader/data/queue.db)
+    Stage 1 Execution with Automated Deduplication:
+    1. Pre-download check: Check if media is already in Drive (raw or refined)
+    2. Download video to local Colab workspace
+    3. Post-download check: Re-verify actual file against Drive
+    4. Move raw video to Google Drive (drive/downloader/raw/<formatted_name>.<ext>)
+    5. Record in metadata.json and prune any pending duplicates in download_queue
+    6. Enqueue into persistent SQLite queue (drive/downloader/data/queue.db)
     """
     t_id = task.get("id")
     db_id = task.get("db_id", t_id)
     try:
         if task.get("cancelled"):
+            return
+
+        # -------------------------------------------------------------
+        # DEDUPLICATION CHECK 1 (Pre-Download)
+        # -------------------------------------------------------------
+        pre_info = classifier.classify_media(task.get("title", ""))
+        exists, st_exists, existing_path = metadata_manager.check_media_exists(pre_info)
+        if exists:
+            msg = f"Skipped: Already exists in Drive as {st_exists}"
+            print(f"[Deduplication] Task #{t_id} '{task.get('title')}' skipped ({msg}) -> {existing_path}")
+            task["status"] = f"Skipped (Already in Drive: {st_exists})"
+            task["cancelled"] = True
+            task["download_pct"] = 100.0
+            database.update_item_status("download_queue", db_id, status="cancelled", error_msg=msg)
             return
 
         task["status"] = "Queued for Download"
@@ -196,15 +211,34 @@ def run_download_pipeline(task: Dict[str, Any]):
         task["status"] = "Classifying & Staging"
         database.update_item_status("download_queue", db_id, status="staging")
 
-        # 1. AI & Heuristic Classification
-        media_info = classifier.classify_media(task.get("title", ""))
+        # -------------------------------------------------------------
+        # DEDUPLICATION CHECK 2 (Post-Download, using actual downloaded media)
+        # -------------------------------------------------------------
+        downloaded_name = os.path.basename(task["raw_path"])
+        # Classify with downloaded name if title was generic
+        media_info = classifier.classify_media(task.get("title", "") or downloaded_name)
+        exists, st_exists, existing_path = metadata_manager.check_media_exists(media_info)
+        if exists:
+            # Duplicate finished downloading! Delete local raw file immediately to save disk
+            print(f"[Deduplication] Task #{t_id} downloaded duplicate detected. Purging local copy -> {task['raw_path']}")
+            try:
+                if os.path.exists(task["raw_path"]):
+                    os.remove(task["raw_path"])
+            except Exception:
+                pass
+            msg = f"Cancelled: Duplicate of existing media in Drive ({st_exists})"
+            task["status"] = f"Cancelled (Duplicate: Already in Drive)"
+            task["cancelled"] = True
+            database.update_item_status("download_queue", db_id, status="cancelled", error_msg=msg)
+            return
+
         media_type = media_info.get("type", "other")
         show_name = media_info.get("show_name", "")
         season = media_info.get("season", 0)
         episode = media_info.get("episode", 0)
         formatted_name = media_info.get("formatted_name", sanitize_filename(task.get("title", "")))
 
-        # 2. Determine raw filename & Drive raw staging path
+        # Determine raw filename & Drive raw staging path
         raw_ext = os.path.splitext(task["raw_path"])[1].lower() or ".mp4"
         standard_raw_filename = f"{formatted_name}{raw_ext}"
         drive_raw_path = os.path.join(config.RAW_DIR, standard_raw_filename)
@@ -221,7 +255,7 @@ def run_download_pipeline(task: Dict[str, Any]):
         shutil.move(task["raw_path"], drive_raw_path)
         raw_size_mb = os.path.getsize(drive_raw_path) / (1024 * 1024)
 
-        # 3. Determine expected refined output path in Google Drive
+        # Determine expected refined output path in Google Drive
         container_choice = task.get("container_format", "mkv").lower()
         target_ext = ".mp4" if "mp4" in container_choice else ".mkv"
         if media_type == "tv_series":
@@ -242,7 +276,7 @@ def run_download_pipeline(task: Dict[str, Any]):
             "parallel_workers": task.get("parallel_workers", 3)
         }
 
-        # 4. Record in metadata.json
+        # Record in metadata.json
         metadata_manager.record_item(
             media_type=media_type,
             name=formatted_name,
@@ -255,7 +289,14 @@ def run_download_pipeline(task: Dict[str, Any]):
             episode=episode
         )
 
-        # 5. Enqueue into persistent refine_queue in queue.db
+        # -------------------------------------------------------------
+        # DEDUPLICATION CHECK 3 (Prune pending queue duplicates)
+        # -------------------------------------------------------------
+        pruned_count = metadata_manager.prune_pending_duplicates(media_info)
+        if pruned_count > 0:
+            print(f"[Deduplication] Pruned {pruned_count} pending duplicate(s) from download queue.")
+
+        # Enqueue into persistent refine_queue in queue.db
         refine_job_id = database.enqueue_refine({
             "media_type": media_type,
             "show_name": show_name,
@@ -268,7 +309,7 @@ def run_download_pipeline(task: Dict[str, Any]):
             "refining_config": refining_config
         })
 
-        # 6. Mark Stage 1 completed
+        # Mark Stage 1 completed
         task["status"] = "Staged in Drive"
         task["download_pct"] = 100.0
         database.update_item_status(
@@ -286,7 +327,8 @@ def run_download_pipeline(task: Dict[str, Any]):
             database.update_item_status("download_queue", db_id, status="failed", error_msg=str(e))
     finally:
         if task.get("cancelled"):
-            task["status"] = "Cancelled"
+            if not str(task.get("status", "")).startswith("Cancelled") and not str(task.get("status", "")).startswith("Skipped"):
+                task["status"] = "Cancelled"
             cleanup_task_files(t_id, task)
 
 def _refine_job_worker(job: Dict[str, Any]):
@@ -314,7 +356,6 @@ def _refine_job_worker(job: Dict[str, Any]):
     os.makedirs(LOCAL_REFINE_DIR, exist_ok=True)
     local_raw_copy = os.path.join(LOCAL_REFINE_DIR, f"refine_{job_id}_{os.path.basename(raw_drive_path)}")
 
-    # Construct execution task context
     refine_task: Dict[str, Any] = {
         "id": job_id,
         "title": job.get("title", "Refined Video"),
@@ -336,14 +377,14 @@ def _refine_job_worker(job: Dict[str, Any]):
         _active_refine_tasks[job_id] = refine_task
 
     try:
-        # Step A: Copy from Drive to local VM ephemeral disk for ultra-fast NVENC access
+        # Step A: Copy from Drive to local VM ephemeral disk
         database.update_item_status("refine_queue", job_id, status="refining", convert_pct=5.0)
         shutil.copy2(raw_drive_path, local_raw_copy)
 
         if refine_task.get("cancelled"):
             return
 
-        # Step B: Execute GPU VRAM chunked transcoding
+        # Step B: GPU VRAM chunked transcoding
         database.update_item_status("refine_queue", job_id, status="refining", convert_pct=10.0)
         convert_worker(refine_task)
 
@@ -421,7 +462,6 @@ def ensure_refine_daemon_running():
         _daemon_started = True
         t = threading.Thread(target=_refine_daemon_loop, daemon=True, name="RefineDaemon")
         t.start()
-
 
 def queue_direct_items(
     items_list: List[Tuple[str, str]],
