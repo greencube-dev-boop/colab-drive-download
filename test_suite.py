@@ -34,6 +34,11 @@ class TestTwoStagePipeline(unittest.TestCase):
         self.orig_trash = config.TRASH_STAGING_DIR
         self.orig_local_raw = config.LOCAL_RAW_DIR
         self.orig_local_refine = config.LOCAL_REFINE_DIR
+        self.orig_drive_db = getattr(config, "DRIVE_QUEUE_DB", None)
+        self.orig_local_db = getattr(config, "LOCAL_QUEUE_DB", None)
+        self.orig_local_data = getattr(config, "LOCAL_DATA_DIR", None)
+        self.orig_local_meta = getattr(config, "LOCAL_METADATA_JSON", None)
+        self.orig_is_colab = getattr(config, "IS_COLAB", False)
 
         config.DOWNLOADER_DIR = self.test_dir
         config.RAW_DIR = os.path.join(self.test_dir, "raw")
@@ -42,22 +47,28 @@ class TestTwoStagePipeline(unittest.TestCase):
         config.REFINED_TV_DIR = os.path.join(config.REFINED_DIR, "tv_series")
         config.REFINED_OTHER_DIR = os.path.join(config.REFINED_DIR, "other")
         config.DATA_DIR = os.path.join(self.test_dir, "data")
+        config.LOCAL_DATA_DIR = os.path.join(self.test_dir, "local_data")
         config.QUEUE_DB = os.path.join(config.DATA_DIR, "queue.db")
+        config.DRIVE_QUEUE_DB = os.path.join(config.DATA_DIR, "queue.db")
+        config.LOCAL_QUEUE_DB = os.path.join(config.LOCAL_DATA_DIR, "queue.db")
         config.METADATA_JSON = os.path.join(config.DATA_DIR, "metadata.json")
+        config.LOCAL_METADATA_JSON = os.path.join(config.LOCAL_DATA_DIR, "metadata.json")
         config.TRASH_STAGING_DIR = os.path.join(self.test_dir, "trash_staging")
         config.LOCAL_RAW_DIR = os.path.join(self.test_dir, "local_raw")
         config.LOCAL_REFINE_DIR = os.path.join(self.test_dir, "local_refine")
 
         for d in [config.RAW_DIR, config.REFINED_DIR, config.REFINED_MOVIES_DIR,
-                  config.REFINED_TV_DIR, config.REFINED_OTHER_DIR, config.DATA_DIR,
+                  config.REFINED_TV_DIR, config.REFINED_OTHER_DIR, config.DATA_DIR, config.LOCAL_DATA_DIR,
                   config.TRASH_STAGING_DIR, config.LOCAL_RAW_DIR, config.LOCAL_REFINE_DIR]:
             os.makedirs(d, exist_ok=True)
 
+        metadata_manager.reset_cache()
         database.init_db()
 
     def tearDown(self):
         config.download_worker_active = False
         config.refine_worker_active = False
+        metadata_manager.reset_cache()
         config.DOWNLOADER_DIR = self.orig_downloader
         config.RAW_DIR = self.orig_raw
         config.REFINED_DIR = self.orig_refined
@@ -67,6 +78,11 @@ class TestTwoStagePipeline(unittest.TestCase):
         config.TRASH_STAGING_DIR = self.orig_trash
         config.LOCAL_RAW_DIR = self.orig_local_raw
         config.LOCAL_REFINE_DIR = self.orig_local_refine
+        config.DRIVE_QUEUE_DB = self.orig_drive_db
+        config.LOCAL_QUEUE_DB = self.orig_local_db
+        config.LOCAL_DATA_DIR = self.orig_local_data
+        config.LOCAL_METADATA_JSON = self.orig_local_meta
+        config.IS_COLAB = self.orig_is_colab
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def test_classifier_movie(self):
@@ -682,6 +698,72 @@ class TestTwoStagePipeline(unittest.TestCase):
         self.assertEqual(len(detected_after_all), 0)
         html_final = ui.render_refine_queue_html()
         self.assertNotIn("Un-queued Raw Files Detected", html_final)
+
+    def test_drive_root_spill_prevention_and_cleanup(self):
+        # 1. Verify resolve_downloader_dir never resolves to drive root
+        config.IS_COLAB = True
+        resolved = config.resolve_downloader_dir()
+        forbidden = ["/content/drive/MyDrive", "/content/drive", "/content", "/"]
+        self.assertNotIn(os.path.abspath(resolved), [os.path.abspath(f) for f in forbidden])
+        self.assertTrue(resolved.endswith("downloader") or "downloader" in resolved or "downloader_staging" in resolved)
+
+        # 2. Test cleanup_drive_root_stray_files
+        mock_mydrive = os.path.join(self.test_dir, "mock_mydrive")
+        os.makedirs(mock_mydrive, exist_ok=True)
+
+        stray_db = os.path.join(mock_mydrive, "queue (1).db")
+        stray_db_tmp = os.path.join(mock_mydrive, "queue.db.tmp")
+        stray_meta_tmp = os.path.join(mock_mydrive, "metadata.json.tmp")
+        stray_meta_conflict = os.path.join(mock_mydrive, "metadata (1).json")
+        regular_file = os.path.join(mock_mydrive, "ImportantDocument.pdf")
+
+        for fpath in [stray_db, stray_db_tmp, stray_meta_tmp, stray_meta_conflict, regular_file]:
+            with open(fpath, "w", encoding="utf-8") as f:
+                f.write("content")
+
+        config.cleanup_drive_root_stray_files(drive_root=mock_mydrive)
+
+        # Non-stray file must NOT be deleted
+        self.assertTrue(os.path.exists(regular_file))
+        # Stray files must be cleaned up
+        self.assertFalse(os.path.exists(stray_db))
+        self.assertFalse(os.path.exists(stray_db_tmp))
+        self.assertFalse(os.path.exists(stray_meta_tmp))
+        self.assertFalse(os.path.exists(stray_meta_conflict))
+
+    def test_debounced_sync_and_zero_tmp_files(self):
+        config.IS_COLAB = True
+        config.LOCAL_QUEUE_DB = os.path.join(config.LOCAL_DATA_DIR, "queue.db")
+        config.DRIVE_QUEUE_DB = os.path.join(config.DATA_DIR, "queue.db")
+        config.QUEUE_DB = config.LOCAL_QUEUE_DB
+
+        # Re-initialize DB in local queue path
+        database.init_db()
+        self.assertTrue(os.path.exists(config.LOCAL_QUEUE_DB))
+
+        # Force sync to Drive
+        database.sync_db_to_drive(force=True)
+        self.assertTrue(os.path.exists(config.DRIVE_QUEUE_DB))
+
+        # Verify NO .tmp file exists in Drive DATA_DIR
+        drive_files = os.listdir(config.DATA_DIR)
+        tmp_files = [f for f in drive_files if f.endswith(".tmp") or ".tmp" in f]
+        self.assertEqual(len(tmp_files), 0)
+
+        # Test metadata_manager save_metadata
+        test_data = {"movies": [{"name": "Test Movie", "year": 2026}], "tvseris": [], "other": []}
+        metadata_manager.save_metadata(test_data)
+
+        # Verify metadata exists on Drive without any .tmp file
+        self.assertTrue(os.path.exists(config.METADATA_JSON))
+        drive_files_after_meta = os.listdir(config.DATA_DIR)
+        tmp_files_after_meta = [f for f in drive_files_after_meta if f.endswith(".tmp") or ".tmp" in f]
+        self.assertEqual(len(tmp_files_after_meta), 0)
+
+        # Verify metadata_manager load_metadata uses cache
+        loaded = metadata_manager.load_metadata()
+        self.assertEqual(len(loaded["movies"]), 1)
+        self.assertEqual(loaded["movies"][0]["name"], "Test Movie")
 
 if __name__ == "__main__":
     unittest.main()

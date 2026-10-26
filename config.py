@@ -1,19 +1,46 @@
 import os
 import re
 import uuid
+import time
 import shutil
 import threading
+from typing import Optional, List, Dict, Any
 from pathlib import Path
 
 # Detect Environment: Google Colab vs Local
 IS_COLAB = os.path.exists("/content") and not os.path.exists("C:\\")
 
 def resolve_downloader_dir() -> str:
-    """Dynamically locates Google Drive downloader directory, supporting shortcuts and shared folders."""
+    """
+    Dynamically locates Google Drive downloader directory, supporting shortcuts,
+    .shortcut-targets-by-id resolution, and shared folders while guaranteeing files
+    are NEVER written directly to Google Drive root.
+    """
     if not IS_COLAB:
         base_dir = os.path.abspath(os.path.dirname(__file__))
         return os.path.join(base_dir, "downloader_staging")
 
+    # 1. Primary check: .shortcut-targets-by-id (Google Drive shortcut targets on Colab)
+    targets_root = "/content/drive/.shortcut-targets-by-id"
+    if os.path.exists(targets_root):
+        try:
+            for tid in os.listdir(targets_root):
+                t_path = os.path.join(targets_root, tid)
+                if not os.path.isdir(t_path):
+                    continue
+                try:
+                    entries = [e.lower() for e in os.listdir(t_path)]
+                    if any(k in entries for k in ["data", "raw", "refined"]) or any(e.endswith(".ipynb") for e in entries):
+                        return t_path
+                    sub = os.path.join(t_path, "downloader")
+                    if os.path.exists(sub) and os.path.isdir(sub):
+                        return sub
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    # 2. Check canonical candidate directories
     candidates = [
         "/content/drive/MyDrive/downloader",
         "/content/drive/MyDrive/downloader - Shortcut",
@@ -21,20 +48,36 @@ def resolve_downloader_dir() -> str:
     ]
     for c in candidates:
         if os.path.exists(c):
-            return c
+            try:
+                real = os.path.realpath(c)
+                if real and os.path.exists(real) and os.path.isdir(real):
+                    if os.path.abspath(real) not in [os.path.abspath("/content/drive/MyDrive"), os.path.abspath("/content/drive")]:
+                        return real
+            except Exception:
+                pass
+            if os.path.isdir(c):
+                return c
 
-    # Search /content/drive/MyDrive for any folder starting with 'downloader'
+    # 3. Search /content/drive/MyDrive for any folder starting with 'downloader'
     mydrive = "/content/drive/MyDrive"
     if os.path.exists(mydrive):
         try:
             for entry in os.listdir(mydrive):
                 full_p = os.path.join(mydrive, entry)
-                if entry.lower().startswith("downloader") and os.path.isdir(full_p):
-                    return full_p
+                if entry.lower().startswith("downloader"):
+                    try:
+                        real = os.path.realpath(full_p)
+                        if real and os.path.exists(real) and os.path.isdir(real):
+                            if os.path.abspath(real) not in [os.path.abspath("/content/drive/MyDrive"), os.path.abspath("/content/drive")]:
+                                return real
+                    except Exception:
+                        pass
+                    if os.path.isdir(full_p):
+                        return full_p
         except Exception:
             pass
 
-    # Search Shared Drives
+    # 4. Search Shared Drives
     shareddrives = "/content/drive/Shareddrives"
     if os.path.exists(shareddrives):
         try:
@@ -48,7 +91,13 @@ def resolve_downloader_dir() -> str:
         except Exception:
             pass
 
-    return "/content/drive/MyDrive/downloader"
+    # Default fallback canonical path
+    resolved = "/content/drive/MyDrive/downloader"
+    resolved = os.path.abspath(resolved)
+    if resolved in [os.path.abspath("/content/drive/MyDrive"), os.path.abspath("/content/drive"), os.path.abspath("/")]:
+        resolved = "/content/drive/MyDrive/downloader"
+
+    return resolved
 
 DOWNLOADER_DIR = resolve_downloader_dir()
 if IS_COLAB:
@@ -71,6 +120,7 @@ LOCAL_RAW_DIR = os.path.join(LOCAL_WORKSPACE, "raw_in")
 LOCAL_REFINE_DIR = os.path.join(LOCAL_WORKSPACE, "refining")
 TRASH_STAGING_DIR = os.path.join(LOCAL_WORKSPACE, "trash_staging")
 LOCAL_DATA_DIR = os.path.join(LOCAL_WORKSPACE, "data")
+LOCAL_METADATA_JSON = os.path.join(LOCAL_DATA_DIR, "metadata.json")
 TEMP_DIR = LOCAL_WORKSPACE
 DRIVE_DIR = DOWNLOADER_DIR
 
@@ -155,3 +205,65 @@ def bypass_trash_delete(file_path_on_drive: str) -> bool:
         except Exception:
             pass
         return False
+
+def cleanup_drive_root_stray_files(drive_root: Optional[str] = None):
+    """
+    Scans Google Drive root (/content/drive/MyDrive) for stray .db or .json files
+    accidentally written there by shortcut resolution issues or FUSE ghost copies,
+    and safely removes them using bypass_trash_delete.
+    """
+    if drive_root is None and not IS_COLAB:
+        return
+    mydrive = drive_root or "/content/drive/MyDrive"
+    if not os.path.exists(mydrive):
+        return
+
+    try:
+        entries = os.listdir(mydrive)
+    except Exception:
+        return
+
+    # Patterns for stray database and metadata files
+    stray_patterns = [
+        re.compile(r"^queue.*\.db.*$", re.IGNORECASE),
+        re.compile(r"^metadata.*\.json.*$", re.IGNORECASE),
+    ]
+
+    # Data preservation before cleanup:
+    # If DATA_DIR does not have queue.db or metadata.json, rescue the best file from root
+    try:
+        dest_db = os.path.join(DATA_DIR, "queue.db")
+        if not os.path.exists(dest_db):
+            root_db = os.path.join(mydrive, "queue.db")
+            if os.path.exists(root_db) and os.path.getsize(root_db) > 0:
+                os.makedirs(DATA_DIR, exist_ok=True)
+                shutil.copyfile(root_db, dest_db)
+                print(f"[Cleanup] Rescued valid queue.db from Drive root to {dest_db}")
+
+        dest_meta = os.path.join(DATA_DIR, "metadata.json")
+        if not os.path.exists(dest_meta):
+            root_meta = os.path.join(mydrive, "metadata.json")
+            if os.path.exists(root_meta) and os.path.getsize(root_meta) > 0:
+                os.makedirs(DATA_DIR, exist_ok=True)
+                shutil.copyfile(root_meta, dest_meta)
+                print(f"[Cleanup] Rescued valid metadata.json from Drive root to {dest_meta}")
+    except Exception as e:
+        print(f"[Cleanup] Warning checking for rescue files: {e}")
+
+    cleaned = 0
+    for entry in entries:
+        full_path = os.path.join(mydrive, entry)
+        if not os.path.isfile(full_path):
+            continue
+        for pat in stray_patterns:
+            if pat.match(entry):
+                print(f"[Cleanup] Removing stray root artifact: {entry}")
+                bypass_trash_delete(full_path)
+                cleaned += 1
+                break
+    if cleaned > 0:
+        print(f"[Cleanup] Cleaned up {cleaned} stray db/json files from Google Drive root.")
+
+# Run root cleanup on module import if running in Colab
+if IS_COLAB:
+    cleanup_drive_root_stray_files()

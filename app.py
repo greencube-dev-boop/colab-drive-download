@@ -2,6 +2,7 @@ import sys
 import time
 import argparse
 from ui import create_ui
+import config
 from config import tasks, tasks_lock
 import database
 from pipeline import ensure_daemons_running
@@ -17,6 +18,7 @@ def main():
     print("🚀 Initializing Two-Stage Google Drive Downloader & GPU Refiner Engine...")
     print("=" * 72)
 
+    config.cleanup_drive_root_stray_files()
     database.init_db()
     ensure_daemons_running()
     demo = create_ui()
@@ -55,7 +57,9 @@ def main():
 
             print(f"\r⏱️ Keep-Alive | Uptime: {h:02d}h {m:02d}m {s:02d}s | DLs: {dl_active} active ({dl_pending} queued) | Refiner: {rf_active} active ({rf_pending} queued) | Refined: {rf_done}", end="", flush=True)
     except KeyboardInterrupt:
-        print("\n🛑 Execution stopped by user.")
+        print("\n🛑 Execution stopped by user. Flushing persistent queues...")
+    finally:
+        database.sync_db_to_drive(force=True)
 
 if __name__ == "__main__":
     main()

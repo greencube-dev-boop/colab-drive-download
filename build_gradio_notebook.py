@@ -142,29 +142,25 @@ if has_gpu:
 REPO_URL = "https://github.com/greencube-dev-boop/colab-drive-download.git"
 REPO_DIR = "/content/colab-drive-download"
 
-git_synced = False
-if not os.path.exists(REPO_DIR):
-    clone_res = subprocess.run(["git", "clone", REPO_URL, REPO_DIR], capture_output=True, text=True)
-    if clone_res.returncode == 0:
-        git_synced = True
-        print(f"✅ Cloned latest project from GitHub into {REPO_DIR}!")
-else:
-    pull_res = subprocess.run(["git", "-C", REPO_DIR, "pull"], capture_output=True, text=True)
-    if pull_res.returncode == 0:
-        git_synced = True
-        print(f"✅ Pulled latest project updates from GitHub into {REPO_DIR}!")
+print("📦 Deploying project modules into workspace...")
+os.makedirs(REPO_DIR, exist_ok=True)
+bundle_data = """ + repr(compressed_bundle) + """
+decompressed = zlib.decompress(base64.b64decode(bundle_data)).decode('utf-8')
+files_dict = json.loads(decompressed)
+for fname, fcontent in files_dict.items():
+    fpath = os.path.join(REPO_DIR, fname)
+    with open(fpath, "w", encoding="utf-8") as f:
+        f.write(fcontent)
+print(f"✅ Deployed {len(files_dict)} modular project files successfully into {REPO_DIR}!")
 
-if not git_synced:
-    print("📦 Extracting embedded project modules into workspace...")
-    os.makedirs(REPO_DIR, exist_ok=True)
-    bundle_data = """ + repr(compressed_bundle) + """
-    decompressed = zlib.decompress(base64.b64decode(bundle_data)).decode('utf-8')
-    files_dict = json.loads(decompressed)
-    for fname, fcontent in files_dict.items():
-        fpath = os.path.join(REPO_DIR, fname)
-        with open(fpath, "w", encoding="utf-8") as f:
-            f.write(fcontent)
-    print(f"✅ Extracted {len(files_dict)} modular project files successfully into {REPO_DIR}!")
+try:
+    if not os.path.exists(os.path.join(REPO_DIR, ".git")):
+        subprocess.run(["git", "clone", "--depth", "1", REPO_URL, REPO_DIR + "_git_temp"], capture_output=True, text=True, timeout=15)
+        if os.path.exists(REPO_DIR + "_git_temp/.git"):
+            shutil.move(REPO_DIR + "_git_temp/.git", os.path.join(REPO_DIR, ".git"))
+            shutil.rmtree(REPO_DIR + "_git_temp", ignore_errors=True)
+except Exception:
+    pass
 
 os.chdir(REPO_DIR)
 print(f"🎉 Setup complete! Current workspace: {os.getcwd()}")

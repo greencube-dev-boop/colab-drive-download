@@ -2,6 +2,7 @@ import os
 import re
 import glob
 import json
+import time
 import shutil
 import datetime
 import threading
@@ -9,6 +10,17 @@ from typing import Dict, Any, List, Optional, Tuple
 import config
 
 _meta_lock = threading.RLock()
+_cached_metadata: Optional[Dict[str, Any]] = None
+_cached_file: str = ""
+_last_cache_time: float = 0.0
+
+def reset_cache():
+    """Resets in-memory metadata cache."""
+    global _cached_metadata, _cached_file, _last_cache_time
+    with _meta_lock:
+        _cached_metadata = None
+        _cached_file = ""
+        _last_cache_time = 0.0
 
 def normalize_title(t: str) -> str:
     """Normalizes title string for duplicate comparison (removes 'the', punctuation, whitespace)."""
@@ -63,15 +75,36 @@ def _default_schema() -> Dict[str, Any]:
 def _now_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
-def load_metadata() -> Dict[str, Any]:
-    """Loads metadata.json thread-safely with automatic initialization."""
+def load_metadata(force_reload: bool = False) -> Dict[str, Any]:
+    """Loads metadata thread-safely with caching and local SSD mirroring."""
+    global _cached_metadata, _cached_file, _last_cache_time
     with _meta_lock:
-        if not os.path.exists(config.METADATA_JSON):
+        now = time.time()
+        local_meta = getattr(config, "LOCAL_METADATA_JSON", os.path.join(config.DATA_DIR, "metadata.json"))
+        drive_meta = getattr(config, "METADATA_JSON", os.path.join(config.DATA_DIR, "metadata.json"))
+
+        # In Colab, initialize local SSD working copy from Drive if available
+        if getattr(config, "IS_COLAB", False) and os.path.exists(drive_meta) and not os.path.exists(local_meta):
+            try:
+                os.makedirs(os.path.dirname(local_meta), exist_ok=True)
+                shutil.copyfile(drive_meta, local_meta)
+            except Exception as e:
+                print(f"[Metadata] Notice: Initial copy from Drive: {e}")
+
+        target_file = local_meta if (getattr(config, "IS_COLAB", False) and os.path.exists(local_meta)) else drive_meta
+
+        if not force_reload and _cached_metadata is not None and _cached_file == target_file and (now - _last_cache_time) < 5.0:
+            return _cached_metadata
+
+        if not os.path.exists(target_file):
             data = _default_schema()
             save_metadata(data)
+            _cached_metadata = data
+            _cached_file = target_file
+            _last_cache_time = now
             return data
         try:
-            with open(config.METADATA_JSON, "r", encoding="utf-8") as f:
+            with open(target_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 if not isinstance(data, dict):
                     data = _default_schema()
@@ -80,36 +113,75 @@ def load_metadata() -> Dict[str, Any]:
                     data["tvseris"] = data["tv_series"]
                 data.setdefault("tvseris", [])
                 data.setdefault("other", [])
+                _cached_metadata = data
+                _cached_file = target_file
+                _last_cache_time = now
                 return data
         except Exception as e:
             print(f"[Metadata] Warning loading metadata: {e}. Initializing default.")
-            return _default_schema()
+            data = _default_schema()
+            _cached_metadata = data
+            _cached_file = target_file
+            _last_cache_time = now
+            return data
 
 def save_metadata(data: Dict[str, Any]):
-    """Saves metadata to disk safely using atomic temp file replacement."""
-    os.makedirs(config.DATA_DIR, exist_ok=True)
-    temp_file = config.METADATA_JSON + ".tmp"
-    if "tvseris" in data:
-        data["tv_series"] = data["tvseris"]
-    try:
-        with open(temp_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+    """
+    Saves metadata safely using local SSD atomic write and single-shot Drive mirroring.
+    Completely avoids writing .tmp files to Google Drive FUSE to prevent ghost / duplicate files.
+    """
+    global _cached_metadata, _cached_file, _last_cache_time
+    with _meta_lock:
+        if "tvseris" in data:
+            data["tv_series"] = data["tvseris"]
+
+        local_dir = getattr(config, "LOCAL_DATA_DIR", config.DATA_DIR)
+        os.makedirs(local_dir, exist_ok=True)
+        local_meta = getattr(config, "LOCAL_METADATA_JSON", os.path.join(local_dir, "metadata.json"))
+        local_temp = os.path.join(local_dir, "metadata_atomic.tmp")
+        target_file = local_meta if getattr(config, "IS_COLAB", False) else getattr(config, "METADATA_JSON", local_meta)
+
+        _cached_metadata = data
+        _cached_file = target_file
+        _last_cache_time = time.time()
+
         try:
-            if os.path.exists(config.METADATA_JSON):
-                os.replace(temp_file, config.METADATA_JSON)
-            else:
-                os.rename(temp_file, config.METADATA_JSON)
-        except OSError:
-            shutil.copy2(temp_file, config.METADATA_JSON)
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-    except Exception as e:
-        print(f"[Metadata] Error saving metadata: {e}")
-        try:
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-        except Exception:
-            pass
+            # 1. Atomic write on local SSD
+            with open(local_temp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            try:
+                os.replace(local_temp, local_meta)
+            except OSError:
+                shutil.copyfile(local_temp, local_meta)
+                if os.path.exists(local_temp):
+                    os.remove(local_temp)
+
+            # 2. Single-pass mirror to Google Drive (never write .tmp on Drive FUSE!)
+            drive_meta = getattr(config, "METADATA_JSON", None)
+            if getattr(config, "IS_COLAB", False) and drive_meta:
+                drive_meta_dir = os.path.abspath(os.path.dirname(drive_meta))
+                forbidden_roots = [
+                    os.path.abspath("/content/drive/MyDrive"),
+                    os.path.abspath("/content/drive"),
+                    os.path.abspath("/content"),
+                    os.path.abspath("/")
+                ]
+                if drive_meta_dir not in forbidden_roots:
+                    os.makedirs(drive_meta_dir, exist_ok=True)
+                    shutil.copyfile(local_meta, drive_meta)
+                else:
+                    print(f"[Metadata] Security Warning: Refusing to mirror metadata directly into Drive root ({drive_meta_dir}).")
+            elif not getattr(config, "IS_COLAB", False) and drive_meta and drive_meta != local_meta:
+                os.makedirs(os.path.dirname(drive_meta), exist_ok=True)
+                shutil.copyfile(local_meta, drive_meta)
+
+        except Exception as e:
+            print(f"[Metadata] Error saving metadata: {e}")
+            if os.path.exists(local_temp):
+                try:
+                    os.remove(local_temp)
+                except Exception:
+                    pass
 
 def check_media_exists(media_info: Dict[str, Any]) -> Tuple[bool, str, str]:
     """

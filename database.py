@@ -1,4 +1,5 @@
 import os
+import time
 import json
 import shutil
 import sqlite3
@@ -8,32 +9,59 @@ from typing import Dict, Any, List, Optional, Tuple
 import config
 
 _db_lock = threading.Lock()
+_last_db_sync_time: float = 0.0
 
-def sync_db_to_drive():
-    """Safely mirrors local SQLite database to Google Drive for multi-session persistence."""
+def sync_db_to_drive(force: bool = False):
+    """
+    Safely mirrors local SQLite database to Google Drive for multi-session persistence.
+    Uses local SSD staging snapshot and single-pass direct copy to Drive FUSE,
+    completely eliminating ghost / duplicate .tmp files on Google Drive.
+    Debounces high-frequency writes (minimum 5s interval unless force=True).
+    """
+    global _last_db_sync_time
     if not getattr(config, "IS_COLAB", False):
         return
     drive_db = getattr(config, "DRIVE_QUEUE_DB", None)
     local_db = getattr(config, "LOCAL_QUEUE_DB", None)
     if not drive_db or not local_db or not os.path.exists(local_db):
         return
+
+    # Safety check: Drive DB MUST NOT be directly in MyDrive or Drive root
+    drive_db_dir = os.path.abspath(os.path.dirname(drive_db))
+    forbidden_roots = [
+        os.path.abspath("/content/drive/MyDrive"),
+        os.path.abspath("/content/drive"),
+        os.path.abspath("/content"),
+        os.path.abspath("/")
+    ]
+    if drive_db_dir in forbidden_roots:
+        print(f"[Database] Security Warning: Refusing to sync DB directly into Drive root ({drive_db_dir}). Must be inside a subfolder.")
+        return
+
+    now = time.time()
+    if not force and (now - _last_db_sync_time) < 5.0:
+        return
+    _last_db_sync_time = now
+
     try:
-        os.makedirs(os.path.dirname(drive_db), exist_ok=True)
-        tmp_drive = drive_db + ".tmp"
-        shutil.copy2(local_db, tmp_drive)
-        try:
-            os.replace(tmp_drive, drive_db)
-        except OSError:
-            shutil.copy2(tmp_drive, drive_db)
-            if os.path.exists(tmp_drive):
-                os.remove(tmp_drive)
+        os.makedirs(drive_db_dir, exist_ok=True)
+        # Use local SSD for the temporary snapshot, never write .tmp on Drive FUSE!
+        local_sync_tmp = local_db + ".sync_tmp"
+        shutil.copyfile(local_db, local_sync_tmp)
+        # Single-pass direct file copy to Drive destination
+        shutil.copyfile(local_sync_tmp, drive_db)
+        if os.path.exists(local_sync_tmp):
+            try:
+                os.remove(local_sync_tmp)
+            except Exception:
+                pass
     except Exception as e:
         # Gracefully handle shared viewer / read-only drive mounts
         pass
 
-def _commit_and_sync(conn: sqlite3.Connection):
+def _commit_and_sync(conn: sqlite3.Connection, force: bool = False):
     conn.commit()
-    sync_db_to_drive()
+    sync_db_to_drive(force=force)
 
 def _get_connection() -> sqlite3.Connection:
     os.makedirs(os.path.dirname(config.QUEUE_DB), exist_ok=True)
@@ -43,7 +71,7 @@ def _get_connection() -> sqlite3.Connection:
         if drive_db and local_db and os.path.exists(drive_db) and not os.path.exists(local_db):
             try:
                 os.makedirs(os.path.dirname(local_db), exist_ok=True)
-                shutil.copy2(drive_db, local_db)
+                shutil.copyfile(drive_db, local_db)
             except Exception as e:
                 print(f"[Database] Notice: Initial copy from Drive: {e}")
 
@@ -53,6 +81,7 @@ def _get_connection() -> sqlite3.Connection:
         conn.execute("PRAGMA journal_mode = WAL;")
         conn.execute("PRAGMA temp_store = MEMORY;")
         conn.execute("PRAGMA synchronous = NORMAL;")
+        conn.execute("PRAGMA cache_size = -64000;")
         conn.execute("PRAGMA busy_timeout = 30000;")
     except Exception:
         pass
@@ -118,7 +147,7 @@ def init_db():
             cur.execute("CREATE INDEX IF NOT EXISTS idx_dl_status ON download_queue(status, order_idx);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_dl_speed_status ON download_queue(is_low_speed, status, order_idx);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_rf_status ON refine_queue(status, order_idx);")
-            _commit_and_sync(conn)
+            _commit_and_sync(conn, force=True)
         finally:
             conn.close()
 
@@ -153,7 +182,7 @@ def enqueue_download(item: Dict[str, Any]) -> int:
                 now,
                 now
             ))
-            _commit_and_sync(conn)
+            _commit_and_sync(conn, force=True)
             return cur.lastrowid
         finally:
             conn.close()
@@ -187,7 +216,7 @@ def enqueue_refine(item: Dict[str, Any]) -> int:
                 now,
                 now
             ))
-            _commit_and_sync(conn)
+            _commit_and_sync(conn, force=True)
             return cur.lastrowid
         finally:
             conn.close()
@@ -301,7 +330,7 @@ def move_queue_item(table_name: str, item_id: int, direction: str) -> bool:
             for rank, r in enumerate(rows, start=1):
                 cur.execute(f"UPDATE {table_name} SET order_idx = ?, updated_at = ? WHERE id = ?", (rank, now, r["id"]))
 
-            _commit_and_sync(conn)
+            _commit_and_sync(conn, force=True)
             return True
         finally:
             conn.close()
@@ -333,7 +362,7 @@ def claim_next_download_job(is_low_speed: bool = False) -> Optional[Dict[str, An
                 SET status = 'downloading', updated_at = ? 
                 WHERE id = ? AND status = 'pending'
             """, (now, job_id))
-            _commit_and_sync(conn)
+            _commit_and_sync(conn, force=True)
 
             if cur.rowcount == 0:
                 return None
@@ -362,7 +391,7 @@ def demote_to_low_speed_queue(item_id: int, reason: str = "Moved to Low-Speed Qu
                 SET is_low_speed = 1, status = 'pending', order_idx = ?, error_msg = ?, updated_at = ? 
                 WHERE id = ?
             """, (next_idx, reason, now, item_id))
-            _commit_and_sync(conn)
+            _commit_and_sync(conn, force=True)
             return cur.rowcount > 0
         finally:
             conn.close()
@@ -398,7 +427,7 @@ def requeue_download_for_retry(item_id: int, max_retries: int = 2) -> Tuple[bool
                     SET retry_count = ?, status = 'pending', order_idx = ?, download_pct = 0.0, download_speed = '--', error_msg = ?, updated_at = ? 
                     WHERE id = ?
                 """, (new_retries, next_idx, reason, now, item_id))
-                _commit_and_sync(conn)
+                _commit_and_sync(conn, force=True)
                 return True, new_retries
             else:
                 err_msg = f"Failed to start within 90s after {max_retries + 1} attempts (no active swarm/seeds)"
@@ -407,7 +436,7 @@ def requeue_download_for_retry(item_id: int, max_retries: int = 2) -> Tuple[bool
                     SET status = 'failed', error_msg = ?, updated_at = ? 
                     WHERE id = ?
                 """, (err_msg, now, item_id))
-                _commit_and_sync(conn)
+                _commit_and_sync(conn, force=True)
                 return False, curr_retries + 1
         finally:
             conn.close()
@@ -433,7 +462,7 @@ def toggle_download_queue_speed(item_id: int, to_low_speed: Optional[bool] = Non
                 SET is_low_speed = ?, order_idx = ?, updated_at = ? 
                 WHERE id = ?
             """, (target, next_idx, now, item_id))
-            _commit_and_sync(conn)
+            _commit_and_sync(conn, force=True)
             return cur.rowcount > 0
         finally:
             conn.close()
@@ -463,7 +492,7 @@ def claim_next_refine_job() -> Optional[Dict[str, Any]]:
                 SET status = 'refining', updated_at = ? 
                 WHERE id = ? AND status = 'pending'
             """, (now, job_id))
-            _commit_and_sync(conn)
+            _commit_and_sync(conn, force=True)
 
             if cur.rowcount == 0:
                 return None
@@ -505,7 +534,8 @@ def update_item_status(table_name: str, item_id: int, **kwargs):
 
             sql = f"UPDATE {table_name} SET {', '.join(fields)} WHERE id = ?"
             cur.execute(sql, tuple(values))
-            _commit_and_sync(conn)
+            is_high_frequency = any(k in kwargs for k in ["download_pct", "convert_pct", "download_speed"])
+            _commit_and_sync(conn, force=not is_high_frequency)
         finally:
             conn.close()
 
@@ -555,7 +585,7 @@ def delete_queue_item(table_name: str, item_id: int) -> bool:
         try:
             cur = conn.cursor()
             cur.execute(f"DELETE FROM {table_name} WHERE id = ?", (item_id,))
-            _commit_and_sync(conn)
+            _commit_and_sync(conn, force=True)
             return cur.rowcount > 0
         finally:
             conn.close()
@@ -572,7 +602,7 @@ def cancel_queue_item(table_name: str, item_id: int, reason: str = "Cancelled by
                 f"UPDATE {table_name} SET status = 'cancelled', error_msg = CASE WHEN error_msg IS NULL OR error_msg = '' THEN ? ELSE error_msg END, updated_at = ? WHERE id = ?",
                 (reason, _now_iso(), item_id)
             )
-            _commit_and_sync(conn)
+            _commit_and_sync(conn, force=True)
             return cur.rowcount > 0
         finally:
             conn.close()
@@ -587,7 +617,7 @@ def clear_completed(table_name: str) -> int:
             cur = conn.cursor()
             cur.execute(f"DELETE FROM {table_name} WHERE status IN ('completed', 'failed', 'cancelled')")
             deleted = cur.rowcount
-            _commit_and_sync(conn)
+            _commit_and_sync(conn, force=True)
             return deleted
         finally:
             conn.close()
