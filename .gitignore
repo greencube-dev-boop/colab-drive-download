@@ -14,6 +14,7 @@ ENV/
 content/
 raw/
 temp/
+downloader_staging/
 *.log
 *.torrent
 *.mp4

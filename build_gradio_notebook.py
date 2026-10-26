@@ -26,6 +26,9 @@ def generate_notebook():
     # Read all modular files to bundle as fallback
     modules = [
         "config.py",
+        "database.py",
+        "metadata_manager.py",
+        "classifier.py",
         "torrent_parser.py",
         "torrent_search.py",
         "media_search.py",
@@ -47,30 +50,28 @@ def generate_notebook():
     compressed_bundle = base64.b64encode(zlib.compress(bundle_json.encode('utf-8'))).decode('ascii')
 
     # Cell 0: Modern Documentation
-    add_markdown("""# 🎬 Colab Video Downloader & Universal Transcode Engine
+    add_markdown("""# 🚀 Two-Stage Google Drive Downloader & GPU Refiner
 
-An asynchronous batch video processing web application running natively in Google Colab with an interactive **Gradio** dashboard, hardware NVENC GPU encoding, and direct Google Drive preservation.
+An enterprise-grade, asynchronous batch media ingestion and transcoding system running natively in Google Colab with an interactive **Gradio** dashboard, persistent SQLite queue, Gemini AI media classification, hardware NVENC GPU encoding, and direct Google Drive preservation.
 
 ---
 
 ### 🌟 Key Architecture & Capabilities:
-1. **⚙️ Universal Settings Bar (Persistent Header)**:
-   - **Download Settings**: Configurable connection / segment concurrency (1–16 connections) and optional cloud Debrid bridges (TorBox / Real-Debrid).
-   - **Output Resolution**: `480p (Default)`, `360p (Mobile Ultra-Low)`, `240p (Data Saver)`, `720p (HD)`, `1080p (Full HD)`, or `Original / Passthrough`.
-   - **Video Codecs**: `H.265 / HEVC` (high compression) or `H.264 / AVC` (broad device playback) with GPU NVENC hardware acceleration and transparent CPU fallback.
-   - **Container Formats**: `MKV` (multi-track resilient) or `MP4` (`+faststart` streaming).
+1. **🌐 Universal Settings Bar (Top Header)**:
+   - **Ingestion Settings**: Configurable connection / stream concurrency (1–16 connections) and cloud Debrid support.
+   - **Refining Settings**: `480p`, `240p`, `360p`, `720p`, `1080p`, or `Original`.
+   - **Video Codecs**: `H.265 / HEVC` or `H.264 / AVC` with GPU NVENC hardware acceleration and automatic CPU fallback.
+   - **Container Formats**: `MKV` or `MP4` (`+faststart`).
    - **Audio Presets**: `Opus 64 kbps` (zero-desync frame-perfect), `Opus 48 kbps`, `AAC 96 kbps`, `AAC 128 kbps`, or `Copy Original`.
-   - **Transcode Chunks & Quality**: Selectable parallel transcode slices (1–6 workers) and custom CRF compression slider (18–40).
-2. **Clean 2-Tab Layout with Automatic Switch**:
-   - **Main Tab 1: 📥 Fetch & Queue**:
-     - *Sub-Tab 1: 🔗 Direct Download*: High-speed multi-connection downloads for direct video URLs, Videm/VidSrc embeds, and HLS M3U8 playlists.
-     - *Sub-Tab 2: 🧲 Torrent & Magnet Download*: Dedicated hub to inspect `.torrent` files or magnet links, explore the complete directory hierarchy, and cherry-pick specific episodes.
-     - *Sub-Tab 3: 🔎 Title Search & Discovery*: Instant IMDb search, TV series season/episode browser, and live multi-tracker torrent swarms (The Pirate Bay & YTS).
-   - **Main Tab 2: 📊 Downloads & Processes**:
-     - Automatically switches here whenever a download is queued!
-     - Displays real-time progress, speed, ETA, parallel GPU chunk bars, and compression savings %.
-     - Working **`✕ Cancel`** (active) and **`✕ Clear`** (errored/done) buttons that immediately kill subprocesses, delete temp files, and remove cards.
-     - Single **`🧹 Clear Completed`** button for one-click cleanup.
+   - **GPU VRAM Slices & CRF**: Slicing slider (1–8 chunks) and custom CRF compression slider (18–36).
+2. **Two-Stage Decoupled Workflow**:
+   - **Stage 1 (Ingestion)**: Downloads video to Colab local workspace $\\rightarrow$ Classifies with AI (Gemini / Heuristic) $\\rightarrow$ Standardizes title (e.g. `Avatar Fire And Ash (2025)` or `Mentalist S01E04`) $\\rightarrow$ Moves raw video to `drive/downloader/raw/` $\\rightarrow$ Records entry in `metadata.json` $\\rightarrow$ Enqueues into persistent SQLite queue (`drive/downloader/data/queue.db`).
+   - **Stage 2 (Refining)**: Background worker daemon continuously monitors `queue.db` $\\rightarrow$ Copies raw file from Drive to local VM $\\rightarrow$ Slices and encodes via NVENC in GPU VRAM $\\rightarrow$ Stitches and muxes final video $\\rightarrow$ Moves to `drive/downloader/refined/<tv_series|movies|other>` $\\rightarrow$ Verifies file on Drive $\\rightarrow$ **Bypasses Drive Trash Bin** (moves raw file to VM disk, then unlinks locally) $\\rightarrow$ Updates `metadata.json` & `queue.db`.
+3. **Persistent SQLite Queue & Interactive Process Manager**:
+   - If a Colab session ends or restarts, pending refining jobs in `queue.db` automatically resume in the next session without re-downloading!
+   - 1-click **Move Up (⬆️)** and **Move Down (⬇️)** to reorder pending jobs.
+   - Active cancellation and single **Clear Completed** button.
+   - **Drive Media Catalog** tab provides a real-time browser for `metadata.json`.
 """)
 
     # Cell 1: Environment Setup, Dependencies & Drive Mount
@@ -85,9 +86,9 @@ import json
 import base64
 import zlib
 
-print("=" * 68)
+print("=" * 72)
 print("🚀 [1/3] Checking Hardware Acceleration (NVIDIA GPU)...")
-print("=" * 68)
+print("=" * 72)
 has_gpu = False
 try:
     gpu_info = subprocess.check_output(
@@ -101,7 +102,7 @@ except Exception:
 
 print()
 print("📁 [2/3] Mounting Google Drive...")
-print("=" * 68)
+print("=" * 72)
 try:
     from google.colab import drive
     drive.mount('/content/drive')
@@ -111,9 +112,9 @@ except Exception as e:
 
 print()
 print("📦 [3/3] Installing Dependencies & Setting Up Project Workspace...")
-print("=" * 68)
+print("=" * 72)
 !apt-get update -qq && apt-get install -y -qq aria2 ffmpeg > /dev/null
-!pip install -q gradio yt-dlp fastapi uvicorn requests urllib3
+!pip install -q gradio yt-dlp fastapi uvicorn requests urllib3 google-genai
 
 if has_gpu:
     try:
