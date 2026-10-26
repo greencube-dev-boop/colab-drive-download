@@ -31,6 +31,36 @@ def normalize_title(t: str) -> str:
     s = re.sub(r'[^a-z0-9]+', ' ', s)
     return re.sub(r'\s+', ' ', s).strip()
 
+def _is_show_match(s1: str, s2: str) -> bool:
+    """Accurately compares two show names ignoring case, punctuation, articles, and release years."""
+    norm1 = normalize_title(s1)
+    norm2 = normalize_title(s2)
+    if not norm1 or not norm2:
+        return False
+    if norm1 == norm2:
+        return True
+    w1 = re.sub(r'\b(19\d\d|20\d\d)\b', '', norm1).strip()
+    w2 = re.sub(r'\b(19\d\d|20\d\d)\b', '', norm2).strip()
+    w1 = re.sub(r'\s+', ' ', w1).strip()
+    w2 = re.sub(r'\s+', ' ', w2).strip()
+    return bool(w1 and w1 == w2)
+
+def _is_movie_match(title1: str, year1: Optional[int], title2: str, year2: Optional[int]) -> bool:
+    """Compares two movie titles and years with strict precision."""
+    n1 = normalize_title(title1)
+    n2 = normalize_title(title2)
+    if not n1 or not n2:
+        return False
+    if year1 and year2 and int(year1) != int(year2):
+        return False
+    if n1 == n2:
+        return True
+    w1 = re.sub(r'\b(19\d\d|20\d\d)\b', '', n1).strip()
+    w2 = re.sub(r'\b(19\d\d|20\d\d)\b', '', n2).strip()
+    w1 = re.sub(r'\s+', ' ', w1).strip()
+    w2 = re.sub(r'\s+', ' ', w2).strip()
+    return bool(w1 and w1 == w2)
+
 def is_same_media(m1: Dict[str, Any], m2: Dict[str, Any]) -> bool:
     """Compares two classified media dictionaries to determine if they represent the exact same media item."""
     if not m1 or not m2:
@@ -39,26 +69,23 @@ def is_same_media(m1: Dict[str, Any], m2: Dict[str, Any]) -> bool:
     t2 = m2.get("type", "other").lower()
 
     if t1 in ["tv_series", "tv", "tvseris"] and t2 in ["tv_series", "tv", "tvseris"]:
-        s1 = normalize_title(m1.get("show_name") or m1.get("title", ""))
-        s2 = normalize_title(m2.get("show_name") or m2.get("title", ""))
+        s1 = m1.get("show_name") or m1.get("title", "")
+        s2 = m2.get("show_name") or m2.get("title", "")
         season1 = int(m1.get("season", 0) or 0)
         season2 = int(m2.get("season", 0) or 0)
         ep1 = int(m1.get("episode", 0) or 0)
         ep2 = int(m2.get("episode", 0) or 0)
-        if s1 == s2 and season1 == season2 and ep1 == ep2 and season1 > 0 and ep1 > 0:
+        if _is_show_match(s1, s2) and season1 == season2 and ep1 == ep2 and season1 > 0 and ep1 > 0:
             return True
         return False
 
     elif t1 == "movie" and t2 == "movie":
-        name1 = normalize_title(m1.get("title", ""))
-        name2 = normalize_title(m2.get("title", ""))
-        y1 = m1.get("year")
-        y2 = m2.get("year")
-        if name1 == name2:
-            if y1 and y2:
-                return int(y1) == int(y2)
-            return True
-        return False
+        return _is_movie_match(
+            m1.get("title", ""),
+            m1.get("year"),
+            m2.get("title", ""),
+            m2.get("year")
+        )
 
     else:
         name1 = normalize_title(m1.get("title", "") or m1.get("formatted_name", ""))
@@ -187,6 +214,8 @@ def check_media_exists(media_info: Dict[str, Any]) -> Tuple[bool, str, str]:
     """
     Checks if a media item is already present in Google Drive metadata or filesystem.
     Returns: (exists: bool, status: 'raw'|'refined'|'disk', path: str)
+    Strictly isolates TV series by show name so different shows with the same
+    season/episode number (e.g. S01E06) never collide.
     """
     if not media_info:
         return False, "", ""
@@ -194,67 +223,105 @@ def check_media_exists(media_info: Dict[str, Any]) -> Tuple[bool, str, str]:
     m_type = media_info.get("type", "other").lower()
     data = load_metadata()
 
-    # 1. Check TV Series in metadata
+    # 1. Check TV Series
     if m_type in ["tv_series", "tv", "tvseris"]:
-        target_show = normalize_title(media_info.get("show_name") or media_info.get("title", ""))
+        raw_show = media_info.get("show_name") or media_info.get("title", "")
         season = int(media_info.get("season", 0) or 0)
         episode = int(media_info.get("episode", 0) or 0)
         season_key = f"season_{season:02d}"
         ep_key = f"episode_{episode:02d}"
 
-        if season > 0 and episode > 0:
+        if season > 0 and episode > 0 and raw_show:
+            # Step A: Check metadata.json (exact show match via _is_show_match)
             for s in data.get("tvseris", []):
-                s_name = normalize_title(s.get("name", ""))
-                if s_name == target_show:
+                s_name = s.get("name", "")
+                if _is_show_match(s_name, raw_show):
                     ep_data = s.get("seasons", {}).get(season_key, {}).get(ep_key)
                     if ep_data:
                         st = ep_data.get("status", "raw")
                         p = ep_data.get("refined_path") or ep_data.get("raw_path") or ""
                         return True, st, p
 
-            # Check physical filesystem in Drive
-            pat_refined = os.path.join(config.REFINED_TV_DIR, "*", f"Season {season:02d}", f"*S{season:02d}E{episode:02d}*.*")
-            matches = glob.glob(pat_refined)
-            if matches:
-                return True, "refined", matches[0]
+            # Step B: Check physical refined filesystem in Drive:
+            # ONLY look in folders under REFINED_TV_DIR that strictly match raw_show!
+            if os.path.exists(config.REFINED_TV_DIR):
+                try:
+                    for show_dir in os.listdir(config.REFINED_TV_DIR):
+                        show_dir_path = os.path.join(config.REFINED_TV_DIR, show_dir)
+                        if not os.path.isdir(show_dir_path):
+                            continue
+                        if _is_show_match(show_dir, raw_show):
+                            season_path = os.path.join(show_dir_path, f"Season {season:02d}")
+                            if os.path.exists(season_path):
+                                pat_refined = os.path.join(season_path, f"*S{season:02d}E{episode:02d}*.*")
+                                matches = glob.glob(pat_refined)
+                                if matches:
+                                    return True, "refined", matches[0]
+                except Exception as e:
+                    print(f"[Metadata] Warning checking refined TV filesystem: {e}")
 
-            pat_raw = os.path.join(config.RAW_DIR, f"*S{season:02d}E{episode:02d}*.*")
-            matches_raw = glob.glob(pat_raw)
-            if matches_raw:
-                return True, "raw", matches_raw[0]
+            # Step C: Check physical raw filesystem in Drive:
+            # Files in RAW_DIR are flat. Candidate files matching SxxExx MUST match raw_show!
+            if os.path.exists(config.RAW_DIR):
+                try:
+                    pat_raw = os.path.join(config.RAW_DIR, f"*S{season:02d}E{episode:02d}*.*")
+                    matches_raw = glob.glob(pat_raw)
+                    for rf in matches_raw:
+                        rf_base = os.path.basename(rf)
+                        import classifier
+                        rf_info = classifier.heuristic_classify(rf_base)
+                        if is_same_media(media_info, rf_info):
+                            return True, "raw", rf
+                except Exception as e:
+                    print(f"[Metadata] Warning checking raw TV filesystem: {e}")
 
-    # 2. Check Movies in metadata
+    # 2. Check Movies
     elif m_type == "movie":
-        target_name = normalize_title(media_info.get("title", ""))
+        target_name = media_info.get("title", "")
         target_year = media_info.get("year")
 
+        # Step A: Check metadata.json
         for m in data.get("movies", []):
-            m_name = normalize_title(m.get("name", ""))
-            if target_name in m_name:
-                if target_year and str(target_year) not in m_name:
-                    continue
+            m_title = m.get("name", "")
+            if _is_movie_match(target_name, target_year, m_title, m.get("year")):
                 st = m.get("status", "raw")
                 p = m.get("refined_path") or m.get("raw_path") or ""
                 return True, st, p
 
-        # Check physical filesystem in Drive
-        clean_stem = config.sanitize_filename(media_info.get("formatted_name", ""))
-        matches_refined = glob.glob(os.path.join(config.REFINED_MOVIES_DIR, f"{clean_stem}.*"))
-        if matches_refined:
-            return True, "refined", matches_refined[0]
+        # Step B: Check physical refined filesystem in Drive
+        if os.path.exists(config.REFINED_MOVIES_DIR):
+            try:
+                for mf in os.listdir(config.REFINED_MOVIES_DIR):
+                    mf_path = os.path.join(config.REFINED_MOVIES_DIR, mf)
+                    if not os.path.isfile(mf_path):
+                        continue
+                    import classifier
+                    mf_info = classifier.heuristic_classify(mf)
+                    if is_same_media(media_info, mf_info):
+                        return True, "refined", mf_path
+            except Exception as e:
+                print(f"[Metadata] Warning checking refined movie filesystem: {e}")
 
-        matches_raw = glob.glob(os.path.join(config.RAW_DIR, f"{clean_stem}.*"))
-        if matches_raw:
-            return True, "raw", matches_raw[0]
+        # Step C: Check physical raw filesystem in Drive
+        if os.path.exists(config.RAW_DIR):
+            try:
+                clean_stem = config.sanitize_filename(media_info.get("formatted_name", ""))
+                if clean_stem:
+                    matches_raw = glob.glob(os.path.join(config.RAW_DIR, f"{clean_stem}.*"))
+                    if matches_raw:
+                        return True, "raw", matches_raw[0]
+            except Exception as e:
+                print(f"[Metadata] Warning checking raw movie filesystem: {e}")
 
     # 3. Check Other in metadata
     else:
         target_title = normalize_title(media_info.get("title", "") or media_info.get("formatted_name", ""))
-        for o in data.get("other", []):
-            if normalize_title(o.get("name", "")) == target_title:
-                st = o.get("status", "raw")
-                p = o.get("refined_path") or o.get("raw_path") or ""
-                return True, st, p
+        if target_title:
+            for o in data.get("other", []):
+                if normalize_title(o.get("name", "")) == target_title:
+                    st = o.get("status", "raw")
+                    p = o.get("refined_path") or o.get("raw_path") or ""
+                    return True, st, p
 
     return False, "", ""
 
@@ -340,7 +407,7 @@ def record_item(
             ep_key = f"episode_{episode:02d}" if episode > 0 else "episode_01"
 
             tv_list: List[Dict[str, Any]] = data.get("tvseris", [])
-            existing_show = next((s for s in tv_list if s.get("name", "").lower() == s_name.lower()), None)
+            existing_show = next((s for s in tv_list if _is_show_match(s.get("name", ""), s_name)), None)
 
             ep_data = {
                 "name": name,
@@ -423,7 +490,7 @@ def update_item_status(
             ep_key = f"episode_{episode:02d}" if episode > 0 else "episode_01"
 
             for s in data.get("tvseris", []):
-                if s.get("name", "").lower() == s_name.lower():
+                if _is_show_match(s.get("name", ""), s_name):
                     ep = s.get("seasons", {}).get(season_key, {}).get(ep_key)
                     if ep:
                         ep["status"] = status

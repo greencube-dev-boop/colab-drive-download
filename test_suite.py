@@ -765,5 +765,56 @@ class TestTwoStagePipeline(unittest.TestCase):
         self.assertEqual(len(loaded["movies"]), 1)
         self.assertEqual(loaded["movies"][0]["name"], "Test Movie")
 
+    def test_tv_series_differentiation_same_season_and_episode(self):
+        import classifier
+        # 1. Simulate existing refined TV series: Fbi S01E06 in Drive
+        fbi_dir = os.path.join(config.REFINED_TV_DIR, "Fbi", "Season 01")
+        os.makedirs(fbi_dir, exist_ok=True)
+        fbi_refined_file = os.path.join(fbi_dir, "Fbi S01E06.mkv")
+        with open(fbi_refined_file, "wb") as f:
+            f.write(b"fbi_s01e06_bytes")
+
+        metadata_manager.record_item(
+            media_type="tv_series",
+            name="Fbi S01E06",
+            status="refined",
+            refined_path=fbi_refined_file,
+            show_name="Fbi",
+            season=1,
+            episode=6
+        )
+
+        # 2. Check that a completely different show with the exact same S01E06 is NOT reported as existing!
+        lotr_info = classifier.classify_media("The Lord of the Rings The Rings of Power S01E06 - Udûn")
+        exists_lotr, st_lotr, path_lotr = metadata_manager.check_media_exists(lotr_info)
+        self.assertFalse(exists_lotr, f"False positive collision! LOTR matched {path_lotr}")
+        self.assertEqual(st_lotr, "")
+        self.assertEqual(path_lotr, "")
+
+        # 3. Check that FBI S01E06 IS correctly identified as existing in refined state
+        fbi_query_info = classifier.classify_media("Fbi S01E06")
+        exists_fbi, st_fbi, path_fbi = metadata_manager.check_media_exists(fbi_query_info)
+        self.assertTrue(exists_fbi)
+        self.assertEqual(st_fbi, "refined")
+        self.assertEqual(os.path.basename(path_fbi), "Fbi S01E06.mkv")
+
+        # 4. Check Raw directory differentiation:
+        # Place Fbi S01E07 in raw directory
+        raw_fbi_file = os.path.join(config.RAW_DIR, "Fbi S01E07.mkv")
+        with open(raw_fbi_file, "wb") as f:
+            f.write(b"raw_fbi_s01e07_bytes")
+
+        # Check that another show with S01E07 is NOT falsely detected as raw
+        sherlock_info = classifier.classify_media("Sherlock S01E07")
+        exists_sherlock, st_sh, path_sh = metadata_manager.check_media_exists(sherlock_info)
+        self.assertFalse(exists_sherlock, f"False positive raw collision! Sherlock matched {path_sh}")
+
+        # Check that Fbi S01E07 IS detected as raw
+        fbi_e7_info = classifier.classify_media("Fbi S01E07")
+        exists_fbi_raw, st_fr, path_fr = metadata_manager.check_media_exists(fbi_e7_info)
+        self.assertTrue(exists_fbi_raw)
+        self.assertEqual(st_fr, "raw")
+        self.assertEqual(os.path.basename(path_fr), "Fbi S01E07.mkv")
+
 if __name__ == "__main__":
     unittest.main()
