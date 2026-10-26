@@ -335,6 +335,12 @@ class TestTwoStagePipeline(unittest.TestCase):
         self.assertIn("Duplicate detected in Drive", dl_html)
         self.assertIn("Completed Show S01E01", dl_html)
 
+        # Inverted history assertion (nearest / most recent at top)
+        pos_staged = dl_html.find("Completed Show S01E01")
+        pos_cancelled = dl_html.find("Duplicate Show S01E01")
+        pos_failed = dl_html.find("Broken Stream S01E03")
+        self.assertTrue(pos_staged < pos_cancelled < pos_failed, "Download history not ordered nearest-first (descending)!")
+
         # 2. Add refine tasks: 1 pending, 1 failed with transcode error, 1 completed
         rf_p = database.enqueue_refine({"title": "Refine Pending", "raw_drive_path": "/r/1"})
         rf_f = database.enqueue_refine({"title": "Refine Broken NVENC", "raw_drive_path": "/r/2"})
@@ -348,6 +354,11 @@ class TestTwoStagePipeline(unittest.TestCase):
         self.assertIn("NVENC Out of Memory", rf_html)
         self.assertIn("Refine Done 1080p", rf_html)
         self.assertIn("120.5 MB", rf_html)
+
+        # Inverted history assertion for refine queue (most recent completion on top)
+        pos_ref_done = rf_html.find("Refine Done 1080p")
+        pos_ref_broken = rf_html.find("Refine Broken NVENC")
+        self.assertTrue(pos_ref_done < pos_ref_broken, "Refine history not ordered nearest-first (descending)!")
 
     def test_catalog_ascending_numerical_sorting(self):
         # Record episodes in reverse / random order: Episode 4, Episode 1, Episode 2
@@ -613,6 +624,64 @@ class TestTwoStagePipeline(unittest.TestCase):
         self.assertFalse(triggered3)
         self.assertFalse(task_already_slow.get("demote_low_speed", False))
         mock_proc3.kill.assert_not_called()
+
+    def test_unqueued_raw_files_detection_and_actions(self):
+        import pipeline
+        # 1. Initially no raw files -> no unqueued files detected, section does not appear in HTML
+        unqueued = pipeline.get_unqueued_raw_files()
+        self.assertEqual(len(unqueued), 0)
+        html_initial = ui.render_refine_queue_html()
+        self.assertNotIn("Un-queued Raw Files Detected", html_initial)
+
+        # 2. Place 2 unqueued raw video files in config.RAW_DIR
+        raw1 = os.path.join(config.RAW_DIR, "Inception.2010.720p.mkv")
+        with open(raw1, "wb") as f:
+            f.write(b"0" * 1024 * 50)
+
+        raw2 = os.path.join(config.RAW_DIR, "Sherlock.S01E03.mkv")
+        with open(raw2, "wb") as f:
+            f.write(b"0" * 1024 * 75)
+
+        # 3. Detect unqueued files
+        detected = pipeline.get_unqueued_raw_files()
+        self.assertEqual(len(detected), 2)
+        filenames = [d["filename"] for d in detected]
+        self.assertIn("Inception.2010.720p.mkv", filenames)
+        self.assertIn("Sherlock.S01E03.mkv", filenames)
+
+        # 4. Check UI renders the section with both files
+        html_with_raw = ui.render_refine_queue_html()
+        self.assertIn("Un-queued Raw Files Detected in Drive (2)", html_with_raw)
+        self.assertIn("Inception.2010.720p.mkv", html_with_raw)
+        self.assertIn("Sherlock.S01E03.mkv", html_with_raw)
+        self.assertIn("➕ Add to Refine Queue", html_with_raw)
+        self.assertIn("🗑️ Delete", html_with_raw)
+
+        # 5. Enqueue the first file
+        job_id = pipeline.enqueue_unqueued_raw_file("Inception.2010.720p.mkv")
+        self.assertIsNotNone(job_id)
+
+        # Now only 1 unqueued file remains
+        detected_after_1 = pipeline.get_unqueued_raw_files()
+        self.assertEqual(len(detected_after_1), 1)
+        self.assertEqual(detected_after_1[0]["filename"], "Sherlock.S01E03.mkv")
+
+        # Refine queue now has Inception in pending status
+        q = database.get_refine_queue()
+        inc_job = next(j for j in q if j["id"] == job_id)
+        self.assertEqual(inc_job["status"], "pending")
+        self.assertIn("Inception", inc_job["title"])
+
+        # 6. Delete the second file
+        deleted = pipeline.delete_unqueued_raw_file("Sherlock.S01E03.mkv")
+        self.assertTrue(deleted)
+        self.assertFalse(os.path.exists(raw2))
+
+        # 7. Now 0 unqueued files remain -> section disappears completely!
+        detected_after_all = pipeline.get_unqueued_raw_files()
+        self.assertEqual(len(detected_after_all), 0)
+        html_final = ui.render_refine_queue_html()
+        self.assertNotIn("Un-queued Raw Files Detected", html_final)
 
 if __name__ == "__main__":
     unittest.main()

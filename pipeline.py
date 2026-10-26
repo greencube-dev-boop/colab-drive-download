@@ -699,3 +699,130 @@ def queue_direct_items(
         queued_count += 1
 
     return queued_count
+
+# ---------------------------------------------------------------------
+# Un-queued Raw Drive Files Management
+# ---------------------------------------------------------------------
+VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv', '.m4v', '.ts'}
+
+def get_unqueued_raw_files() -> List[Dict[str, Any]]:
+    """
+    Scans RAW_DIR for video files not currently in refine_queue with status 'pending' or 'refining'.
+    """
+    raw_dir = getattr(config, "RAW_DIR", "")
+    if not raw_dir or not os.path.exists(raw_dir):
+        return []
+
+    try:
+        refine_items = database.get_refine_queue()
+    except Exception:
+        refine_items = []
+
+    active_or_pending = [j for j in refine_items if j.get("status") in ["pending", "refining"]]
+    queued_keys = set()
+    for j in active_or_pending:
+        raw_p = j.get("raw_drive_path", "")
+        if raw_p:
+            queued_keys.add(os.path.basename(raw_p).lower())
+            queued_keys.add(os.path.splitext(os.path.basename(raw_p))[0].lower())
+        title = j.get("title", "")
+        if title:
+            queued_keys.add(title.lower())
+
+    unqueued = []
+    try:
+        for fname in os.listdir(raw_dir):
+            full_path = os.path.join(raw_dir, fname)
+            if not os.path.isfile(full_path):
+                continue
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in VIDEO_EXTENSIONS:
+                continue
+
+            stem = os.path.splitext(fname)[0].lower()
+            if fname.lower() in queued_keys or stem in queued_keys:
+                continue
+
+            try:
+                sz_mb = os.path.getsize(full_path) / (1024 * 1024)
+            except Exception:
+                sz_mb = 0.0
+
+            unqueued.append({
+                "filename": fname,
+                "path": full_path,
+                "size_mb": sz_mb,
+                "formatted_size": f"{sz_mb:.1f} MB" if sz_mb < 1024 else f"{sz_mb/1024:.2f} GB"
+            })
+    except Exception as e:
+        print(f"[UnqueuedScan] Error reading raw directory: {e}")
+
+    return sorted(unqueued, key=lambda x: x["filename"].lower())
+
+def enqueue_unqueued_raw_file(filename: str, refining_config: Optional[Dict[str, Any]] = None) -> Optional[int]:
+    """Classifies an unqueued raw file, records in metadata.json, and pushes into refine_queue."""
+    raw_dir = getattr(config, "RAW_DIR", "")
+    full_path = os.path.join(raw_dir, filename)
+    if not os.path.exists(full_path):
+        return None
+
+    raw_size_mb = os.path.getsize(full_path) / (1024 * 1024)
+    media_info = classifier.classify_media(filename)
+    media_type = media_info.get("type", "other")
+    show_name = media_info.get("show_name", "")
+    season = media_info.get("season", 0)
+    episode = media_info.get("episode", 0)
+    formatted_name = media_info.get("formatted_name", sanitize_filename(os.path.splitext(filename)[0]))
+
+    cfg = refining_config or {
+        "res_preset": "480p",
+        "video_codec": "H.265 / HEVC",
+        "container_format": "mkv",
+        "audio_preset": "Opus 64 kbps",
+        "crf_val": 32,
+        "parallel_workers": 3
+    }
+    target_ext = f".{cfg.get('container_format', 'mkv').lower()}"
+
+    if media_type == "movie":
+        target_refined_path = os.path.join(config.REFINED_MOVIES_DIR, f"{formatted_name}{target_ext}")
+    elif media_type == "tv_series":
+        target_refined_path = os.path.join(config.REFINED_TV_DIR, show_name, f"Season {season:02d}", f"{formatted_name}{target_ext}")
+    else:
+        target_refined_path = os.path.join(config.REFINED_OTHER_DIR, f"{formatted_name}{target_ext}")
+
+    metadata_manager.record_item(
+        media_type=media_type,
+        name=formatted_name,
+        status="raw",
+        raw_path=full_path,
+        refined_path=target_refined_path,
+        refining_data=cfg,
+        show_name=show_name,
+        season=season,
+        episode=episode
+    )
+
+    refine_job_id = database.enqueue_refine({
+        "media_type": media_type,
+        "show_name": show_name,
+        "season": season,
+        "episode": episode,
+        "title": formatted_name,
+        "raw_drive_path": full_path,
+        "target_refined_path": target_refined_path,
+        "raw_size_mb": raw_size_mb,
+        "refining_config": cfg
+    })
+    print(f"[UnqueuedAction] Enqueued '{filename}' as refine job #{refine_job_id} ({formatted_name})")
+    return refine_job_id
+
+def delete_unqueued_raw_file(filename: str) -> bool:
+    """Permanently deletes an unqueued raw file from Drive using bypass_trash_delete."""
+    raw_dir = getattr(config, "RAW_DIR", "")
+    full_path = os.path.join(raw_dir, filename)
+    if not os.path.exists(full_path):
+        return False
+    success = config.bypass_trash_delete(full_path)
+    print(f"[UnqueuedAction] Deleted unqueued file '{filename}' (Trash bin bypass: {success})")
+    return success

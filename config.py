@@ -8,12 +8,53 @@ from pathlib import Path
 # Detect Environment: Google Colab vs Local
 IS_COLAB = os.path.exists("/content") and not os.path.exists("C:\\")
 
+def resolve_downloader_dir() -> str:
+    """Dynamically locates Google Drive downloader directory, supporting shortcuts and shared folders."""
+    if not IS_COLAB:
+        base_dir = os.path.abspath(os.path.dirname(__file__))
+        return os.path.join(base_dir, "downloader_staging")
+
+    candidates = [
+        "/content/drive/MyDrive/downloader",
+        "/content/drive/MyDrive/downloader - Shortcut",
+        "/content/drive/Shareddrives/downloader"
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+
+    # Search /content/drive/MyDrive for any folder starting with 'downloader'
+    mydrive = "/content/drive/MyDrive"
+    if os.path.exists(mydrive):
+        try:
+            for entry in os.listdir(mydrive):
+                full_p = os.path.join(mydrive, entry)
+                if entry.lower().startswith("downloader") and os.path.isdir(full_p):
+                    return full_p
+        except Exception:
+            pass
+
+    # Search Shared Drives
+    shareddrives = "/content/drive/Shareddrives"
+    if os.path.exists(shareddrives):
+        try:
+            for entry in os.listdir(shareddrives):
+                full_p = os.path.join(shareddrives, entry)
+                if entry.lower().startswith("downloader") and os.path.isdir(full_p):
+                    return full_p
+                sub_p = os.path.join(full_p, "downloader")
+                if os.path.exists(sub_p) and os.path.isdir(sub_p):
+                    return sub_p
+        except Exception:
+            pass
+
+    return "/content/drive/MyDrive/downloader"
+
+DOWNLOADER_DIR = resolve_downloader_dir()
 if IS_COLAB:
-    DOWNLOADER_DIR = "/content/drive/MyDrive/downloader"
     LOCAL_WORKSPACE = "/content/temp"
 else:
     BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-    DOWNLOADER_DIR = os.path.join(BASE_DIR, "downloader_staging")
     LOCAL_WORKSPACE = os.path.join(BASE_DIR, "content", "temp")
 
 # Structured Google Drive Directories
@@ -24,20 +65,30 @@ REFINED_TV_DIR = os.path.join(REFINED_DIR, "tv_series")
 REFINED_OTHER_DIR = os.path.join(REFINED_DIR, "other")
 DATA_DIR = os.path.join(DOWNLOADER_DIR, "data")
 METADATA_JSON = os.path.join(DATA_DIR, "metadata.json")
-QUEUE_DB = os.path.join(DATA_DIR, "queue.db")
 
 # Ephemeral Local VM Directories
 LOCAL_RAW_DIR = os.path.join(LOCAL_WORKSPACE, "raw_in")
 LOCAL_REFINE_DIR = os.path.join(LOCAL_WORKSPACE, "refining")
 TRASH_STAGING_DIR = os.path.join(LOCAL_WORKSPACE, "trash_staging")
+LOCAL_DATA_DIR = os.path.join(LOCAL_WORKSPACE, "data")
 TEMP_DIR = LOCAL_WORKSPACE
 DRIVE_DIR = DOWNLOADER_DIR
+
+# Database Paths: Google Drive vs Local working copy
+DRIVE_QUEUE_DB = os.path.join(DATA_DIR, "queue.db")
+LOCAL_QUEUE_DB = os.path.join(LOCAL_DATA_DIR, "queue.db")
+
+# In Colab, always use local SSD SQLite file to eliminate Google Drive FUSE file-locking failures; otherwise use DRIVE_QUEUE_DB
+if IS_COLAB:
+    QUEUE_DB = LOCAL_QUEUE_DB
+else:
+    QUEUE_DB = DRIVE_QUEUE_DB
 
 # Ensure necessary directories exist
 for d in [
     DOWNLOADER_DIR, RAW_DIR, REFINED_DIR, REFINED_MOVIES_DIR,
     REFINED_TV_DIR, REFINED_OTHER_DIR, DATA_DIR,
-    LOCAL_WORKSPACE, LOCAL_RAW_DIR, LOCAL_REFINE_DIR, TRASH_STAGING_DIR
+    LOCAL_WORKSPACE, LOCAL_RAW_DIR, LOCAL_REFINE_DIR, TRASH_STAGING_DIR, LOCAL_DATA_DIR
 ]:
     try:
         os.makedirs(d, exist_ok=True)

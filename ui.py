@@ -16,7 +16,8 @@ from torrent_search import search_live_torrents
 from media_search import search_media_imdb, get_tv_seasons_data
 from pipeline import (
     cancel_task_by_id, clear_done_tasks, queue_direct_items,
-    _active_refine_tasks, _refine_lock
+    _active_refine_tasks, _refine_lock,
+    get_unqueued_raw_files, enqueue_unqueued_raw_file, delete_unqueued_raw_file
 )
 import threading
 
@@ -52,6 +53,9 @@ def render_download_queue_html() -> str:
                 high_pending.append(item)
         else:
             history_items.append(item)
+
+    # Invert history order so nearest/most recent is at the top
+    history_items = sorted(history_items, key=lambda x: x.get("id", 0), reverse=True)
 
     html_parts = ['<div style="display: flex; flex-direction: column; gap: 16px; font-family: system-ui, -apple-system, sans-serif;">']
 
@@ -277,9 +281,46 @@ def render_refine_queue_html() -> str:
 
     active_jobs = [it for it in db_items if it.get("status") == "refining"]
     pending_jobs = [it for it in db_items if it.get("status") == "pending"]
-    history_jobs = [it for it in db_items if it.get("status") in ["completed", "failed", "cancelled"]]
+    # Invert history order so nearest/most recent is at the top
+    history_jobs = sorted([it for it in db_items if it.get("status") in ["completed", "failed", "cancelled"]], key=lambda x: x.get("id", 0), reverse=True)
 
     html_parts = ['<div style="display: flex; flex-direction: column; gap: 16px; font-family: system-ui, -apple-system, sans-serif;">']
+
+    # 0. Un-queued Raw Files Alert & Interactive Action Section
+    unqueued_files = get_unqueued_raw_files()
+    if unqueued_files:
+        html_parts.append(f"""
+        <div style="background: rgba(249, 226, 175, 0.08); border: 1px solid rgba(249, 226, 175, 0.4); border-radius: 10px; padding: 14px 18px; margin-bottom: 4px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                <div style="font-weight: 700; font-size: 15px; color: #f9e2af; display: flex; align-items: center; gap: 8px;">
+                    📁 Un-queued Raw Files Detected in Drive ({len(unqueued_files)})
+                </div>
+                <div style="font-size: 12px; color: #bac2de;">
+                    Found in raw/ folder but not in refining queue. Choose an action for each:
+                </div>
+            </div>
+        """)
+        for item in unqueued_files:
+            fname = html.escape(item["filename"])
+            raw_fname = item["filename"]
+            sz = item["formatted_size"]
+            js_fname = json.dumps(raw_fname)
+            html_parts.append(f"""
+            <div style="background: #181825; border: 1px solid #313244; border-radius: 8px; padding: 10px 14px; margin-bottom: 6px; display: flex; justify-content: space-between; align-items: center;">
+                <div style="font-size: 13px; color: #cdd6f4; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%;">
+                    🎬 {fname} <span style="font-size: 11px; color: #7f849c; margin-left: 6px;">({sz})</span>
+                </div>
+                <div style="display: flex; align-items: center; gap: 8px;">
+                    <button onclick='window.rawAction("raw_enqueue", {js_fname})' title="Add this video to the refining queue" style="background: #2a3a30; color: #a6e3a1; border: 1px solid #a6e3a1; border-radius: 6px; padding: 4px 10px; font-size: 11px; font-weight: 600; cursor: pointer;">
+                        ➕ Add to Refine Queue
+                    </button>
+                    <button onclick='window.rawAction("raw_delete", {js_fname})' title="Permanently delete from Google Drive" style="background: #3a2228; color: #f38ba8; border: 1px solid #f38ba8; border-radius: 6px; padding: 4px 10px; font-size: 11px; font-weight: 600; cursor: pointer;">
+                        🗑️ Delete
+                    </button>
+                </div>
+            </div>
+            """)
+        html_parts.append('</div>')
 
     # 1. Active Transcoding Job Section
     html_parts.append('<div style="font-weight: 700; font-size: 15px; color: #cba6f7; display: flex; align-items: center; gap: 8px;">⚙️ Active Transcoding (' + str(len(active_jobs)) + ')</div>')
@@ -622,6 +663,26 @@ def create_ui():
     window.moveQueueItem = function(table, id, direction) {
         window.queueAction('move', table, id, direction);
     };
+
+    window.rawAction = function(action, filename) {
+        try {
+            const payload = JSON.stringify({ action: action, filename: filename });
+            const inp = document.querySelector('#queue_action_input textarea') || 
+                        document.querySelector('#queue_action_input input');
+            const btn = document.querySelector('#queue_action_btn');
+            if (inp && btn) {
+                inp.value = payload;
+                inp.dispatchEvent(new Event('input', { bubbles: true }));
+                btn.click();
+            }
+        } catch(err) {
+            console.error("[RawAction] DOM dispatch error:", err);
+        }
+        try {
+            const ep = action === 'raw_enqueue' ? '/api/raw/enqueue/' : '/api/raw/delete/';
+            fetch(ep + encodeURIComponent(filename), { method: 'POST' }).catch(e => {});
+        } catch(e) {}
+    };
     </script>
     """
 
@@ -903,6 +964,14 @@ def create_ui():
                     cancel_task_by_id(item_id, table_name=table, dismiss=True)
                 elif action == "cancel" and item_id > 0:
                     cancel_task_by_id(item_id, table_name=table if table else None, dismiss=False)
+                elif action == "raw_enqueue":
+                    fn = data.get("filename", "")
+                    if fn:
+                        enqueue_unqueued_raw_file(fn)
+                elif action == "raw_delete":
+                    fn = data.get("filename", "")
+                    if fn:
+                        delete_unqueued_raw_file(fn)
             except Exception as e:
                 print(f"[QueueAction] Handler error: {e}")
             return render_download_queue_html(), render_refine_queue_html()
@@ -1484,5 +1553,15 @@ def create_ui():
     @demo.app.get("/api/queue/refine")
     def api_refine_queue():
         return {"items": database.get_refine_queue()}
+
+    @demo.app.post("/api/raw/enqueue/{filename:path}")
+    def api_raw_enqueue(filename: str):
+        job_id = enqueue_unqueued_raw_file(filename)
+        return {"status": "ok", "filename": filename, "job_id": job_id}
+
+    @demo.app.post("/api/raw/delete/{filename:path}")
+    def api_raw_delete(filename: str):
+        success = delete_unqueued_raw_file(filename)
+        return {"status": "ok", "filename": filename, "success": success}
 
     return demo

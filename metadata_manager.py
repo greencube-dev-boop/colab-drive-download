@@ -2,6 +2,7 @@ import os
 import re
 import glob
 import json
+import shutil
 import datetime
 import threading
 from typing import Dict, Any, List, Optional, Tuple
@@ -93,10 +94,15 @@ def save_metadata(data: Dict[str, Any]):
     try:
         with open(temp_file, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
-        if os.path.exists(config.METADATA_JSON):
-            os.replace(temp_file, config.METADATA_JSON)
-        else:
-            os.rename(temp_file, config.METADATA_JSON)
+        try:
+            if os.path.exists(config.METADATA_JSON):
+                os.replace(temp_file, config.METADATA_JSON)
+            else:
+                os.rename(temp_file, config.METADATA_JSON)
+        except OSError:
+            shutil.copy2(temp_file, config.METADATA_JSON)
+            if os.path.exists(temp_file):
+                os.remove(temp_file)
     except Exception as e:
         print(f"[Metadata] Error saving metadata: {e}")
         try:
