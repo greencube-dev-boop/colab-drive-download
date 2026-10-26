@@ -46,11 +46,11 @@ for d in [
 
 # Concurrency Semaphores & Worker Limits
 MAX_DOWNLOAD_WORKERS = 3
-MAX_LOW_SPEED_DOWNLOAD_WORKERS = 2
+MAX_LOW_SPEED_DOWNLOAD_WORKERS = 0  # 0 indicates UNLIMITED concurrent low-speed downloads
 MAX_REFINE_WORKERS = 1
 
 download_semaphore = threading.Semaphore(MAX_DOWNLOAD_WORKERS)
-low_speed_download_semaphore = threading.Semaphore(MAX_LOW_SPEED_DOWNLOAD_WORKERS)
+low_speed_download_semaphore = None  # None: unlimited concurrency for slow-lane trickle downloads
 conversion_semaphore = threading.Semaphore(MAX_REFINE_WORKERS)
 
 # Timeout and Speed Watchdog Rules

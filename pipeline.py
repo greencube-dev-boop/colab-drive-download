@@ -430,7 +430,8 @@ def _download_job_worker(job: Dict[str, Any], is_low_speed: bool = False):
         with _dl_lock:
             _active_download_tasks.pop(job_id, None)
         if job_is_low:
-            config.low_speed_download_semaphore.release()
+            if getattr(config, "MAX_LOW_SPEED_DOWNLOAD_WORKERS", 0) > 0 and getattr(config, "low_speed_download_semaphore", None) is not None:
+                config.low_speed_download_semaphore.release()
         else:
             config.download_semaphore.release()
 
@@ -459,27 +460,34 @@ def _download_daemon_loop():
             time.sleep(2.0)
 
 def _low_speed_download_daemon_loop():
-    """Continuous background loop executing slow-lane trickle downloads without blocking the high-speed queue."""
+    """Continuous background loop executing slow-lane trickle downloads with unlimited concurrency without blocking high-speed slots."""
     while True:
         if not getattr(config, "download_worker_active", True):
             time.sleep(0.5)
             continue
-        acquired = config.low_speed_download_semaphore.acquire(blocking=False)
-        if not acquired:
-            time.sleep(1.0)
-            continue
+
+        limit = getattr(config, "MAX_LOW_SPEED_DOWNLOAD_WORKERS", 0)
+        has_limit = (limit > 0 and getattr(config, "low_speed_download_semaphore", None) is not None)
+        if has_limit:
+            acquired = config.low_speed_download_semaphore.acquire(blocking=False)
+            if not acquired:
+                time.sleep(1.0)
+                continue
 
         try:
             job = database.claim_next_download_job(is_low_speed=True)
             if job:
                 t = threading.Thread(target=_download_job_worker, args=(job, True), daemon=True)
                 t.start()
+                time.sleep(0.1)
             else:
-                config.low_speed_download_semaphore.release()
-                time.sleep(2.0)
+                if has_limit:
+                    config.low_speed_download_semaphore.release()
+                time.sleep(1.5)
         except Exception as e:
             print(f"[LowSpeedDaemon] Loop exception: {e}")
-            config.low_speed_download_semaphore.release()
+            if has_limit:
+                config.low_speed_download_semaphore.release()
             time.sleep(2.0)
 
 # ---------------------------------------------------------------------

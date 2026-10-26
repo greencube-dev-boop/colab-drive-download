@@ -169,9 +169,9 @@ def render_download_queue_html() -> str:
         for idx, it in enumerate(high_pending):
             html_parts.append(render_pending_row(it, idx, is_low_lane=False))
 
-    # 3. Low-Speed Trickle Queue Section (Dedicated slow lane)
+    # 3. Low-Speed Trickle Queue Section (Dedicated slow lane - Unlimited concurrent capacity)
     total_low = len(low_active) + len(low_pending)
-    html_parts.append('<div style="font-weight: 700; font-size: 15px; color: #f9e2af; display: flex; align-items: center; gap: 8px; margin-top: 14px;">🐢 Low-Speed Trickle Queue (<100 KB/s Lane: ' + str(len(low_active)) + ' active, ' + str(len(low_pending)) + ' queued)</div>')
+    html_parts.append('<div style="font-weight: 700; font-size: 15px; color: #f9e2af; display: flex; align-items: center; gap: 8px; margin-top: 14px;">🐢 Low-Speed Trickle Queue (<100 KB/s: ' + str(len(low_active)) + ' active [Unlimited Capacity], ' + str(len(low_pending)) + ' queued)</div>')
     if total_low == 0:
         html_parts.append("""
         <div style="background: #181825; border: 1px dashed #313244; border-radius: 10px; padding: 12px; text-align: center; color: #6c7086; font-size: 13px;">

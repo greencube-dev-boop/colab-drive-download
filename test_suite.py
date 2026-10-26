@@ -552,6 +552,19 @@ class TestTwoStagePipeline(unittest.TestCase):
         self.assertTrue(toggled_to_slow)
         self.assertEqual(database.get_queue_item("download_queue", id_crawl)["is_low_speed"], 1)
 
+        # Test unlimited concurrent capacity in low-speed queue
+        id_s1 = database.enqueue_download({"title": "Slow 1", "url": "magnet:s1", "is_low_speed": 1})
+        id_s2 = database.enqueue_download({"title": "Slow 2", "url": "magnet:s2", "is_low_speed": 1})
+        id_s3 = database.enqueue_download({"title": "Slow 3", "url": "magnet:s3", "is_low_speed": 1})
+
+        c1 = database.claim_next_download_job(is_low_speed=True)
+        c2 = database.claim_next_download_job(is_low_speed=True)
+        c3 = database.claim_next_download_job(is_low_speed=True)
+        self.assertIsNotNone(c1)
+        self.assertIsNotNone(c2)
+        self.assertIsNotNone(c3)
+        self.assertEqual(config.MAX_LOW_SPEED_DOWNLOAD_WORKERS, 0)
+
     def test_download_watchdog_timeout_detection(self):
         # 1. Test speed & size parsers
         self.assertEqual(parse_speed_to_bps("100KiB"), 100 * 1024)
