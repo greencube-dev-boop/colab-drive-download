@@ -496,12 +496,16 @@ def render_catalog_html() -> str:
 
     html_parts = ['<div style="display: flex; flex-direction: column; gap: 20px; font-family: system-ui, -apple-system, sans-serif;">']
 
-    # Section 1: Movies
+    # Section 1: Movies (Sorted alphabetically and by release year)
     html_parts.append(f'<div style="font-weight: 700; font-size: 16px; color: #f9e2af; display: flex; align-items: center; gap: 8px;">🎬 Movies ({len(movies)})</div>')
     if not movies:
         html_parts.append('<div style="background: #181825; border: 1px dashed #313244; border-radius: 8px; padding: 12px; color: #6c7086; font-size: 13px;">No movies recorded yet.</div>')
     else:
-        for m in movies:
+        sorted_movies = sorted(
+            movies,
+            key=lambda m: (str(m.get("name", "")).lower(), int(m.get("year") or 0))
+        )
+        for m in sorted_movies:
             name = html.escape(m.get("name", "Movie"))
             st = m.get("status", "raw")
             is_ref = (st == "refined")

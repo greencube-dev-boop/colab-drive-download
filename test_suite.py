@@ -816,5 +816,82 @@ class TestTwoStagePipeline(unittest.TestCase):
         self.assertEqual(st_fr, "raw")
         self.assertEqual(os.path.basename(path_fr), "Fbi S01E07.mkv")
 
+    def test_classifier_movie_formats(self):
+        cases = [
+            ("Inception (2010)", "Inception", 2010, "Inception (2010)"),
+            ("Avatar [2009]", "Avatar", 2009, "Avatar (2009)"),
+            ("The Matrix (1999) 1080p BluRay.mkv", "The Matrix", 1999, "The Matrix (1999)"),
+            ("[YTS.MX] Interstellar (2014) [1080p] [WEBRip]", "Interstellar", 2014, "Interstellar (2014)"),
+            ("Blade Runner 2049 (2017)", "Blade Runner 2049", 2017, "Blade Runner 2049 (2017)"),
+            ("Blade.Runner.2049.2017.1080p.BluRay.x264", "Blade Runner 2049", 2017, "Blade Runner 2049 (2017)"),
+            ("2001 A Space Odyssey 1968 1080p BluRay", "2001 A Space Odyssey", 1968, "2001 A Space Odyssey (1968)"),
+            ("2012 2009 1080p BluRay", "2012", 2009, "2012 (2009)"),
+            ("Gladiator.II.2024.HDRip.XviD-EVO", "Gladiator Ii", 2024, "Gladiator Ii (2024)"),
+            ("Pulp.Fiction.1080p.BluRay.x264.mkv", "Pulp Fiction", None, "Pulp Fiction"),
+            ("Fight.Club.720p", "Fight Club", None, "Fight Club")
+        ]
+        for raw_input, expected_title, expected_year, expected_fmt in cases:
+            res = classifier.heuristic_classify(raw_input)
+            self.assertEqual(res["type"], "movie", f"Failed movie type for {raw_input}")
+            self.assertEqual(res["year"], expected_year, f"Failed year for {raw_input}")
+            self.assertEqual(res["title"], expected_title, f"Failed title for {raw_input}")
+            self.assertEqual(res["formatted_name"], expected_fmt, f"Failed formatted_name for {raw_input}")
+
+    def test_movie_deduplication_and_catalog(self):
+        # 1. Test _is_movie_match precision
+        self.assertTrue(metadata_manager._is_movie_match("Inception (2010)", None, "Inception", 2010))
+        self.assertTrue(metadata_manager._is_movie_match("The Matrix", 1999, "Matrix, The (1999)", None))
+        # Different years must NOT match
+        self.assertFalse(metadata_manager._is_movie_match("Avatar (2009)", None, "Avatar (2022)", None))
+        self.assertFalse(metadata_manager._is_movie_match("Dune (1984)", 1984, "Dune (2021)", 2021))
+
+        # 2. Test record_item updates existing without duplicating
+        metadata_manager.record_item(
+            media_type="movie",
+            name="Inception (2010)",
+            status="raw",
+            raw_path=os.path.join(config.RAW_DIR, "Inception (2010).mkv"),
+            year=2010
+        )
+        data = metadata_manager.load_metadata()
+        self.assertEqual(len(data["movies"]), 1)
+        self.assertEqual(data["movies"][0]["status"], "raw")
+        self.assertEqual(data["movies"][0]["year"], 2010)
+
+        # Update status using update_item_status
+        metadata_manager.update_item_status(
+            media_type="movie",
+            name="Inception",
+            status="refined",
+            refined_path=os.path.join(config.REFINED_MOVIES_DIR, "Inception (2010).mkv"),
+            year=2010
+        )
+        data2 = metadata_manager.load_metadata()
+        self.assertEqual(len(data2["movies"]), 1)
+        self.assertEqual(data2["movies"][0]["status"], "refined")
+
+        # 3. Test check_media_exists with raw scene filename in RAW_DIR
+        scene_raw_file = os.path.join(config.RAW_DIR, "Avatar.2009.720p.BluRay.x264.mkv")
+        with open(scene_raw_file, "wb") as f:
+            f.write(b"avatar_raw_bytes")
+
+        query_info = classifier.classify_media("Avatar (2009)")
+        exists, st, p = metadata_manager.check_media_exists(query_info)
+        self.assertTrue(exists)
+        self.assertEqual(st, "raw")
+        self.assertEqual(os.path.basename(p), "Avatar.2009.720p.BluRay.x264.mkv")
+
+        # 4. Test render_catalog_html sorting for movies
+        metadata_manager.record_item(media_type="movie", name="Zack Snyder Justice League (2021)", status="refined", year=2021)
+        metadata_manager.record_item(media_type="movie", name="Avatar (2009)", status="refined", year=2009)
+        metadata_manager.record_item(media_type="movie", name="Avatar: The Way of Water (2022)", status="refined", year=2022)
+
+        html = ui.render_catalog_html()
+        idx_avatar1 = html.find("Avatar (2009)")
+        idx_avatar2 = html.find("Avatar: The Way of Water (2022)")
+        idx_justice = html.find("Zack Snyder Justice League (2021)")
+        self.assertTrue(idx_avatar1 != -1 and idx_avatar2 != -1 and idx_justice != -1)
+        self.assertTrue(idx_avatar1 < idx_avatar2 < idx_justice, "Movies are not sorted alphabetically in Media Catalog!")
+
 if __name__ == "__main__":
     unittest.main()

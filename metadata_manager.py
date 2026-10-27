@@ -28,6 +28,7 @@ def normalize_title(t: str) -> str:
         return ""
     s = t.lower().strip()
     s = re.sub(r'^(the|a|an)\s+', '', s)
+    s = re.sub(r'[,_.-]+\s*(the|a|an)\b', '', s)
     s = re.sub(r'[^a-z0-9]+', ' ', s)
     return re.sub(r'\s+', ' ', s).strip()
 
@@ -51,10 +52,24 @@ def _is_movie_match(title1: str, year1: Optional[int], title2: str, year2: Optio
     n2 = normalize_title(title2)
     if not n1 or not n2:
         return False
+
+    # Infer years from titles if not provided
+    if not year1:
+        y1_match = re.search(r'\b(19\d\d|20\d\d)\b', n1)
+        if y1_match:
+            year1 = int(y1_match.group(1))
+    if not year2:
+        y2_match = re.search(r'\b(19\d\d|20\d\d)\b', n2)
+        if y2_match:
+            year2 = int(y2_match.group(1))
+
+    # If both have years and they differ, they are definitely different movies
     if year1 and year2 and int(year1) != int(year2):
         return False
+
     if n1 == n2:
         return True
+
     w1 = re.sub(r'\b(19\d\d|20\d\d)\b', '', n1).strip()
     w2 = re.sub(r'\b(19\d\d|20\d\d)\b', '', n2).strip()
     w1 = re.sub(r'\s+', ' ', w1).strip()
@@ -79,11 +94,11 @@ def is_same_media(m1: Dict[str, Any], m2: Dict[str, Any]) -> bool:
             return True
         return False
 
-    elif t1 == "movie" and t2 == "movie":
+    elif (t1 == "movie" or t2 == "movie") and (t1 not in ["tv_series", "tv", "tvseris"] and t2 not in ["tv_series", "tv", "tvseris"]):
         return _is_movie_match(
-            m1.get("title", ""),
+            m1.get("title", "") or m1.get("formatted_name", ""),
             m1.get("year"),
-            m2.get("title", ""),
+            m2.get("title", "") or m2.get("formatted_name", ""),
             m2.get("year")
         )
 
@@ -310,6 +325,21 @@ def check_media_exists(media_info: Dict[str, Any]) -> Tuple[bool, str, str]:
                     matches_raw = glob.glob(os.path.join(config.RAW_DIR, f"{clean_stem}.*"))
                     if matches_raw:
                         return True, "raw", matches_raw[0]
+
+                # If raw filename differed from formatted_name (e.g. scene release dots/tags), classify raw candidates
+                if target_year:
+                    candidates = glob.glob(os.path.join(config.RAW_DIR, f"*{target_year}*.*"))
+                else:
+                    candidates = [os.path.join(config.RAW_DIR, f) for f in os.listdir(config.RAW_DIR)]
+
+                for rf in candidates:
+                    if not os.path.isfile(rf):
+                        continue
+                    rf_base = os.path.basename(rf)
+                    import classifier
+                    rf_info = classifier.heuristic_classify(rf_base)
+                    if is_same_media(media_info, rf_info):
+                        return True, "raw", rf
             except Exception as e:
                 print(f"[Metadata] Warning checking raw movie filesystem: {e}")
 
@@ -364,7 +394,8 @@ def record_item(
     refining_data: Optional[Dict[str, Any]] = None,
     show_name: str = "",
     season: int = 0,
-    episode: int = 0
+    episode: int = 0,
+    year: Optional[int] = None
 ):
     """
     Records or updates a media entry in metadata.json matching user's schema:
@@ -381,17 +412,25 @@ def record_item(
         now = _now_iso()
 
         if m_type == "movie":
+            if year is None:
+                y_match = re.search(r'\b(19\d\d|20\d\d)\b', name)
+                if y_match:
+                    year = int(y_match.group(1))
+
             movies_list: List[Dict[str, Any]] = data.get("movies", [])
-            existing = next((m for m in movies_list if m.get("name") == name), None)
+            existing = next((m for m in movies_list if _is_movie_match(m.get("name", ""), m.get("year"), name, year)), None)
             if existing:
                 existing["status"] = status
                 if raw_path: existing["raw_path"] = raw_path
                 if refined_path: existing["refined_path"] = refined_path
                 existing["refining_data"] = refining_data
+                if year and not existing.get("year"):
+                    existing["year"] = year
                 existing["updated_at"] = now
             else:
                 movies_list.append({
                     "name": name,
+                    "year": year,
                     "status": status,
                     "raw_path": raw_path,
                     "refined_path": refined_path,
@@ -468,7 +507,8 @@ def update_item_status(
     refined_path: str = "",
     show_name: str = "",
     season: int = 0,
-    episode: int = 0
+    episode: int = 0,
+    year: Optional[int] = None
 ):
     """Updates status and refined_path for an existing entry."""
     with _meta_lock:
@@ -477,10 +517,17 @@ def update_item_status(
         now = _now_iso()
 
         if m_type == "movie":
+            if year is None:
+                y_match = re.search(r'\b(19\d\d|20\d\d)\b', name)
+                if y_match:
+                    year = int(y_match.group(1))
+
             for m in data.get("movies", []):
-                if m.get("name") == name:
+                if _is_movie_match(m.get("name", ""), m.get("year"), name, year):
                     m["status"] = status
                     if refined_path: m["refined_path"] = refined_path
+                    if year and not m.get("year"):
+                        m["year"] = year
                     m["updated_at"] = now
                     break
 

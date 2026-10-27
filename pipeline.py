@@ -280,6 +280,7 @@ def run_download_pipeline(task: Dict[str, Any]):
         show_name = media_info.get("show_name", "")
         season = media_info.get("season", 0)
         episode = media_info.get("episode", 0)
+        year = media_info.get("year")
         formatted_name = media_info.get("formatted_name", sanitize_filename(task.get("title", "")))
 
         # Determine raw filename & Drive raw staging path
@@ -329,7 +330,8 @@ def run_download_pipeline(task: Dict[str, Any]):
             refining_data=refining_config,
             show_name=show_name,
             season=season,
-            episode=episode
+            episode=episode,
+            year=year
         )
 
         # -------------------------------------------------------------
@@ -345,6 +347,7 @@ def run_download_pipeline(task: Dict[str, Any]):
             "show_name": show_name,
             "season": season,
             "episode": episode,
+            "year": year,
             "title": formatted_name,
             "raw_drive_path": drive_raw_path,
             "target_refined_path": target_refined_path,
@@ -573,7 +576,8 @@ def _refine_job_worker(job: Dict[str, Any]):
             refined_path=target_refined_path,
             show_name=job.get("show_name", ""),
             season=job.get("season", 0),
-            episode=job.get("episode", 0)
+            episode=job.get("episode", 0),
+            year=job.get("year")
         )
         database.complete_refine_job(job_id, final_size_mb=final_size_mb)
 
@@ -772,6 +776,7 @@ def enqueue_unqueued_raw_file(filename: str, refining_config: Optional[Dict[str,
     show_name = media_info.get("show_name", "")
     season = media_info.get("season", 0)
     episode = media_info.get("episode", 0)
+    year = media_info.get("year")
     formatted_name = media_info.get("formatted_name", sanitize_filename(os.path.splitext(filename)[0]))
 
     cfg = refining_config or {
@@ -800,7 +805,8 @@ def enqueue_unqueued_raw_file(filename: str, refining_config: Optional[Dict[str,
         refining_data=cfg,
         show_name=show_name,
         season=season,
-        episode=episode
+        episode=episode,
+        year=year
     )
 
     refine_job_id = database.enqueue_refine({
@@ -808,6 +814,7 @@ def enqueue_unqueued_raw_file(filename: str, refining_config: Optional[Dict[str,
         "show_name": show_name,
         "season": season,
         "episode": episode,
+        "year": year,
         "title": formatted_name,
         "raw_drive_path": full_path,
         "target_refined_path": target_refined_path,

@@ -128,6 +128,7 @@ def init_db():
                 show_name TEXT DEFAULT '',
                 season INTEGER DEFAULT 0,
                 episode INTEGER DEFAULT 0,
+                year INTEGER DEFAULT NULL,
                 title TEXT NOT NULL,
                 raw_drive_path TEXT NOT NULL,
                 target_refined_path TEXT DEFAULT '',
@@ -143,6 +144,11 @@ def init_db():
                 updated_at TEXT NOT NULL
             );
             """)
+
+            cur.execute("PRAGMA table_info(refine_queue)")
+            rf_cols = [r["name"] for r in cur.fetchall()]
+            if "year" not in rf_cols:
+                cur.execute("ALTER TABLE refine_queue ADD COLUMN year INTEGER DEFAULT NULL")
 
             cur.execute("CREATE INDEX IF NOT EXISTS idx_dl_status ON download_queue(status, order_idx);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_dl_speed_status ON download_queue(is_low_speed, status, order_idx);")
@@ -198,15 +204,17 @@ def enqueue_refine(item: Dict[str, Any]) -> int:
 
             now = _now_iso()
             refining_cfg = json.dumps(item.get("refining_config", {}))
+            year_val = item.get("year")
             cur.execute("""
                 INSERT INTO refine_queue 
-                (media_type, show_name, season, episode, title, raw_drive_path, target_refined_path, status, order_idx, refining_config, convert_pct, raw_size_mb, final_size_mb, chunk_status, error_msg, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, 0.0, ?, 0.0, '{}', '', ?, ?)
+                (media_type, show_name, season, episode, year, title, raw_drive_path, target_refined_path, status, order_idx, refining_config, convert_pct, raw_size_mb, final_size_mb, chunk_status, error_msg, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, 0.0, ?, 0.0, '{}', '', ?, ?)
             """, (
                 item.get("media_type", "other"),
                 item.get("show_name", ""),
                 int(item.get("season", 0)),
                 int(item.get("episode", 0)),
+                year_val,
                 item.get("title", "Untitled Media"),
                 item.get("raw_drive_path", ""),
                 item.get("target_refined_path", ""),
