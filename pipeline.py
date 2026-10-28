@@ -297,6 +297,7 @@ def run_download_pipeline(task: Dict[str, Any]):
 
         os.makedirs(config.RAW_DIR, exist_ok=True)
         shutil.move(task["raw_path"], drive_raw_path)
+        invalidate_unqueued_cache()
         raw_size_mb = os.path.getsize(drive_raw_path) / (1024 * 1024)
 
         # Determine expected refined output path in Google Drive
@@ -709,13 +710,39 @@ def queue_direct_items(
 # ---------------------------------------------------------------------
 VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.avi', '.mov', '.webm', '.flv', '.wmv', '.m4v', '.ts'}
 
-def get_unqueued_raw_files() -> List[Dict[str, Any]]:
+_unqueued_cache: Optional[List[Dict[str, Any]]] = None
+_unqueued_last_mtime: float = -1.0
+_unqueued_lock = threading.Lock()
+
+def invalidate_unqueued_cache():
+    """Invalidates the in-memory unqueued raw files cache."""
+    global _unqueued_cache, _unqueued_last_mtime
+    with _unqueued_lock:
+        _unqueued_cache = None
+        _unqueued_last_mtime = -1.0
+
+def get_unqueued_raw_files(force_refresh: bool = False) -> List[Dict[str, Any]]:
     """
     Scans RAW_DIR for video files not currently in refine_queue with status 'pending' or 'refining'.
+    Caches based on directory modification time to avoid repetitive file statting when directory hasn't changed.
     """
+    global _unqueued_cache, _unqueued_last_mtime
+
     raw_dir = getattr(config, "RAW_DIR", "")
     if not raw_dir or not os.path.exists(raw_dir):
+        with _unqueued_lock:
+            _unqueued_cache = []
+            _unqueued_last_mtime = -1.0
         return []
+
+    try:
+        dir_mtime = os.path.getmtime(raw_dir)
+    except Exception:
+        dir_mtime = time.time()
+
+    with _unqueued_lock:
+        if not force_refresh and _unqueued_cache is not None and dir_mtime == _unqueued_last_mtime:
+            return list(_unqueued_cache)
 
     try:
         refine_items = database.get_refine_queue()
@@ -761,7 +788,11 @@ def get_unqueued_raw_files() -> List[Dict[str, Any]]:
     except Exception as e:
         print(f"[UnqueuedScan] Error reading raw directory: {e}")
 
-    return sorted(unqueued, key=lambda x: x["filename"].lower())
+    res = sorted(unqueued, key=lambda x: x["filename"].lower())
+    with _unqueued_lock:
+        _unqueued_cache = res
+        _unqueued_last_mtime = dir_mtime
+    return res
 
 def enqueue_unqueued_raw_file(filename: str, refining_config: Optional[Dict[str, Any]] = None) -> Optional[int]:
     """Classifies an unqueued raw file, records in metadata.json, and pushes into refine_queue."""
@@ -821,6 +852,7 @@ def enqueue_unqueued_raw_file(filename: str, refining_config: Optional[Dict[str,
         "raw_size_mb": raw_size_mb,
         "refining_config": cfg
     })
+    invalidate_unqueued_cache()
     print(f"[UnqueuedAction] Enqueued '{filename}' as refine job #{refine_job_id} ({formatted_name})")
     return refine_job_id
 
@@ -831,5 +863,6 @@ def delete_unqueued_raw_file(filename: str) -> bool:
     if not os.path.exists(full_path):
         return False
     success = config.bypass_trash_delete(full_path)
+    invalidate_unqueued_cache()
     print(f"[UnqueuedAction] Deleted unqueued file '{filename}' (Trash bin bypass: {success})")
     return success

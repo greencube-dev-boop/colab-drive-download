@@ -4,7 +4,19 @@ import html
 import time
 import json
 import urllib.parse
+import warnings
 from typing import Dict, Any, List, Tuple, Optional
+
+# Suppress benign Gradio 6.0 deprecation/user warnings for Blocks constructor parameters
+warnings.filterwarnings(
+    "ignore",
+    message=r".*parameter in the Blocks constructor will be removed in Gradio 6\.0.*"
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*The parameters have been moved from the Blocks constructor to the launch\(\) method.*"
+)
+
 import gradio as gr
 import config
 from config import tasks, tasks_lock, sanitize_filename
@@ -897,7 +909,7 @@ def create_ui():
                 catalog_html_component = gr.HTML(value=render_catalog_html)
 
         # Periodic Refresh Timer for Live Queue Updating
-        refresh_timer = gr.Timer(value=2.0)
+        refresh_timer = gr.Timer(value=3.0)
         refresh_timer.tick(
             fn=lambda: (render_download_queue_html(), render_refine_queue_html()),
             outputs=[download_queue_html, refine_queue_html]

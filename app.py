@@ -1,6 +1,38 @@
 import sys
 import time
 import argparse
+import logging
+import warnings
+
+# Suppress benign Gradio 6.0 deprecation/user warnings for Blocks constructor parameters
+warnings.filterwarnings(
+    "ignore",
+    message=r".*parameter in the Blocks constructor will be removed in Gradio 6\.0.*"
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r".*The parameters have been moved from the Blocks constructor to the launch\(\) method.*"
+)
+
+# Suppress harmless Starlette/Uvicorn ASGI disconnect tracebacks when browser tabs refresh or background
+class ASGISilentDisconnectFilter(logging.Filter):
+    """
+    Suppresses benign ASGI stream cancellation tracebacks that occur when a browser
+    client tab is closed, refreshed, or backgrounded while an SSE stream is in progress.
+    """
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = str(record.getMessage())
+        if "response already started" in msg.lower():
+            return False
+        if record.exc_info:
+            exc = record.exc_info[1]
+            if exc and "response already started" in str(exc).lower():
+                return False
+        return True
+
+for logger_name in ("uvicorn.error", "uvicorn", "uvicorn.access"):
+    logging.getLogger(logger_name).addFilter(ASGISilentDisconnectFilter())
+
 from ui import create_ui
 import config
 from config import tasks, tasks_lock
