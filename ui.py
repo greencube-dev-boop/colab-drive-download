@@ -348,7 +348,12 @@ def render_refine_queue_html() -> str:
             j_id = job["id"]
             m_task = active_mem.get(j_id, {})
             pct = m_task.get("convert_pct", job.get("convert_pct", 0.0))
-            chunks = m_task.get("chunk_status", {})
+            chunks = m_task.get("chunk_status") or job.get("chunk_status", {})
+            if isinstance(chunks, str):
+                try:
+                    chunks = json.loads(chunks)
+                except Exception:
+                    chunks = {}
             if chunks:
                 total_curr = sum(c.get("curr_sec", 0.0) for c in chunks.values())
                 total_dur = sum(c.get("dur_sec", 1.0) for c in chunks.values())
@@ -360,6 +365,11 @@ def render_refine_queue_html() -> str:
             v_codec = "H.265" if "265" in cfg.get("video_codec", "H.265") else "H.264"
             cont = cfg.get("container_format", "mkv").upper()
             title = html.escape(job.get("title", "Media"))
+
+            chunks_done_label = ""
+            if chunks:
+                d_c = sum(1 for c in chunks.values() if c.get("status") == "Done")
+                chunks_done_label = f"({d_c}/{len(chunks)} Chunks)"
 
             html_parts.append(f"""
             <div id="refine-card-{j_id}" style="background: #1e1e2e; border: 1px solid #cba6f7; border-radius: 10px; padding: 16px 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.3);">
@@ -383,28 +393,49 @@ def render_refine_queue_html() -> str:
                     <div style="background: linear-gradient(90deg, #cba6f7, #f5c2e7); height: 100%; width: {pct:.1f}%; transition: width 0.3s ease;"></div>
                 </div>
                 <div style="display: flex; justify-content: space-between; font-size: 12px; color: #a6adc8; margin-bottom: 8px;">
-                    <span>Transcoding progress: <b>{pct:.1f}%</b></span>
+                    <span>Transcoding progress: <b>{pct:.1f}%</b> {chunks_done_label}</span>
                     <span>Raw Size: <b>{job.get('raw_size_mb', 0):.1f} MB</b></span>
                 </div>
             """)
 
-            if chunks and len(chunks) > 1:
-                html_parts.append("""
-                <div style="background: #181825; border: 1px solid #313244; border-radius: 8px; padding: 8px 12px; margin-top: 8px;">
-                    <div style="font-size: 11px; font-weight: 600; color: #9399b2; margin-bottom: 6px;">GPU VRAM Parallel Slices:</div>
-                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px;">
+            if chunks and len(chunks) > 0:
+                total_c = len(chunks)
+                done_c = sum(1 for c in chunks.values() if c.get("status") == "Done")
+                active_c = sum(1 for c in chunks.values() if c.get("status") in ["Encoding", "Retrying (CPU)"])
+                html_parts.append(f"""
+                <div style="background: #181825; border: 1px solid #313244; border-radius: 8px; padding: 10px 12px; margin-top: 8px;">
+                    <div style="display: flex; justify-content: space-between; font-size: 11px; font-weight: 600; color: #9399b2; margin-bottom: 8px;">
+                        <span>📦 Video Segments: {total_c} Total &bull; {done_c} Done &bull; {active_c} Active</span>
+                        <span style="color: #a6e3a1;">Max 2 Chunks / GPU</span>
+                    </div>
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px;">
                 """)
-                for c_idx, c_st in sorted(chunks.items()):
-                    c_pct = c_st.get("pct", 0.0)
-                    c_spd = c_st.get("speed", "--")
+                for c_idx, c_st in sorted(chunks.items(), key=lambda x: int(x[0])):
+                    c_pct = float(c_st.get("pct", 0.0))
+                    c_spd = html.escape(str(c_st.get("speed", "--")))
+                    c_status = str(c_st.get("status", "Queued"))
+                    c_worker = html.escape(str(c_st.get("worker_name", c_st.get("worker_id", "GPU"))))
+                    if c_status == "Done":
+                        c_color = "#a6e3a1"
+                        st_label = "✅ Done"
+                    elif c_status in ["Encoding", "Retrying (CPU)"]:
+                        c_color = "#f9e2af"
+                        st_label = f"⚡ {c_spd}"
+                    else:
+                        c_color = "#6c7086"
+                        st_label = "⏳ Queued"
+
                     html_parts.append(f"""
-                        <div style="background: #11111b; border: 1px solid #313244; border-radius: 6px; padding: 4px 8px;">
-                            <div style="display: flex; justify-content: space-between; font-size: 10px; color: #a6adc8; margin-bottom: 2px;">
-                                <span>Slice #{int(c_idx) + 1} ({c_spd})</span>
-                                <span>{c_pct:.0f}%</span>
+                        <div style="background: #11111b; border: 1px solid #313244; border-radius: 6px; padding: 6px 8px;">
+                            <div style="display: flex; justify-content: space-between; font-size: 10px; color: #cdd6f4; font-weight: 600; margin-bottom: 2px;">
+                                <span>Chunk #{int(c_idx) + 1}</span>
+                                <span style="color: {c_color};">{st_label}</span>
+                            </div>
+                            <div style="font-size: 9px; color: #7f849c; margin-bottom: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">
+                                {c_worker}
                             </div>
                             <div style="background: #313244; border-radius: 3px; height: 4px; width: 100%; overflow: hidden;">
-                                <div style="background: #cba6f7; height: 100%; width: {c_pct:.1f}%;"></div>
+                                <div style="background: {c_color}; height: 100%; width: {c_pct:.1f}%;"></div>
                             </div>
                         </div>
                     """)

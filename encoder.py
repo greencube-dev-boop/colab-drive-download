@@ -118,7 +118,7 @@ def convert_worker(task: Dict[str, Any]):
     if task.get("cancelled"):
         return
 
-    task_chunks_dir = os.path.join(TEMP_DIR, f"chunks_{task['id']}")
+    task_chunks_dir = os.path.join(getattr(config, "CHUNKS_STAGING_DIR", os.path.join(config.DOWNLOADER_DIR, "staging", "chunks")), f"job_{task['id']}")
     os.makedirs(task_chunks_dir, exist_ok=True)
 
     # 1. Probe input video properties
@@ -307,13 +307,30 @@ def convert_worker(task: Dict[str, Any]):
             "status": "Queued"
         }
 
-    def _update_overall_progress():
+    _last_db_progress_sync = [0.0]
+
+    def _update_overall_progress(force_sync: bool = False):
         chunks = task.get("chunk_status", {})
         if chunks:
             total_curr = sum(c.get("curr_sec", 0.0) for c in chunks.values())
             total_dur = sum(c.get("dur_sec", 1.0) for c in chunks.values())
             if total_dur > 0:
-                task["convert_pct"] = min(99.0, max(5.0, (total_curr / total_dur) * 100.0))
+                ratio = total_curr / total_dur
+                task["convert_pct"] = min(99.0, max(5.0, 5.0 + (ratio * 94.0)))
+
+            now = time.time()
+            if force_sync or (now - _last_db_progress_sync[0]) >= 2.0:
+                _last_db_progress_sync[0] = now
+                try:
+                    import database
+                    database.update_item_status(
+                        "refine_queue",
+                        task["id"],
+                        convert_pct=task.get("convert_pct", 5.0),
+                        chunk_status=json.dumps(chunks)
+                    )
+                except Exception:
+                    pass
 
     # 6. Parallel Encoding of Chunks with Auto CPU Fallback
     def encode_single_chunk(idx: int, chunk_path: str) -> str:
@@ -433,9 +450,32 @@ def convert_worker(task: Dict[str, Any]):
     }
     cluster_manager.register_cluster_job(task["id"], cluster_job_info)
 
+    has_main_gpu = is_nvenc_available()
+    online_helpers = cluster_manager.get_online_helper_count()
+
+    if not has_main_gpu:
+        if online_helpers > 0:
+            local_concurrency = 0
+            print(f"[Encoder] Main GPU not available, but {online_helpers} remote GPU helper(s) connected. Delegating chunks to GPU cluster (CPU paused).")
+        else:
+            local_concurrency = 1
+            print("[Encoder] Main GPU not available and no GPU helpers connected. Transcoding via CPU fallback (1 chunk at a time).")
+    else:
+        # Main has GPU: encode up to 2 chunks concurrently on Main GPU
+        local_concurrency = min(2, len(raw_chunks))
+
     def local_cluster_worker(local_worker_id: str):
         while not task.get("cancelled"):
-            c_task = cluster_manager.claim_task(local_worker_id)
+            # Dynamic CPU Fallback Rule: If Main is CPU-only, yield/pause whenever GPU helpers are connected
+            if not has_main_gpu:
+                helpers = cluster_manager.get_online_helper_count()
+                if helpers > 0:
+                    time.sleep(2.0)
+                    if all(c.get("status") == "done" for c in chunks_dict.values()):
+                        break
+                    continue
+
+            c_task = cluster_manager.claim_task(local_worker_id, node_name="Main Local GPU" if has_main_gpu else "Main Local CPU")
             if not c_task or not c_task.get("has_task"):
                 if all(c.get("status") == "done" for c in chunks_dict.values()):
                     break
@@ -456,10 +496,16 @@ def convert_worker(task: Dict[str, Any]):
                 chunks_dict[c_idx]["worker_id"] = None
                 time.sleep(1.0)
 
-    # Launch local worker threads alongside any remote cluster helpers
-    local_concurrency = min(num_workers, len(raw_chunks))
-    with ThreadPoolExecutor(max_workers=local_concurrency) as executor:
-        futures = [executor.submit(local_cluster_worker, f"main_local_{i}") for i in range(local_concurrency)]
+    # Launch local worker threads (or 1 standby thread to resume CPU if remote helpers drop)
+    effective_workers = local_concurrency if (has_main_gpu or online_helpers == 0) else 1
+    with ThreadPoolExecutor(max_workers=max(1, effective_workers)) as executor:
+        futures = []
+        if has_main_gpu:
+            futures = [executor.submit(local_cluster_worker, f"main_gpu_slot_{i}") for i in range(local_concurrency)]
+        else:
+            # CPU fallback worker
+            futures = [executor.submit(local_cluster_worker, "main_cpu_slot_0")]
+
         while not task.get("cancelled"):
             all_done = all(c.get("status") == "done" for c in chunks_dict.values())
             # Sync remote helper telemetry into task["chunk_status"]
@@ -484,6 +530,7 @@ def convert_worker(task: Dict[str, Any]):
             except Exception:
                 pass
 
+    _update_overall_progress(force_sync=True)
     cluster_manager.unregister_cluster_job(task["id"])
 
     if task.get("cancelled"):

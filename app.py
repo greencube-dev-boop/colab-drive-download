@@ -63,6 +63,7 @@ def main():
     cluster_manager.start_cluster_daemon()
 
     @demo.app.post("/api/cluster/register")
+    @demo.app.post("/api/cluster/register/")
     async def api_register_worker(request: Request):
         try:
             data = await request.json()
@@ -72,6 +73,7 @@ def main():
         return JSONResponse(content=res)
 
     @demo.app.post("/api/cluster/heartbeat")
+    @demo.app.post("/api/cluster/heartbeat/")
     async def api_heartbeat_worker(request: Request):
         try:
             data = await request.json()
@@ -82,11 +84,13 @@ def main():
         return JSONResponse(content=res)
 
     @demo.app.get("/api/cluster/claim_task")
+    @demo.app.get("/api/cluster/claim_task/")
     async def api_claim_task(worker_id: str = ""):
         res = cluster_manager.claim_task(worker_id)
         return JSONResponse(content=res)
 
     @demo.app.post("/api/cluster/complete_task")
+    @demo.app.post("/api/cluster/complete_task/")
     async def api_complete_task(request: Request):
         try:
             data = await request.json()
@@ -101,6 +105,7 @@ def main():
         return JSONResponse(content=res)
 
     @demo.app.get("/api/cluster/status")
+    @demo.app.get("/api/cluster/status/")
     async def api_cluster_status():
         status = cluster_manager.get_cluster_status()
         return JSONResponse(content=status)

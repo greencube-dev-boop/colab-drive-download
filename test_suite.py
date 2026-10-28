@@ -1110,5 +1110,62 @@ class TestTwoStagePipeline(unittest.TestCase):
         discovered_url = worker.discover_master_url()
         self.assertEqual(discovered_url, "https://test-main-coord.trycloudflare.com")
 
+    def test_cpu_fallback_and_helper_preemption(self):
+        import cluster_manager
+
+        # 1. No helpers online: get_online_helper_count is 0
+        self.assertEqual(cluster_manager.get_online_helper_count(), 0)
+
+        # 2. Add an online remote helper
+        database.upsert_cluster_worker({
+            "worker_id": "helper_gpu_1",
+            "node_name": "Helper 1 (Tesla T4)",
+            "gpu_name": "Tesla T4",
+            "vram_mb": 15360,
+            "status": "idle"
+        })
+        self.assertEqual(cluster_manager.get_online_helper_count(), 1)
+
+        # 3. Local worker ID should not be counted as remote helper
+        database.upsert_cluster_worker({
+            "worker_id": "main_local_0",
+            "node_name": "Main Local Node",
+            "gpu_name": "CPU",
+            "vram_mb": 0,
+            "status": "idle"
+        })
+        self.assertEqual(cluster_manager.get_online_helper_count(), 1)
+
+    def test_ui_refine_queue_chunks_display(self):
+        # Enqueue a refining job with chunk status
+        job_id = database.enqueue_refine({
+            "title": "Spider-Man Brand New Day (2026)",
+            "raw_drive_path": "/fake/raw/spiderman.mkv",
+            "target_refined_path": "/fake/refined/spiderman.mkv",
+            "raw_size_mb": 1200.0,
+            "refining_config": {"res_preset": "1080p", "video_codec": "H.265 / HEVC"}
+        })
+        # Set job as refining with 4 chunks
+        chunks_info = {
+            "0": {"status": "Done", "pct": 100.0, "speed": "15.0x", "worker_name": "Helper (Tesla T4)"},
+            "1": {"status": "Encoding", "pct": 45.0, "speed": "14.2x", "worker_name": "Main Local GPU"},
+            "2": {"status": "Queued", "pct": 0.0, "speed": "--", "worker_name": "Queued"},
+            "3": {"status": "Queued", "pct": 0.0, "speed": "--", "worker_name": "Queued"}
+        }
+        database.update_item_status(
+            "refine_queue",
+            job_id,
+            status="refining",
+            convert_pct=36.0,
+            chunk_status=json.dumps(chunks_info)
+        )
+
+        html = ui.render_refine_queue_html()
+        self.assertIn("Spider-Man Brand New Day (2026)", html)
+        self.assertIn("1/4 Chunks", html)
+        self.assertIn("Chunk #1", html)
+        self.assertIn("Helper (Tesla T4)", html)
+        self.assertIn("Main Local GPU", html)
+
 if __name__ == "__main__":
     unittest.main()

@@ -157,7 +157,7 @@ def get_cluster_job(job_id: int) -> Optional[Dict[str, Any]]:
     with _cluster_lock:
         return _active_cluster_jobs.get(job_id)
 
-def claim_task(worker_id: str) -> Dict[str, Any]:
+def claim_task(worker_id: str, node_name: Optional[str] = None) -> Dict[str, Any]:
     """
     Leases the next available video chunk to an idle GPU worker node.
     Prioritizes pending chunks, or expired leased chunks needing recovery.
@@ -180,6 +180,7 @@ def claim_task(worker_id: str) -> Dict[str, Any]:
                     # Claim / lease chunk
                     c["status"] = "leased"
                     c["worker_id"] = worker_id
+                    c["worker_name"] = node_name or worker_id
                     c["leased_until"] = now + lease_sec
 
                     # Update database worker tracking
@@ -256,8 +257,15 @@ def reclaim_stale_chunks():
                         except Exception:
                             pass
 
+def get_online_helper_count() -> int:
+    """Returns the number of active, online remote GPU workers (excluding local node)."""
+    discover_workers_from_drive()
+    workers = database.get_cluster_workers(active_only=True)
+    return sum(1 for w in workers if w.get("status") != "offline" and not str(w.get("worker_id", "")).startswith("main_local"))
+
 def get_cluster_status() -> Dict[str, Any]:
     """Returns a high-level summary of the GPU cluster health, nodes, and jobs."""
+    discover_workers_from_drive()
     workers = database.get_cluster_workers(active_only=False)
     online_count = sum(1 for w in workers if w.get("status") != "offline")
     encoding_count = sum(1 for w in workers if w.get("status") == "encoding")
