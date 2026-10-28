@@ -124,6 +124,22 @@ LOCAL_METADATA_JSON = os.path.join(LOCAL_DATA_DIR, "metadata.json")
 TEMP_DIR = LOCAL_WORKSPACE
 DRIVE_DIR = DOWNLOADER_DIR
 
+# Distributed GPU Cluster & Chunks Staging Directories
+STAGING_DIR = os.path.join(DOWNLOADER_DIR, "staging")
+CHUNKS_STAGING_DIR = os.path.join(STAGING_DIR, "chunks")
+LOCAL_CHUNKS_DIR = os.path.join(LOCAL_WORKSPACE, "chunks")
+CLUSTER_DIR = os.path.join(DATA_DIR, "cluster")
+CLUSTER_WORKERS_DIR = os.path.join(CLUSTER_DIR, "workers")
+CLUSTER_MASTER_FILE = os.path.join(CLUSTER_DIR, "master.json")
+LOCAL_CLUSTER_DIR = os.path.join(LOCAL_DATA_DIR, "cluster")
+LOCAL_CLUSTER_WORKERS_DIR = os.path.join(LOCAL_CLUSTER_DIR, "workers")
+LOCAL_CLUSTER_MASTER_FILE = os.path.join(LOCAL_CLUSTER_DIR, "master.json")
+
+# Distributed Cluster Configuration
+CHUNK_DURATION_SEC = 240.0         # 4 minutes per keyframe segment (optimal balance of fault tolerance & low Drive FUSE I/O)
+CHUNK_LEASE_TIMEOUT_SEC = 90.0     # 90 seconds lease duration
+WORKER_HEARTBEAT_TIMEOUT_SEC = 45.0 # Mark worker offline if no heartbeat for 45s
+
 # Database Paths: Google Drive vs Local working copy
 DRIVE_QUEUE_DB = os.path.join(DATA_DIR, "queue.db")
 LOCAL_QUEUE_DB = os.path.join(LOCAL_DATA_DIR, "queue.db")
@@ -137,8 +153,8 @@ else:
 # Ensure necessary directories exist
 for d in [
     DOWNLOADER_DIR, RAW_DIR, REFINED_DIR, REFINED_MOVIES_DIR,
-    REFINED_TV_DIR, REFINED_OTHER_DIR, DATA_DIR,
-    LOCAL_WORKSPACE, LOCAL_RAW_DIR, LOCAL_REFINE_DIR, TRASH_STAGING_DIR, LOCAL_DATA_DIR
+    REFINED_TV_DIR, REFINED_OTHER_DIR, DATA_DIR, STAGING_DIR, CHUNKS_STAGING_DIR, CLUSTER_DIR, CLUSTER_WORKERS_DIR,
+    LOCAL_WORKSPACE, LOCAL_RAW_DIR, LOCAL_REFINE_DIR, TRASH_STAGING_DIR, LOCAL_DATA_DIR, LOCAL_CHUNKS_DIR, LOCAL_CLUSTER_DIR, LOCAL_CLUSTER_WORKERS_DIR
 ]:
     try:
         os.makedirs(d, exist_ok=True)

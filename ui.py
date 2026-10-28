@@ -31,6 +31,7 @@ from pipeline import (
     _active_refine_tasks, _refine_lock,
     get_unqueued_raw_files, enqueue_unqueued_raw_file, delete_unqueued_raw_file
 )
+import cluster_manager
 import threading
 
 # ---------------------------------------------------------
@@ -602,6 +603,145 @@ def render_catalog_html() -> str:
     html_parts.append('</div>')
     return "\n".join(html_parts)
 
+def render_cluster_html() -> str:
+    """Renders GPU Cluster overview, active worker nodes, telemetry, and live chunk stats."""
+    status = cluster_manager.get_cluster_status()
+    workers = status.get("workers", [])
+    total_nodes = status.get("total_nodes", 0)
+    online_nodes = status.get("online_nodes", 0)
+    encoding_nodes = status.get("encoding_nodes", 0)
+    active_jobs = status.get("active_jobs", 0)
+    total_chunks = status.get("total_chunks", 0)
+    done_chunks = status.get("done_chunks", 0)
+
+    html_parts = []
+    html_parts.append('<div style="display: flex; flex-direction: column; gap: 16px;">')
+
+    # 1. Top Metrics Banner
+    html_parts.append(f"""
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px;">
+        <div style="background: #1e1e2e; border: 1px solid #313244; border-radius: 10px; padding: 14px; text-align: center;">
+            <div style="font-size: 11px; text-transform: uppercase; color: #a6adc8; font-weight: 700; letter-spacing: 0.5px;">Cluster Nodes</div>
+            <div style="font-size: 24px; font-weight: 800; color: #a6e3a1; margin-top: 4px;">{online_nodes} <span style="font-size: 14px; color: #6c7086; font-weight: 500;">/ {total_nodes} Total</span></div>
+        </div>
+        <div style="background: #1e1e2e; border: 1px solid #313244; border-radius: 10px; padding: 14px; text-align: center;">
+            <div style="font-size: 11px; text-transform: uppercase; color: #a6adc8; font-weight: 700; letter-spacing: 0.5px;">Active Transcodes</div>
+            <div style="font-size: 24px; font-weight: 800; color: #89b4fa; margin-top: 4px;">{encoding_nodes} <span style="font-size: 14px; color: #6c7086; font-weight: 500;">Encoding</span></div>
+        </div>
+        <div style="background: #1e1e2e; border: 1px solid #313244; border-radius: 10px; padding: 14px; text-align: center;">
+            <div style="font-size: 11px; text-transform: uppercase; color: #a6adc8; font-weight: 700; letter-spacing: 0.5px;">Cluster Chunks</div>
+            <div style="font-size: 24px; font-weight: 800; color: #f9e2af; margin-top: 4px;">{done_chunks} <span style="font-size: 14px; color: #6c7086; font-weight: 500;">/ {total_chunks} Done</span></div>
+        </div>
+        <div style="background: #1e1e2e; border: 1px solid #313244; border-radius: 10px; padding: 14px; text-align: center;">
+            <div style="font-size: 11px; text-transform: uppercase; color: #a6adc8; font-weight: 700; letter-spacing: 0.5px;">Active Refine Jobs</div>
+            <div style="font-size: 24px; font-weight: 800; color: #cba6f7; margin-top: 4px;">{active_jobs} <span style="font-size: 14px; color: #6c7086; font-weight: 500;">In Pipeline</span></div>
+        </div>
+    </div>
+    """)
+
+    # 2. Worker Cards Section
+    html_parts.append('<div style="font-weight: 700; font-size: 16px; color: #cdd6f4; display: flex; align-items: center; gap: 8px; margin-top: 8px;">🖥️ Registered GPU Compute Nodes</div>')
+
+    if not workers:
+        html_parts.append("""
+        <div style="background: #181825; border: 1px dashed #313244; border-radius: 10px; padding: 24px; text-align: center; color: #a6adc8;">
+            <div style="font-size: 18px; margin-bottom: 6px;">⏳ No Remote GPU Workers Connected Yet</div>
+            <div style="font-size: 13px; color: #6c7086; max-width: 500px; margin: 0 auto;">
+                Refining will use this notebook's local GPU. To connect external helper Colab notebooks, see the setup guide below.
+            </div>
+        </div>
+        """)
+    else:
+        html_parts.append('<div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 14px;">')
+        now = time.time()
+        for w in workers:
+            w_id = html.escape(str(w.get("worker_id", "unknown")))
+            node_name = html.escape(str(w.get("node_name", "GPU Worker")))
+            gpu_name = html.escape(str(w.get("gpu_name", "GPU")))
+            vram_mb = int(w.get("vram_mb", 0))
+            vram_str = f"{vram_mb / 1024:.1f} GB" if vram_mb > 1024 else f"{vram_mb} MB"
+            st = str(w.get("status", "idle")).lower()
+            last_hb = float(w.get("last_heartbeat", 0.0))
+            ago = max(0, int(now - last_hb)) if last_hb > 0 else 999
+            chunks_done = int(w.get("total_chunks_processed", 0))
+            job_id = int(w.get("current_job_id", 0))
+            chunk_idx = int(w.get("current_chunk_idx", -1))
+            pct = float(w.get("current_progress", 0.0))
+            fps = float(w.get("current_fps", 0.0))
+            speed = html.escape(str(w.get("current_speed", "--")))
+
+            if st == "encoding":
+                badge_bg = "rgba(249, 226, 175, 0.15)"
+                badge_color = "#f9e2af"
+                badge_text = "⚡ Encoding"
+                border_color = "rgba(249, 226, 175, 0.4)"
+            elif st == "offline" or ago > 45:
+                badge_bg = "rgba(243, 139, 168, 0.15)"
+                badge_color = "#f38ba8"
+                badge_text = "🔴 Offline"
+                border_color = "#313244"
+            else:
+                badge_bg = "rgba(166, 227, 161, 0.15)"
+                badge_color = "#a6e3a1"
+                badge_text = "🟢 Idle / Ready"
+                border_color = "rgba(166, 227, 161, 0.3)"
+
+            task_detail = ""
+            if st == "encoding" and chunk_idx >= 0:
+                task_detail = f"""
+                <div style="margin-top: 10px; background: #11111b; border: 1px solid #313244; border-radius: 6px; padding: 8px 10px;">
+                    <div style="display: flex; justify-content: space-between; font-size: 11px; color: #a6adc8; margin-bottom: 4px;">
+                        <span>Job #{job_id} &bull; Chunk #{chunk_idx}</span>
+                        <span style="font-weight: 700; color: #f9e2af;">{pct:.1f}% ({speed} / {fps:.0f} FPS)</span>
+                    </div>
+                    <div style="width: 100%; height: 6px; background: #313244; border-radius: 3px; overflow: hidden;">
+                        <div style="width: {pct}%; height: 100%; background: #f9e2af; border-radius: 3px; transition: width 0.3s ease;"></div>
+                    </div>
+                </div>
+                """
+
+            html_parts.append(f"""
+            <div style="background: #181825; border: 1px solid {border_color}; border-radius: 10px; padding: 14px; display: flex; flex-direction: column; justify-content: space-between;">
+                <div>
+                    <div style="display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px;">
+                        <div>
+                            <div style="font-size: 15px; font-weight: 700; color: #cdd6f4;">{node_name}</div>
+                            <div style="font-size: 11px; color: #6c7086; font-family: monospace;">{w_id}</div>
+                        </div>
+                        <span style="background: {badge_bg}; color: {badge_color}; border: 1px solid {badge_color}; border-radius: 12px; padding: 2px 8px; font-size: 11px; font-weight: 600;">
+                            {badge_text}
+                        </span>
+                    </div>
+                    <div style="display: flex; gap: 12px; font-size: 12px; color: #a6adc8; margin-top: 6px;">
+                        <div>🎮 <strong>GPU:</strong> {gpu_name}</div>
+                        <div>💾 <strong>VRAM:</strong> {vram_str}</div>
+                    </div>
+                    {task_detail}
+                </div>
+                <div style="display: flex; justify-content: space-between; align-items: center; border-top: 1px solid #313244; padding-top: 10px; margin-top: 12px; font-size: 11px; color: #6c7086;">
+                    <span>Completed Chunks: <strong style="color: #cdd6f4;">{chunks_done}</strong></span>
+                    <span>Last seen: {ago}s ago</span>
+                </div>
+            </div>
+            """)
+        html_parts.append('</div>')
+
+    # 3. Connection Instructions Accordion
+    html_parts.append("""
+    <div style="background: #1e1e2e; border: 1px solid #313244; border-radius: 10px; padding: 16px; margin-top: 10px;">
+        <div style="font-weight: 700; font-size: 15px; color: #89b4fa; margin-bottom: 8px;">💡 How to Add GPU Helper Notebooks</div>
+        <div style="font-size: 13px; color: #a6adc8; line-height: 1.6;">
+            1. Open a second Google Colab tab or use another Google account.<br>
+            2. Run <code>drive_downloader_gpu_helper.ipynb</code> located in your shared Google Drive <code>downloader</code> folder.<br>
+            3. Mount Google Drive and select <strong>Runtime &gt; Change runtime type &gt; T4 GPU</strong> (or A100/V100).<br>
+            4. Run the notebook. It will automatically detect this Main coordinator via <code>data/cluster/master.json</code> on Drive, join the cluster, and immediately start helping transcode video chunks!
+        </div>
+    </div>
+    </div>
+    """)
+
+    return "".join(html_parts)
+
 # ---------------------------------------------------------
 # Build Main Gradio Application
 # ---------------------------------------------------------
@@ -908,11 +1048,22 @@ def create_ui():
 
                 catalog_html_component = gr.HTML(value=render_catalog_html)
 
+            # =================================================
+            # TAB 4: 🖥️ GPU CLUSTER & HELPERS
+            # =================================================
+            with gr.Tab("🖥️ GPU Cluster & Helpers", id="tab_cluster"):
+                with gr.Row():
+                    gr.Markdown("### 🖥️ Distributed GPU Refiner Cluster & Active Helpers")
+                    btn_refresh_cluster = gr.Button("🔄 Refresh Nodes", scale=1)
+                    btn_cleanup_offline = gr.Button("🧹 Clear Offline Nodes", scale=1)
+
+                cluster_html_component = gr.HTML(value=render_cluster_html)
+
         # Periodic Refresh Timer for Live Queue Updating
         refresh_timer = gr.Timer(value=3.0)
         refresh_timer.tick(
-            fn=lambda: (render_download_queue_html(), render_refine_queue_html()),
-            outputs=[download_queue_html, refine_queue_html]
+            fn=lambda: (render_download_queue_html(), render_refine_queue_html(), render_cluster_html()),
+            outputs=[download_queue_html, refine_queue_html, cluster_html_component]
         )
 
         # -----------------------------------------------------
@@ -960,6 +1111,11 @@ def create_ui():
         btn_refresh_dl_queue.click(fn=render_download_queue_html, outputs=[download_queue_html])
         btn_refresh_refine_queue.click(fn=render_refine_queue_html, outputs=[refine_queue_html])
         btn_refresh_catalog.click(fn=render_catalog_html, outputs=[catalog_html_component])
+        btn_refresh_cluster.click(fn=render_cluster_html, outputs=[cluster_html_component])
+        btn_cleanup_offline.click(
+            fn=lambda: (database.cleanup_stale_cluster_workers(timeout_sec=0.0), render_cluster_html())[1],
+            outputs=[cluster_html_component]
+        )
 
         # Native Queue Reordering & Cancellation Handler (Dual Gradio DOM + API mechanism)
         def handle_queue_action(action_str: str):

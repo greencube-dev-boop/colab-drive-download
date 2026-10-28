@@ -55,6 +55,56 @@ def main():
     ensure_daemons_running()
     demo = create_ui()
 
+    # Mount Distributed GPU Cluster REST API endpoints on Gradio's underlying FastAPI app
+    import cluster_manager
+    from fastapi import Request
+    from fastapi.responses import JSONResponse
+
+    cluster_manager.start_cluster_daemon()
+
+    @demo.app.post("/api/cluster/register")
+    async def api_register_worker(request: Request):
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        res = cluster_manager.register_worker(data)
+        return JSONResponse(content=res)
+
+    @demo.app.post("/api/cluster/heartbeat")
+    async def api_heartbeat_worker(request: Request):
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        wid = data.get("worker_id", "")
+        res = cluster_manager.heartbeat_worker(wid, data)
+        return JSONResponse(content=res)
+
+    @demo.app.get("/api/cluster/claim_task")
+    async def api_claim_task(worker_id: str = ""):
+        res = cluster_manager.claim_task(worker_id)
+        return JSONResponse(content=res)
+
+    @demo.app.post("/api/cluster/complete_task")
+    async def api_complete_task(request: Request):
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        wid = data.get("worker_id", "")
+        job_id = int(data.get("job_id", 0))
+        chunk_idx = int(data.get("chunk_idx", -1))
+        out_chunk_path = data.get("out_chunk_path", "")
+        fsize = float(data.get("file_size_mb", 0.0))
+        res = cluster_manager.complete_task(wid, job_id, chunk_idx, out_chunk_path, fsize)
+        return JSONResponse(content=res)
+
+    @demo.app.get("/api/cluster/status")
+    async def api_cluster_status():
+        status = cluster_manager.get_cluster_status()
+        return JSONResponse(content=status)
+
     print(f"\n🌐 Launching Web Interface on port {args.port} (share={args.share})...")
 
     # 1. Start Cloudflare Tunnel in background (robust, immune to Gradio FRP outages)
@@ -95,6 +145,11 @@ def main():
     gradio_share = getattr(demo, "share_url", None)
     import tunnel
     tunnel.display_access_banner(args.port, cloudflare_url=cf_url, gradio_share_url=gradio_share)
+
+    # 5. Publish GPU Cluster Master Beacon to shared Google Drive
+    primary_url = cf_url or gradio_share or f"http://127.0.0.1:{args.port}"
+    cluster_manager.publish_master_beacon(primary_url)
+    print(f"📡 GPU Cluster Master Beacon published to shared Drive ({primary_url})")
 
     print("\n" + "=" * 72)
     print("🟢 Gradio Web Server & Two-Stage Pipelines are LIVE!")

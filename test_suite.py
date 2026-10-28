@@ -39,6 +39,9 @@ class TestTwoStagePipeline(unittest.TestCase):
         self.orig_local_data = getattr(config, "LOCAL_DATA_DIR", None)
         self.orig_local_meta = getattr(config, "LOCAL_METADATA_JSON", None)
         self.orig_is_colab = getattr(config, "IS_COLAB", False)
+        self.orig_cluster_dir = getattr(config, "CLUSTER_DIR", None)
+        self.orig_cluster_workers_dir = getattr(config, "CLUSTER_WORKERS_DIR", None)
+        self.orig_cluster_master_file = getattr(config, "CLUSTER_MASTER_FILE", None)
 
         config.DOWNLOADER_DIR = self.test_dir
         config.RAW_DIR = os.path.join(self.test_dir, "raw")
@@ -56,10 +59,17 @@ class TestTwoStagePipeline(unittest.TestCase):
         config.TRASH_STAGING_DIR = os.path.join(self.test_dir, "trash_staging")
         config.LOCAL_RAW_DIR = os.path.join(self.test_dir, "local_raw")
         config.LOCAL_REFINE_DIR = os.path.join(self.test_dir, "local_refine")
+        config.CLUSTER_DIR = os.path.join(self.test_dir, "data", "cluster")
+        config.CLUSTER_WORKERS_DIR = os.path.join(config.CLUSTER_DIR, "workers")
+        config.CLUSTER_MASTER_FILE = os.path.join(config.CLUSTER_DIR, "master.json")
+        config.LOCAL_CLUSTER_DIR = os.path.join(self.test_dir, "local_data", "cluster")
+        config.LOCAL_CLUSTER_WORKERS_DIR = os.path.join(config.LOCAL_CLUSTER_DIR, "workers")
+        config.LOCAL_CLUSTER_MASTER_FILE = os.path.join(config.LOCAL_CLUSTER_DIR, "master.json")
 
         for d in [config.RAW_DIR, config.REFINED_DIR, config.REFINED_MOVIES_DIR,
                   config.REFINED_TV_DIR, config.REFINED_OTHER_DIR, config.DATA_DIR, config.LOCAL_DATA_DIR,
-                  config.TRASH_STAGING_DIR, config.LOCAL_RAW_DIR, config.LOCAL_REFINE_DIR]:
+                  config.TRASH_STAGING_DIR, config.LOCAL_RAW_DIR, config.LOCAL_REFINE_DIR,
+                  config.CLUSTER_DIR, config.CLUSTER_WORKERS_DIR, config.LOCAL_CLUSTER_DIR, config.LOCAL_CLUSTER_WORKERS_DIR]:
             os.makedirs(d, exist_ok=True)
 
         metadata_manager.reset_cache()
@@ -83,6 +93,9 @@ class TestTwoStagePipeline(unittest.TestCase):
         config.LOCAL_DATA_DIR = self.orig_local_data
         config.LOCAL_METADATA_JSON = self.orig_local_meta
         config.IS_COLAB = self.orig_is_colab
+        config.CLUSTER_DIR = self.orig_cluster_dir
+        config.CLUSTER_WORKERS_DIR = self.orig_cluster_workers_dir
+        config.CLUSTER_MASTER_FILE = self.orig_cluster_master_file
         shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def test_classifier_movie(self):
@@ -906,6 +919,196 @@ class TestTwoStagePipeline(unittest.TestCase):
 
         # 3. Test setup_colab_access doesn't crash in non-colab environments
         tunnel.setup_colab_access(7860)
+
+    def test_cluster_database_operations(self):
+        # 1. Test worker registration
+        w_data = {
+            "worker_id": "worker_test_t4_1",
+            "node_name": "Test Node 1",
+            "gpu_name": "Tesla T4",
+            "vram_mb": 15360,
+            "tunnel_url": "https://test1.trycloudflare.com"
+        }
+        ok = database.upsert_cluster_worker(w_data)
+        self.assertTrue(ok)
+
+        # 2. Verify worker in database
+        workers = database.get_cluster_workers()
+        self.assertEqual(len(workers), 1)
+        self.assertEqual(workers[0]["worker_id"], "worker_test_t4_1")
+        self.assertEqual(workers[0]["gpu_name"], "Tesla T4")
+        self.assertEqual(workers[0]["status"], "idle")
+
+        # 3. Test heartbeat and progress update
+        ok_hb = database.heartbeat_cluster_worker("worker_test_t4_1", {
+            "job_id": 10,
+            "chunk_idx": 2,
+            "pct": 45.0,
+            "fps": 180.0,
+            "speed": "14.5x",
+            "status": "encoding"
+        })
+        self.assertTrue(ok_hb)
+        w_updated = database.get_cluster_workers()[0]
+        self.assertEqual(w_updated["status"], "encoding")
+        self.assertEqual(w_updated["current_progress"], 45.0)
+
+        # 4. Test chunk increment
+        database.increment_worker_chunks("worker_test_t4_1")
+        w_done = database.get_cluster_workers()[0]
+        self.assertEqual(w_done["total_chunks_processed"], 1)
+        self.assertEqual(w_done["status"], "idle")
+
+        # 5. Test stale worker detection
+        with database._db_lock:
+            conn = database._get_connection()
+            conn.execute("UPDATE cluster_workers SET last_heartbeat = ?", (time.time() - 100,))
+            conn.commit()
+            conn.close()
+
+        workers_stale = database.get_cluster_workers(timeout_sec=45.0)
+        self.assertEqual(workers_stale[0]["status"], "offline")
+
+        # 6. Test cleanup stale workers
+        cleaned = database.cleanup_stale_cluster_workers(timeout_sec=50.0)
+        self.assertEqual(cleaned, 1)
+        self.assertEqual(len(database.get_cluster_workers()), 0)
+
+    def test_cluster_manager_beacons_and_discovery(self):
+        import cluster_manager
+
+        # 1. Test master beacon publishing
+        cluster_manager.publish_master_beacon("https://master-coord.trycloudflare.com")
+        self.assertTrue(os.path.exists(config.CLUSTER_MASTER_FILE))
+        with open(config.CLUSTER_MASTER_FILE, "r") as f:
+            data = json.load(f)
+        self.assertEqual(data["master_url"], "https://master-coord.trycloudflare.com")
+
+        # 2. Test worker drive beacon discovery
+        worker_file = os.path.join(config.CLUSTER_WORKERS_DIR, "worker_drive_test.json")
+        with open(worker_file, "w") as f:
+            json.dump({
+                "worker_id": "worker_drive_test",
+                "node_name": "Drive Helper",
+                "gpu_name": "Tesla A100",
+                "vram_mb": 40960,
+                "status": "idle",
+                "last_heartbeat": time.time(),
+                "registered_at": time.time()
+            }, f)
+
+        cluster_manager.discover_workers_from_drive()
+        workers = database.get_cluster_workers()
+        self.assertEqual(len(workers), 1)
+        self.assertEqual(workers[0]["worker_id"], "worker_drive_test")
+        self.assertEqual(workers[0]["gpu_name"], "Tesla A100")
+
+    def test_cluster_manager_task_leasing_and_reclaim(self):
+        import cluster_manager
+
+        # Setup mock active cluster job
+        raw_seg_0 = os.path.join(self.test_dir, "seg_000.mkv")
+        out_seg_0 = os.path.join(self.test_dir, "enc_seg_000.mkv")
+        with open(raw_seg_0, "wb") as f:
+            f.write(b"dummy_chunk")
+
+        job_info = {
+            "job_id": 99,
+            "title": "Test Movie",
+            "chunks_dir": self.test_dir,
+            "raw_chunks": [raw_seg_0],
+            "chunks": {
+                0: {
+                    "raw_path": raw_seg_0,
+                    "out_path": out_seg_0,
+                    "status": "pending",
+                    "worker_id": None,
+                    "leased_until": 0.0,
+                    "pct": 0.0,
+                    "fps": 0.0,
+                    "speed": "--"
+                }
+            },
+            "refining_config": {"res_preset": "480p"},
+            "cancelled": False
+        }
+        cluster_manager.register_cluster_job(99, job_info)
+
+        # 1. Claim task
+        task = cluster_manager.claim_task("worker_node_1")
+        self.assertTrue(task["has_task"])
+        self.assertEqual(task["job_id"], 99)
+        self.assertEqual(task["chunk_idx"], 0)
+        self.assertEqual(job_info["chunks"][0]["status"], "leased")
+        self.assertEqual(job_info["chunks"][0]["worker_id"], "worker_node_1")
+
+        # 2. Subsequent claim has no tasks
+        no_task = cluster_manager.claim_task("worker_node_2")
+        self.assertFalse(no_task["has_task"])
+
+        # 3. Simulate lease expiration and reclaim
+        job_info["chunks"][0]["leased_until"] = time.time() - 10
+        cluster_manager.reclaim_stale_chunks()
+        self.assertEqual(job_info["chunks"][0]["status"], "pending")
+        self.assertIsNone(job_info["chunks"][0]["worker_id"])
+
+        # 4. Re-claim and complete
+        task_reclaimed = cluster_manager.claim_task("worker_node_2")
+        self.assertTrue(task_reclaimed["has_task"])
+        self.assertEqual(task_reclaimed["chunk_idx"], 0)
+
+        # Complete task
+        with open(out_seg_0, "wb") as f:
+            f.write(b"encoded_chunk")
+        res_comp = cluster_manager.complete_task("worker_node_2", 99, 0, out_seg_0, 1.5)
+        self.assertEqual(res_comp["status"], "accepted")
+        self.assertTrue(res_comp["all_chunks_done"])
+        self.assertEqual(job_info["chunks"][0]["status"], "done")
+
+        cluster_manager.unregister_cluster_job(99)
+
+    def test_cluster_ui_rendering(self):
+        import cluster_manager
+        # Render with no workers
+        html_empty = ui.render_cluster_html()
+        self.assertIn("No Remote GPU Workers Connected Yet", html_empty)
+
+        # Add worker and render
+        database.upsert_cluster_worker({
+            "worker_id": "worker_ui_t4",
+            "node_name": "Cluster Node 1",
+            "gpu_name": "Tesla T4",
+            "vram_mb": 15360,
+            "status": "idle"
+        })
+        html_worker = ui.render_cluster_html()
+        self.assertIn("Cluster Node 1", html_worker)
+        self.assertIn("Tesla T4", html_worker)
+        self.assertIn("15.0 GB", html_worker)
+
+    def test_helper_worker_module(self):
+        import helper_worker
+
+        worker = helper_worker.HelperWorker(worker_id="test_worker_standalone")
+        self.assertEqual(worker.worker_id, "test_worker_standalone")
+
+        # Test Drive beacon announcement
+        worker.announce_to_drive(status="idle")
+        w_file = os.path.join(config.CLUSTER_WORKERS_DIR, "worker_test_worker_standalone.json")
+        self.assertTrue(os.path.exists(w_file))
+        with open(w_file, "r") as f:
+            d = json.load(f)
+        self.assertEqual(d["worker_id"], "test_worker_standalone")
+        self.assertEqual(d["status"], "idle")
+
+        # Test master beacon discovery
+        cluster_manager_target = config.CLUSTER_MASTER_FILE
+        os.makedirs(os.path.dirname(cluster_manager_target), exist_ok=True)
+        with open(cluster_manager_target, "w") as f:
+            json.dump({"master_url": "https://test-main-coord.trycloudflare.com"}, f)
+
+        discovered_url = worker.discover_master_url()
+        self.assertEqual(discovered_url, "https://test-main-coord.trycloudflare.com")
 
 if __name__ == "__main__":
     unittest.main()

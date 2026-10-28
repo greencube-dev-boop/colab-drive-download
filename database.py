@@ -149,10 +149,34 @@ def init_db():
             rf_cols = [r["name"] for r in cur.fetchall()]
             if "year" not in rf_cols:
                 cur.execute("ALTER TABLE refine_queue ADD COLUMN year INTEGER DEFAULT NULL")
+            if "chunk_plan" not in rf_cols:
+                cur.execute("ALTER TABLE refine_queue ADD COLUMN chunk_plan TEXT DEFAULT '{}'")
+            if "cluster_enabled" not in rf_cols:
+                cur.execute("ALTER TABLE refine_queue ADD COLUMN cluster_enabled INTEGER DEFAULT 1")
+
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS cluster_workers (
+                worker_id TEXT PRIMARY KEY,
+                node_name TEXT NOT NULL,
+                gpu_name TEXT NOT NULL,
+                vram_mb INTEGER DEFAULT 0,
+                tunnel_url TEXT DEFAULT '',
+                current_job_id INTEGER DEFAULT 0,
+                current_chunk_idx INTEGER DEFAULT -1,
+                current_progress REAL DEFAULT 0.0,
+                current_fps REAL DEFAULT 0.0,
+                current_speed TEXT DEFAULT '--',
+                last_heartbeat REAL NOT NULL,
+                status TEXT DEFAULT 'idle',
+                total_chunks_processed INTEGER DEFAULT 0,
+                registered_at REAL NOT NULL
+            );
+            """)
 
             cur.execute("CREATE INDEX IF NOT EXISTS idx_dl_status ON download_queue(status, order_idx);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_dl_speed_status ON download_queue(is_low_speed, status, order_idx);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_rf_status ON refine_queue(status, order_idx);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_worker_heartbeat ON cluster_workers(last_heartbeat, status);")
             _commit_and_sync(conn, force=True)
         finally:
             conn.close()
@@ -627,5 +651,142 @@ def clear_completed(table_name: str) -> int:
             deleted = cur.rowcount
             _commit_and_sync(conn, force=True)
             return deleted
+        finally:
+            conn.close()
+
+# ---------------------------------------------------------------------
+# Distributed Cluster Worker Database Management
+# ---------------------------------------------------------------------
+def upsert_cluster_worker(worker: Dict[str, Any]) -> bool:
+    """Registers or updates a cluster GPU worker node."""
+    with _db_lock:
+        conn = _get_connection()
+        try:
+            cur = conn.cursor()
+            w_id = worker.get("worker_id", "")
+            if not w_id:
+                return False
+            node_name = worker.get("node_name", f"Node ({worker.get('gpu_name', 'GPU')})")
+            gpu_name = worker.get("gpu_name", "Unknown GPU")
+            vram_mb = int(worker.get("vram_mb", 0))
+            tunnel_url = worker.get("tunnel_url", "")
+            now = time.time()
+            cur.execute("""
+                INSERT INTO cluster_workers 
+                (worker_id, node_name, gpu_name, vram_mb, tunnel_url, current_job_id, current_chunk_idx, current_progress, current_fps, current_speed, last_heartbeat, status, total_chunks_processed, registered_at)
+                VALUES (?, ?, ?, ?, ?, 0, -1, 0.0, 0.0, '--', ?, 'idle', 0, ?)
+                ON CONFLICT(worker_id) DO UPDATE SET
+                    node_name = excluded.node_name,
+                    gpu_name = excluded.gpu_name,
+                    vram_mb = excluded.vram_mb,
+                    tunnel_url = CASE WHEN excluded.tunnel_url != '' THEN excluded.tunnel_url ELSE cluster_workers.tunnel_url END,
+                    last_heartbeat = excluded.last_heartbeat,
+                    status = CASE WHEN cluster_workers.status = 'offline' THEN 'idle' ELSE cluster_workers.status END
+            """, (w_id, node_name, gpu_name, vram_mb, tunnel_url, now, now))
+            _commit_and_sync(conn, force=True)
+            return True
+        finally:
+            conn.close()
+
+def heartbeat_cluster_worker(worker_id: str, progress_data: Optional[Dict[str, Any]] = None) -> bool:
+    """Updates worker heartbeat timestamp and live chunk encoding metrics."""
+    with _db_lock:
+        conn = _get_connection()
+        try:
+            cur = conn.cursor()
+            now = time.time()
+            p = progress_data or {}
+            job_id = int(p.get("job_id", 0))
+            chunk_idx = int(p.get("chunk_idx", -1))
+            pct = float(p.get("pct", 0.0))
+            fps = float(p.get("fps", 0.0))
+            speed = str(p.get("speed", "--"))
+            status = p.get("status", "encoding" if chunk_idx >= 0 else "idle")
+
+            cur.execute("""
+                UPDATE cluster_workers SET
+                    last_heartbeat = ?,
+                    current_job_id = ?,
+                    current_chunk_idx = ?,
+                    current_progress = ?,
+                    current_fps = ?,
+                    current_speed = ?,
+                    status = ?
+                WHERE worker_id = ?
+            """, (now, job_id, chunk_idx, pct, fps, speed, status, worker_id))
+            _commit_and_sync(conn, force=False)
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+def get_cluster_workers(active_only: bool = False, timeout_sec: float = 45.0) -> List[Dict[str, Any]]:
+    """Retrieves all registered cluster GPU workers, dynamically marking stale nodes as offline."""
+    with _db_lock:
+        conn = _get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM cluster_workers ORDER BY registered_at ASC")
+            rows = cur.fetchall()
+            now = time.time()
+            results = []
+            for r in rows:
+                d = dict(r)
+                is_stale = (now - d["last_heartbeat"]) > timeout_sec
+                if is_stale and d["status"] != "offline":
+                    d["status"] = "offline"
+                    cur.execute("UPDATE cluster_workers SET status = 'offline' WHERE worker_id = ?", (d["worker_id"],))
+                if active_only and d["status"] == "offline":
+                    continue
+                results.append(d)
+            _commit_and_sync(conn, force=False)
+            return results
+        finally:
+            conn.close()
+
+def remove_cluster_worker(worker_id: str) -> bool:
+    """Removes a cluster worker from the database."""
+    with _db_lock:
+        conn = _get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM cluster_workers WHERE worker_id = ?", (worker_id,))
+            _commit_and_sync(conn, force=True)
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+def cleanup_stale_cluster_workers(timeout_sec: float = 120.0) -> int:
+    """Removes offline worker nodes that haven't sent a heartbeat for longer than timeout_sec."""
+    with _db_lock:
+        conn = _get_connection()
+        try:
+            cur = conn.cursor()
+            cutoff = time.time() - timeout_sec
+            cur.execute("DELETE FROM cluster_workers WHERE last_heartbeat < ? AND status = 'offline'", (cutoff,))
+            count = cur.rowcount
+            _commit_and_sync(conn, force=True)
+            return count
+        finally:
+            conn.close()
+
+def increment_worker_chunks(worker_id: str) -> None:
+    """Increments the total processed chunk count for a worker and sets its status back to idle."""
+    with _db_lock:
+        conn = _get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                UPDATE cluster_workers SET
+                    total_chunks_processed = total_chunks_processed + 1,
+                    status = 'idle',
+                    current_job_id = 0,
+                    current_chunk_idx = -1,
+                    current_progress = 0.0,
+                    current_fps = 0.0,
+                    current_speed = '--',
+                    last_heartbeat = ?
+                WHERE worker_id = ?
+            """, (time.time(), worker_id))
+            _commit_and_sync(conn, force=True)
         finally:
             conn.close()

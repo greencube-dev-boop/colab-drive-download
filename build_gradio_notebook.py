@@ -37,6 +37,8 @@ def generate_notebook():
         "encoder.py",
         "pipeline.py",
         "tunnel.py",
+        "cluster_manager.py",
+        "helper_worker.py",
         "ui.py",
         "app.py",
         "requirements.txt"

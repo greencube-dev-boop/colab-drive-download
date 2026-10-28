@@ -264,7 +264,8 @@ def convert_worker(task: Dict[str, Any]):
     raw_chunks: List[str] = []
 
     if duration > 90 and num_workers > 1:
-        seg_target_duration = max(30, int(duration / num_workers))
+        target_chunk_sec = int(getattr(config, "CHUNK_DURATION_SEC", 240.0))
+        seg_target_duration = max(30, min(target_chunk_sec, int(duration / num_workers)))
         split_cmd = [
             "ffmpeg", "-nostdin", "-y",
             "-i", task["raw_path"],
@@ -394,12 +395,101 @@ def convert_worker(task: Dict[str, Any]):
         task["chunk_status"][idx]["status"] = "Done"
         return out_chunk
 
-    with ThreadPoolExecutor(max_workers=min(num_workers, len(raw_chunks))) as executor:
-        futures = [executor.submit(encode_single_chunk, idx, cp) for idx, cp in enumerate(raw_chunks)]
-        encoded_chunks = [f.result() for f in futures]
+    # Register job and chunks with ClusterManager for multi-GPU distributed conversion
+    import cluster_manager
+
+    chunks_dict = {}
+    for idx, cp in enumerate(raw_chunks):
+        base = os.path.splitext(os.path.basename(cp))[0]
+        out_chunk_path = os.path.join(task_chunks_dir, f"enc_{base}.mkv")
+        is_already_done = os.path.exists(out_chunk_path) and os.path.getsize(out_chunk_path) > 0
+        chunks_dict[idx] = {
+            "raw_path": cp,
+            "out_path": out_chunk_path,
+            "status": "done" if is_already_done else "pending",
+            "worker_id": "cached" if is_already_done else None,
+            "leased_until": 0.0,
+            "pct": 100.0 if is_already_done else 0.0,
+            "fps": 0.0,
+            "speed": "--"
+        }
+        if is_already_done:
+            task["chunk_status"][idx]["status"] = "Done"
+            task["chunk_status"][idx]["pct"] = 100.0
+
+    cluster_job_info = {
+        "job_id": task["id"],
+        "title": task.get("title", f"Job #{task['id']}"),
+        "chunks_dir": task_chunks_dir,
+        "raw_chunks": raw_chunks,
+        "chunks": chunks_dict,
+        "refining_config": {
+            "res_preset": task.get("res_preset", "480p"),
+            "scale_filter": scale_filter,
+            "video_codec": task.get("video_codec", "H.265 / HEVC"),
+            "crf_val": crf_val
+        },
+        "cancelled": False
+    }
+    cluster_manager.register_cluster_job(task["id"], cluster_job_info)
+
+    def local_cluster_worker(local_worker_id: str):
+        while not task.get("cancelled"):
+            c_task = cluster_manager.claim_task(local_worker_id)
+            if not c_task or not c_task.get("has_task"):
+                if all(c.get("status") == "done" for c in chunks_dict.values()):
+                    break
+                time.sleep(0.5)
+                continue
+
+            c_idx = c_task["chunk_idx"]
+            raw_cp = c_task["raw_chunk_path"]
+            out_cp = c_task["out_chunk_path"]
+
+            try:
+                encode_single_chunk(c_idx, raw_cp)
+                fsize = os.path.getsize(out_cp) / (1024 * 1024) if os.path.exists(out_cp) else 0.0
+                cluster_manager.complete_task(local_worker_id, task["id"], c_idx, out_cp, fsize)
+            except Exception as e:
+                print(f"[Encoder] Local chunk #{c_idx} encoding notice: {e}")
+                chunks_dict[c_idx]["status"] = "pending"
+                chunks_dict[c_idx]["worker_id"] = None
+                time.sleep(1.0)
+
+    # Launch local worker threads alongside any remote cluster helpers
+    local_concurrency = min(num_workers, len(raw_chunks))
+    with ThreadPoolExecutor(max_workers=local_concurrency) as executor:
+        futures = [executor.submit(local_cluster_worker, f"main_local_{i}") for i in range(local_concurrency)]
+        while not task.get("cancelled"):
+            all_done = all(c.get("status") == "done" for c in chunks_dict.values())
+            # Sync remote helper telemetry into task["chunk_status"]
+            for idx, c in chunks_dict.items():
+                if c.get("status") == "done":
+                    task["chunk_status"][idx]["status"] = "Done"
+                    task["chunk_status"][idx]["pct"] = 100.0
+                elif c.get("status") == "leased":
+                    task["chunk_status"][idx]["status"] = "Encoding"
+                    if c.get("pct", 0) > 0:
+                        task["chunk_status"][idx]["pct"] = c["pct"]
+                    if c.get("speed"):
+                        task["chunk_status"][idx]["speed"] = c["speed"]
+            _update_overall_progress()
+            if all_done:
+                break
+            time.sleep(0.5)
+
+        for f in futures:
+            try:
+                f.result(timeout=1.0)
+            except Exception:
+                pass
+
+    cluster_manager.unregister_cluster_job(task["id"])
 
     if task.get("cancelled"):
         return
+
+    encoded_chunks = [c["out_path"] for c in sorted(chunks_dict.values(), key=lambda x: x["raw_path"])]
 
     # 7. Concat video chunks and mux with continuous audio
     encoded_chunks.sort()
