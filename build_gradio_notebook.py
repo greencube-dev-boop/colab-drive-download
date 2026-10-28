@@ -36,6 +36,7 @@ def generate_notebook():
         "downloader.py",
         "encoder.py",
         "pipeline.py",
+        "tunnel.py",
         "ui.py",
         "app.py",
         "requirements.txt"
@@ -115,6 +116,7 @@ print("📦 [3/3] Installing Dependencies & Setting Up Project Workspace...")
 print("=" * 72)
 !apt-get update -qq && apt-get install -y -qq aria2 ffmpeg > /dev/null
 !pip install -q gradio yt-dlp fastapi uvicorn requests urllib3 google-genai
+!wget -q -nc https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared
 
 if has_gpu:
     try:
@@ -167,8 +169,8 @@ print(f"🎉 Setup complete! Current workspace: {os.getcwd()}")
 """)
 
     # Cell 2: Launch Web App & Keep-Alive Loop
-    add_code("""#@title 🚀 Step 2: Launch Gradio Web Application & Heartbeat Keep-Alive
-#@markdown Starts the Gradio web server with public `share=True` link and runs continuous telemetry heartbeat.
+    add_code("""#@title 🚀 Step 2: Launch Web Dashboard & Keep-Alive Heartbeat
+#@markdown Starts the web server with multi-path access: Cloudflare Tunnel, Google Colab native proxy, and Gradio share.
 
 import os
 import sys
@@ -179,7 +181,15 @@ if os.path.exists("/content/colab-drive-download"):
 if "." not in sys.path:
     sys.path.insert(0, ".")
 
-!python app.py --share
+# Setup Colab native direct link window anchor
+try:
+    from google.colab import output
+    output.serve_kernel_port_as_window(7860, anchor_text="🔗 [Colab Native Direct Link] Click here to open Web Dashboard in a new tab")
+except Exception:
+    pass
+
+import app
+app.main()
 """)
 
     nb = {

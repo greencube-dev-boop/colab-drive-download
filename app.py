@@ -44,7 +44,7 @@ def main():
     parser.add_argument("--port", type=int, default=7860, help="Port to bind the server on")
     parser.add_argument("--share", action="store_true", default=True, help="Create a public gradio.live share link")
     parser.add_argument("--no-share", dest="share", action="store_false", help="Disable public share link")
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args()
 
     print("=" * 72)
     print("🚀 Initializing Two-Stage Google Drive Downloader & GPU Refiner Engine...")
@@ -56,12 +56,45 @@ def main():
     demo = create_ui()
 
     print(f"\n🌐 Launching Web Interface on port {args.port} (share={args.share})...")
-    demo.launch(
-        server_port=args.port,
-        share=args.share,
-        inline=True,
-        prevent_thread_lock=True
-    )
+
+    # 1. Start Cloudflare Tunnel in background (robust, immune to Gradio FRP outages)
+    cf_url = None
+    try:
+        import tunnel
+        cf_url = tunnel.start_cloudflare_tunnel(port=args.port)
+    except Exception as e:
+        print(f"[Tunnel] Notice starting Cloudflare tunnel: {e}")
+
+    # 2. Launch Gradio server
+    try:
+        demo.launch(
+            server_port=args.port,
+            share=args.share,
+            inline=True,
+            prevent_thread_lock=True
+        )
+    except Exception as e:
+        print(f"[App] Notice during demo.launch: {e}")
+        if args.share:
+            print("[App] Retrying launch in local mode (Cloudflare tunnel remains active)...")
+            demo.launch(
+                server_port=args.port,
+                share=False,
+                inline=True,
+                prevent_thread_lock=True
+            )
+
+    # 3. Setup Colab native proxy links (if in Google Colab kernel)
+    try:
+        import tunnel
+        tunnel.setup_colab_access(args.port)
+    except Exception:
+        pass
+
+    # 4. Display Access Banner
+    gradio_share = getattr(demo, "share_url", None)
+    import tunnel
+    tunnel.display_access_banner(args.port, cloudflare_url=cf_url, gradio_share_url=gradio_share)
 
     print("\n" + "=" * 72)
     print("🟢 Gradio Web Server & Two-Stage Pipelines are LIVE!")

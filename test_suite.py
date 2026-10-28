@@ -893,5 +893,19 @@ class TestTwoStagePipeline(unittest.TestCase):
         self.assertTrue(idx_avatar1 != -1 and idx_avatar2 != -1 and idx_justice != -1)
         self.assertTrue(idx_avatar1 < idx_avatar2 < idx_justice, "Movies are not sorted alphabetically in Media Catalog!")
 
+    def test_tunnel_module_and_banner(self):
+        import tunnel
+        # 1. Test display_access_banner output formatting without error
+        tunnel.display_access_banner(
+            port=7860,
+            cloudflare_url="https://test-subdomain.trycloudflare.com",
+            gradio_share_url="https://test-share.gradio.live"
+        )
+        # 2. Test safe_print handles unicode safely
+        tunnel.safe_print("Test Unicode: \U0001f310 \U0001f680 \u2705")
+
+        # 3. Test setup_colab_access doesn't crash in non-colab environments
+        tunnel.setup_colab_access(7860)
+
 if __name__ == "__main__":
     unittest.main()
