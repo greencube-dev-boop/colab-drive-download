@@ -727,11 +727,16 @@ def render_cluster_html() -> str:
                 badge_color = "#f9e2af"
                 badge_text = "⚡ Encoding"
                 border_color = "rgba(249, 226, 175, 0.4)"
-            elif st == "offline" or ago > 45:
+            elif st == "offline" or ago > 30:
                 badge_bg = "rgba(243, 139, 168, 0.15)"
                 badge_color = "#f38ba8"
                 badge_text = "🔴 Offline"
                 border_color = "#313244"
+            elif st == "waiting_for_master":
+                badge_bg = "rgba(249, 226, 175, 0.15)"
+                badge_color = "#f9e2af"
+                badge_text = "⏳ Connecting"
+                border_color = "rgba(249, 226, 175, 0.3)"
             else:
                 badge_bg = "rgba(166, 227, 161, 0.15)"
                 badge_color = "#a6e3a1"
@@ -1185,7 +1190,7 @@ def create_ui():
         btn_refresh_catalog.click(fn=render_catalog_html, outputs=[catalog_html_component])
         btn_refresh_cluster.click(fn=render_cluster_html, outputs=[cluster_html_component])
         btn_cleanup_offline.click(
-            fn=lambda: (database.cleanup_stale_cluster_workers(timeout_sec=0.0), render_cluster_html())[1],
+            fn=lambda: (cluster_manager.clean_inactive_workers(force_all_offline=True), render_cluster_html())[1],
             outputs=[cluster_html_component]
         )
 

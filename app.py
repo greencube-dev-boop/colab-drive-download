@@ -69,6 +69,7 @@ def main(enable_debug_logs: bool = True):
     from fastapi import Request
     from fastapi.responses import JSONResponse
 
+    cluster_manager.reset_cluster_on_startup()
     cluster_manager.start_cluster_daemon()
 
     def mount_cluster_api(fastapi_app):

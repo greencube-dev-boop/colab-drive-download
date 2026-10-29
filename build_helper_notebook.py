@@ -116,6 +116,8 @@ print("🎉 Setup complete! Helper workspace ready.")
     # Cell 2: Launch Helper Worker
     add_code("""#@title 🚀 Step 2: Start Autonomous GPU Worker Loop
 #@markdown Launches the helper node. It auto-discovers the Main coordinator and begins encoding video chunks.
+coordinator_url = "" #@param {type:"string"}
+#@markdown *Optional*: If Google Drive auto-discovery takes time, paste the Cloudflare or Gradio link from the Main coordinator here (e.g. `https://xyz.trycloudflare.com`). Leave blank for auto-discovery.
 enable_debug_logs = True #@param {type:"boolean"}
 
 import time
@@ -125,12 +127,13 @@ import helper_worker
 
 print("=" * 72)
 print("🟢 Launching Autonomous GPU Worker Node...")
+print(f"   Coordinator URL: {coordinator_url if coordinator_url else 'Auto-Discover (via Google Drive master.json)'}")
 print(f"   Debug Log Notifications: {'ENABLED (Verbose)' if enable_debug_logs else 'DISABLED (Quiet)'}")
 print("   Keep this cell running to provide GPU compute.")
 print("=" * 72 + "\\n")
 
 try:
-    helper_worker.run_helper_main(enable_debug_logs=enable_debug_logs)
+    helper_worker.run_helper_main(coordinator_url=coordinator_url, enable_debug_logs=enable_debug_logs)
 except KeyboardInterrupt:
     print("\\n🛑 Worker stopped by user.")
 """)

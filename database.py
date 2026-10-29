@@ -687,9 +687,17 @@ def upsert_cluster_worker(worker: Dict[str, Any]) -> bool:
             vram_mb = int(worker.get("vram_mb", 0))
             tunnel_url = worker.get("tunnel_url", "")
             now = time.time()
-            file_hb = float(worker.get("last_heartbeat") or now)
+            file_hb = float(worker.get("last_heartbeat") or 0.0)
+            if file_hb <= 0:
+                file_hb = now
             reg_time = float(worker.get("registered_at") or now)
-            init_status = "offline" if (now - file_hb) > 45.0 else worker.get("status", "idle")
+            w_status = worker.get("status", "idle")
+            if (now - file_hb) > 30.0:
+                init_status = "offline"
+            elif w_status == "waiting_for_master":
+                init_status = "waiting_for_master"
+            else:
+                init_status = w_status
 
             cur.execute("""
                 INSERT INTO cluster_workers 
@@ -702,8 +710,9 @@ def upsert_cluster_worker(worker: Dict[str, Any]) -> bool:
                     tunnel_url = CASE WHEN excluded.tunnel_url != '' THEN excluded.tunnel_url ELSE cluster_workers.tunnel_url END,
                     last_heartbeat = MAX(cluster_workers.last_heartbeat, excluded.last_heartbeat),
                     status = CASE 
-                        WHEN (? - excluded.last_heartbeat) > 45.0 THEN 'offline'
-                        WHEN cluster_workers.status = 'offline' AND (? - excluded.last_heartbeat) <= 45.0 THEN 'idle' 
+                        WHEN (? - excluded.last_heartbeat) > 30.0 THEN 'offline'
+                        WHEN excluded.status = 'waiting_for_master' THEN 'waiting_for_master'
+                        WHEN cluster_workers.status = 'offline' AND (? - excluded.last_heartbeat) <= 30.0 THEN 'idle' 
                         ELSE cluster_workers.status 
                     END
             """, (w_id, node_name, gpu_name, vram_mb, tunnel_url, file_hb, init_status, reg_time, now, now))
@@ -743,7 +752,7 @@ def heartbeat_cluster_worker(worker_id: str, progress_data: Optional[Dict[str, A
         finally:
             conn.close()
 
-def get_cluster_workers(active_only: bool = False, timeout_sec: float = 45.0) -> List[Dict[str, Any]]:
+def get_cluster_workers(active_only: bool = False, timeout_sec: float = 30.0) -> List[Dict[str, Any]]:
     """Retrieves all registered cluster GPU workers, dynamically marking stale nodes as offline."""
     with _db_lock:
         conn = _get_connection()
@@ -764,7 +773,7 @@ def get_cluster_workers(active_only: bool = False, timeout_sec: float = 45.0) ->
                         logger.warn("CLUSTER", f"🔴 Helper went offline: '{d.get('node_name', d['worker_id'])}' [{d['worker_id']}] (No heartbeat for >{int(timeout_sec)}s)")
                     except Exception:
                         pass
-                if active_only and d["status"] == "offline":
+                if active_only and d["status"] in ["offline", "waiting_for_master"]:
                     continue
                 results.append(d)
             _commit_and_sync(conn, force=False)
@@ -784,14 +793,35 @@ def remove_cluster_worker(worker_id: str) -> bool:
         finally:
             conn.close()
 
-def cleanup_stale_cluster_workers(timeout_sec: float = 60.0) -> int:
-    """Removes offline worker nodes that haven't sent a heartbeat for longer than timeout_sec."""
+def purge_all_remote_workers() -> int:
+    """Removes ALL remote cluster workers from the database (called on coordinator startup or manual wipe)."""
+    with _db_lock:
+        conn = _get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM cluster_workers WHERE worker_id != 'main_coordinator'")
+            count = cur.rowcount
+            _commit_and_sync(conn, force=True)
+            return count
+        finally:
+            conn.close()
+
+def cleanup_stale_cluster_workers(timeout_sec: float = 30.0) -> int:
+    """Removes offline or stale worker nodes that haven't sent a heartbeat for longer than timeout_sec."""
     with _db_lock:
         conn = _get_connection()
         try:
             cur = conn.cursor()
             cutoff = time.time() - timeout_sec
-            cur.execute("DELETE FROM cluster_workers WHERE (last_heartbeat < ? AND status = 'offline') OR (last_heartbeat < ?)", (cutoff, time.time() - 90.0))
+            cur.execute("""
+                DELETE FROM cluster_workers 
+                WHERE worker_id != 'main_coordinator' 
+                AND (
+                    last_heartbeat < ? 
+                    OR status = 'offline' 
+                    OR status = 'waiting_for_master'
+                )
+            """, (cutoff,))
             count = cur.rowcount
             _commit_and_sync(conn, force=True)
             return count

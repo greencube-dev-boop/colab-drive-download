@@ -20,7 +20,19 @@ def resolve_downloader_dir() -> str:
         base_dir = os.path.abspath(os.path.dirname(__file__))
         return os.path.join(base_dir, "downloader_staging")
 
-    # 1. Primary check: .shortcut-targets-by-id (Google Drive shortcut targets on Colab)
+    # 1. Primary check: Current working directory (if mounted under Google Drive)
+    cwd = os.path.abspath(os.getcwd())
+    if cwd.startswith("/content/drive/") and cwd not in [os.path.abspath("/content/drive"), os.path.abspath("/content/drive/MyDrive"), os.path.abspath("/content/drive/Shareddrives")]:
+        try:
+            entries = [e.lower() for e in os.listdir(cwd)]
+            if any(k in entries for k in ["data", "raw", "refined"]) or any(e.endswith(".ipynb") for e in entries):
+                return cwd
+            if os.path.exists(os.path.join(cwd, "data", "cluster", "master.json")):
+                return cwd
+        except Exception:
+            pass
+
+    # 2. Check .shortcut-targets-by-id (Google Drive shortcut targets on Colab)
     targets_root = "/content/drive/.shortcut-targets-by-id"
     if os.path.exists(targets_root):
         try:
@@ -30,6 +42,8 @@ def resolve_downloader_dir() -> str:
                     continue
                 try:
                     entries = [e.lower() for e in os.listdir(t_path)]
+                    if os.path.exists(os.path.join(t_path, "data", "cluster", "master.json")):
+                        return t_path
                     if any(k in entries for k in ["data", "raw", "refined"]) or any(e.endswith(".ipynb") for e in entries):
                         return t_path
                     sub = os.path.join(t_path, "downloader")
@@ -40,10 +54,15 @@ def resolve_downloader_dir() -> str:
         except Exception:
             pass
 
-    # 2. Check canonical candidate directories
+    # 3. Check canonical candidate directories
     candidates = [
+        "/content/drive/MyDrive/colab drive download",
+        "/content/drive/MyDrive/colab-drive-download",
+        "/content/drive/MyDrive/colab_drive_download",
         "/content/drive/MyDrive/downloader",
         "/content/drive/MyDrive/downloader - Shortcut",
+        "/content/drive/Shareddrives/colab drive download",
+        "/content/drive/Shareddrives/colab-drive-download",
         "/content/drive/Shareddrives/downloader"
     ]
     for c in candidates:
@@ -58,13 +77,22 @@ def resolve_downloader_dir() -> str:
             if os.path.isdir(c):
                 return c
 
-    # 3. Search /content/drive/MyDrive for any folder starting with 'downloader'
+    # 4. Search /content/drive/MyDrive for any folder containing data/cluster or matching name
     mydrive = "/content/drive/MyDrive"
     if os.path.exists(mydrive):
         try:
-            for entry in os.listdir(mydrive):
+            entries = os.listdir(mydrive) # Busts FUSE directory cache
+            for entry in entries:
                 full_p = os.path.join(mydrive, entry)
-                if entry.lower().startswith("downloader"):
+                if not os.path.isdir(full_p):
+                    continue
+                try:
+                    if os.path.exists(os.path.join(full_p, "data", "cluster", "master.json")) or os.path.exists(os.path.join(full_p, "data", "queue.db")):
+                        return full_p
+                except Exception:
+                    pass
+                name_l = entry.lower()
+                if name_l.startswith("downloader") or ("colab" in name_l and "download" in name_l):
                     try:
                         real = os.path.realpath(full_p)
                         if real and os.path.exists(real) and os.path.isdir(real):
@@ -72,18 +100,26 @@ def resolve_downloader_dir() -> str:
                                 return real
                     except Exception:
                         pass
-                    if os.path.isdir(full_p):
-                        return full_p
+                    return full_p
         except Exception:
             pass
 
-    # 4. Search Shared Drives
+    # 5. Search Shared Drives
     shareddrives = "/content/drive/Shareddrives"
     if os.path.exists(shareddrives):
         try:
-            for entry in os.listdir(shareddrives):
+            entries = os.listdir(shareddrives)
+            for entry in entries:
                 full_p = os.path.join(shareddrives, entry)
-                if entry.lower().startswith("downloader") and os.path.isdir(full_p):
+                if not os.path.isdir(full_p):
+                    continue
+                try:
+                    if os.path.exists(os.path.join(full_p, "data", "cluster", "master.json")):
+                        return full_p
+                except Exception:
+                    pass
+                name_l = entry.lower()
+                if name_l.startswith("downloader") or ("colab" in name_l and "download" in name_l):
                     return full_p
                 sub_p = os.path.join(full_p, "downloader")
                 if os.path.exists(sub_p) and os.path.isdir(sub_p):
@@ -92,7 +128,9 @@ def resolve_downloader_dir() -> str:
             pass
 
     # Default fallback canonical path
-    resolved = "/content/drive/MyDrive/downloader"
+    resolved = "/content/drive/MyDrive/colab drive download"
+    if not os.path.exists(resolved):
+        resolved = "/content/drive/MyDrive/downloader"
     resolved = os.path.abspath(resolved)
     if resolved in [os.path.abspath("/content/drive/MyDrive"), os.path.abspath("/content/drive"), os.path.abspath("/")]:
         resolved = "/content/drive/MyDrive/downloader"
@@ -154,6 +192,43 @@ if IS_COLAB:
     QUEUE_DB = LOCAL_QUEUE_DB
 else:
     QUEUE_DB = DRIVE_QUEUE_DB
+
+def update_downloader_dir(new_dir: str) -> None:
+    """Dynamically points all Drive storage paths to a newly discovered downloader directory."""
+    global DOWNLOADER_DIR, RAW_DIR, REFINED_DIR, REFINED_MOVIES_DIR, REFINED_TV_DIR, REFINED_OTHER_DIR
+    global DATA_DIR, METADATA_JSON, DRIVE_DIR, STAGING_DIR, CHUNKS_STAGING_DIR, CLUSTER_DIR
+    global CLUSTER_WORKERS_DIR, CLUSTER_MASTER_FILE, SYSTEM_LOG_FILE, DRIVE_QUEUE_DB, QUEUE_DB
+
+    if not new_dir or not os.path.isdir(new_dir):
+        return
+
+    DOWNLOADER_DIR = os.path.abspath(new_dir)
+    RAW_DIR = os.path.join(DOWNLOADER_DIR, "raw")
+    REFINED_DIR = os.path.join(DOWNLOADER_DIR, "refined")
+    REFINED_MOVIES_DIR = os.path.join(REFINED_DIR, "movies")
+    REFINED_TV_DIR = os.path.join(REFINED_DIR, "tv_series")
+    REFINED_OTHER_DIR = os.path.join(REFINED_DIR, "other")
+    DATA_DIR = os.path.join(DOWNLOADER_DIR, "data")
+    METADATA_JSON = os.path.join(DATA_DIR, "metadata.json")
+    DRIVE_DIR = DOWNLOADER_DIR
+    STAGING_DIR = os.path.join(DOWNLOADER_DIR, "staging")
+    CHUNKS_STAGING_DIR = os.path.join(STAGING_DIR, "chunks")
+    CLUSTER_DIR = os.path.join(DATA_DIR, "cluster")
+    CLUSTER_WORKERS_DIR = os.path.join(CLUSTER_DIR, "workers")
+    CLUSTER_MASTER_FILE = os.path.join(CLUSTER_DIR, "master.json")
+    SYSTEM_LOG_FILE = os.path.join(DATA_DIR, "system.log")
+    DRIVE_QUEUE_DB = os.path.join(DATA_DIR, "queue.db")
+    if not IS_COLAB:
+        QUEUE_DB = DRIVE_QUEUE_DB
+
+    for d in [
+        DOWNLOADER_DIR, RAW_DIR, REFINED_DIR, REFINED_MOVIES_DIR,
+        REFINED_TV_DIR, REFINED_OTHER_DIR, DATA_DIR, STAGING_DIR, CHUNKS_STAGING_DIR, CLUSTER_DIR, CLUSTER_WORKERS_DIR
+    ]:
+        try:
+            os.makedirs(d, exist_ok=True)
+        except Exception:
+            pass
 
 # Ensure necessary directories exist
 for d in [

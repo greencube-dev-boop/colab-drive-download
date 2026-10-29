@@ -51,12 +51,12 @@ class HelperWorker:
     """
     MAX_CONCURRENT_CHUNKS = 2
 
-    def __init__(self, worker_id: Optional[str] = None):
+    def __init__(self, worker_id: Optional[str] = None, coordinator_url: Optional[str] = None):
         self.gpu_info = get_gpu_info()
         short_gpu = self.gpu_info["gpu_name"].replace("NVIDIA", "").replace("Tesla", "").strip() or "Node"
         self.worker_id = worker_id or f"worker_{short_gpu.lower()}_{uuid.uuid4().hex[:8]}"
         self.node_name = f"Helper ({self.gpu_info['gpu_name']})"
-        self.master_url: Optional[str] = None
+        self.master_url: Optional[str] = coordinator_url.strip().rstrip("/") if coordinator_url and coordinator_url.strip() else None
         self.running: bool = True
         self.active_slots: Dict[int, Optional[Dict[str, Any]]] = {0: None, 1: None}
         self.active_slots_lock = threading.Lock()
@@ -65,19 +65,80 @@ class HelperWorker:
         os.makedirs(self.local_temp_dir, exist_ok=True)
 
     def discover_master_url(self) -> Optional[str]:
-        """Reads master beacon file from shared Google Drive."""
-        targets = [
-            getattr(config, "CLUSTER_MASTER_FILE", os.path.join(config.DATA_DIR, "cluster", "master.json")),
-            getattr(config, "LOCAL_CLUSTER_MASTER_FILE", os.path.join(config.LOCAL_DATA_DIR, "cluster", "master.json"))
-        ]
-        for t in targets:
-            if os.path.exists(t):
+        """
+        Exhaustively searches for Main coordinator's master.json beacon across:
+        1. config.CLUSTER_MASTER_FILE and config.LOCAL_CLUSTER_MASTER_FILE
+        2. Current working directory (./data/cluster/master.json) and parent (../data/cluster/master.json)
+        3. Colab Google Drive subfolders (/content/drive/MyDrive/*/data/cluster/master.json)
+        4. Shortcuts (/content/drive/.shortcut-targets-by-id/*/data/cluster/master.json)
+        5. Shared drives (/content/drive/Shareddrives/*/data/cluster/master.json)
+        Forces Drive FUSE directory listing invalidation to prevent cached/missed files on Colab.
+        """
+        candidate_paths: List[str] = []
+
+        # 1. Config target paths
+        for attr in ["CLUSTER_MASTER_FILE", "LOCAL_CLUSTER_MASTER_FILE"]:
+            p = getattr(config, attr, None)
+            if p:
+                candidate_paths.append(p)
+
+        # 2. Local relative paths
+        candidate_paths.append(os.path.abspath(os.path.join("data", "cluster", "master.json")))
+        candidate_paths.append(os.path.abspath(os.path.join("..", "data", "cluster", "master.json")))
+
+        # 3. Known /content/drive locations in Google Colab
+        if getattr(config, "IS_COLAB", False):
+            drive_roots = [
+                "/content/drive/MyDrive",
+                "/content/drive/Shareddrives",
+                "/content/drive/.shortcut-targets-by-id"
+            ]
+            for droot in drive_roots:
+                if not os.path.exists(droot):
+                    continue
                 try:
-                    with open(t, "r", encoding="utf-8") as f:
+                    entries = os.listdir(droot) # Busts FUSE cache
+                    for entry in entries:
+                        sub_p = os.path.join(droot, entry)
+                        if os.path.isdir(sub_p):
+                            candidate_paths.append(os.path.join(sub_p, "data", "cluster", "master.json"))
+                except Exception:
+                    pass
+
+        # De-duplicate preserving order
+        seen = set()
+        unique_candidates = []
+        for cp in candidate_paths:
+            norm = os.path.abspath(cp)
+            if norm not in seen:
+                seen.add(norm)
+                unique_candidates.append(norm)
+
+        for target in unique_candidates:
+            parent_dir = os.path.dirname(target)
+            if os.path.exists(parent_dir):
+                try:
+                    os.listdir(parent_dir)  # Invalidate Drive FUSE cache
+                except Exception:
+                    pass
+            if os.path.exists(target):
+                try:
+                    with open(target, "r", encoding="utf-8") as f:
                         data = json.load(f)
                     url = data.get("master_url")
                     if url and str(url).startswith("http"):
-                        return url.rstrip("/")
+                        clean_url = str(url).rstrip("/")
+                        # On Colab, ignore 127.0.0.1 / localhost as remote workers cannot reach coordinator locally
+                        if getattr(config, "IS_COLAB", False) and ("127.0.0.1" in clean_url or "localhost" in clean_url):
+                            continue
+                        # Successfully discovered master beacon! Synchronize config.DOWNLOADER_DIR
+                        root_dir = os.path.dirname(os.path.dirname(os.path.dirname(target)))
+                        if root_dir and os.path.exists(root_dir):
+                            try:
+                                config.update_downloader_dir(root_dir)
+                            except Exception:
+                                pass
+                        return clean_url
                 except Exception:
                     pass
         return None
@@ -103,6 +164,20 @@ class HelperWorker:
                 w_file = os.path.join(tdir, f"worker_{self.worker_id}.json")
                 with open(w_file, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2)
+            except Exception:
+                pass
+
+    def cleanup_drive_beacon(self):
+        """Removes this worker's beacon file from Google Drive on shutdown."""
+        targets = [
+            getattr(config, "CLUSTER_WORKERS_DIR", os.path.join(config.DATA_DIR, "cluster", "workers")),
+            getattr(config, "LOCAL_CLUSTER_WORKERS_DIR", os.path.join(config.LOCAL_DATA_DIR, "cluster", "workers"))
+        ]
+        for tdir in targets:
+            try:
+                w_file = os.path.join(tdir, f"worker_{self.worker_id}.json")
+                if os.path.exists(w_file):
+                    os.remove(w_file)
             except Exception:
                 pass
 
@@ -446,8 +521,6 @@ class HelperWorker:
         logger.notify("HELPER", f"   Debug Log Notifications: {'ENABLED (Verbose)' if logger.is_debug() else 'DISABLED (Milestones only)'}")
         logger.notify("HELPER", "=" * 68)
 
-        self.announce_to_drive(status="idle")
-
         # Start 2 concurrent worker slots per GPU
         threads = []
         for slot in range(self.MAX_CONCURRENT_CHUNKS):
@@ -455,6 +528,11 @@ class HelperWorker:
             t.start()
             threads.append(t)
 
+        if self.master_url:
+            logger.notify("HELPER", f"🌐 Coordinator Endpoint Configured: {self.master_url}")
+            self.register_with_master()
+
+        wait_ticks = 0
         while self.running:
             # 1. Discover or refresh Main coordinator URL
             if not self.master_url:
@@ -463,8 +541,10 @@ class HelperWorker:
                     logger.notify("HELPER", f"🌐 Discovered Main Coordinator: {self.master_url}")
                     self.register_with_master()
                 else:
-                    logger.warn("HELPER", "⏳ Waiting for Main coordinator beacon on shared Google Drive (master.json)...")
-                    self.announce_to_drive(status="waiting_for_master")
+                    wait_ticks += 1
+                    if wait_ticks == 1 or wait_ticks % 6 == 0:
+                        logger.warn("HELPER", "⏳ Waiting for Main coordinator beacon on shared Google Drive (master.json)...")
+                        logger.notify("HELPER", "👉 Tip: If auto-discovery takes time, paste the Main coordinator URL into the 'coordinator_url' parameter in Step 2.")
                     time.sleep(5)
                     continue
 
@@ -485,15 +565,19 @@ class HelperWorker:
                 self.send_heartbeat({"status": "idle"})
             time.sleep(10)
 
-def run_helper_main(enable_debug_logs: bool = True):
+def run_helper_main(coordinator_url: str = "", enable_debug_logs: bool = True):
     """Entry point for Helper Colab notebook."""
     logger.set_debug(enable_debug_logs)
-    worker = HelperWorker()
+    worker = HelperWorker(coordinator_url=coordinator_url)
     try:
         worker.run()
     except KeyboardInterrupt:
         logger.notify("HELPER", "🛑 Helper Worker interrupted by user. Shutting down...")
-        worker.announce_to_drive(status="offline")
+        try:
+            worker.announce_to_drive(status="offline")
+            worker.cleanup_drive_beacon()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     run_helper_main()

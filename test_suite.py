@@ -1482,5 +1482,77 @@ class TestTwoStagePipeline(unittest.TestCase):
         pct = 100.0 if d_c == len(chunks) and len(chunks) > 0 else 50.0
         self.assertEqual(pct, 100.0)
 
+    def test_reset_cluster_on_startup_purges_stale_workers(self):
+        import cluster_manager
+        # Setup stale worker in DB
+        database.upsert_cluster_worker({
+            "worker_id": "worker_stale_test_123",
+            "node_name": "Old Stale Worker",
+            "gpu_name": "Tesla T4",
+            "vram_mb": 15360,
+            "status": "idle",
+            "last_heartbeat": time.time() - 3600.0
+        })
+        # Create stale worker file
+        w_dir = config.CLUSTER_WORKERS_DIR
+        os.makedirs(w_dir, exist_ok=True)
+        w_file = os.path.join(w_dir, "worker_worker_stale_test_123.json")
+        with open(w_file, "w") as f:
+            json.dump({"worker_id": "worker_stale_test_123", "status": "idle"}, f)
+
+        self.assertTrue(os.path.exists(w_file))
+        cluster_manager.reset_cluster_on_startup()
+
+        # Verify DB is purged of remote workers
+        workers = database.get_cluster_workers()
+        remote = [w for w in workers if w.get("worker_id") == "worker_stale_test_123"]
+        self.assertEqual(len(remote), 0)
+        # Verify file is deleted
+        self.assertFalse(os.path.exists(w_file))
+
+    def test_clean_inactive_workers_removes_dead_nodes(self):
+        import cluster_manager
+        now = time.time()
+        # Active worker
+        database.upsert_cluster_worker({
+            "worker_id": "worker_active_now",
+            "node_name": "Active Node",
+            "gpu_name": "Tesla T4",
+            "vram_mb": 15360,
+            "status": "idle",
+            "last_heartbeat": now
+        })
+        # Stale worker
+        database.upsert_cluster_worker({
+            "worker_id": "worker_dead_now",
+            "node_name": "Dead Node",
+            "gpu_name": "Tesla T4",
+            "vram_mb": 15360,
+            "status": "offline",
+            "last_heartbeat": now - 60.0
+        })
+
+        cluster_manager.clean_inactive_workers(force_all_offline=False)
+        workers = database.get_cluster_workers()
+        ids = [w["worker_id"] for w in workers]
+        self.assertIn("worker_active_now", ids)
+        self.assertNotIn("worker_dead_now", ids)
+
+    def test_helper_worker_coordinator_param_and_discovery(self):
+        from helper_worker import HelperWorker
+        # 1. Manual coordinator param
+        worker_manual = HelperWorker(worker_id="test_man", coordinator_url="https://manual-cf.trycloudflare.com")
+        self.assertEqual(worker_manual.master_url, "https://manual-cf.trycloudflare.com")
+
+        # 2. Beacon file discovery
+        master_file = config.CLUSTER_MASTER_FILE
+        os.makedirs(os.path.dirname(master_file), exist_ok=True)
+        with open(master_file, "w") as f:
+            json.dump({"master_url": "https://discovered-cf.trycloudflare.com"}, f)
+
+        worker_auto = HelperWorker(worker_id="test_auto")
+        discovered = worker_auto.discover_master_url()
+        self.assertEqual(discovered, "https://discovered-cf.trycloudflare.com")
+
 if __name__ == "__main__":
     unittest.main()
