@@ -120,7 +120,7 @@ class HelperWorker:
                 req_data = json.dumps(data).encode("utf-8")
                 headers["Content-Type"] = "application/json"
             req = urllib.request.Request(url, data=req_data, headers=headers)
-            with urllib.request.urlopen(req, timeout=15) as resp:
+            with urllib.request.urlopen(req, timeout=30) as resp:
                 if resp.status == 200:
                     body = resp.read().decode("utf-8")
                     return json.loads(body)
@@ -129,11 +129,14 @@ class HelperWorker:
                 logger.warn("HELPER", f"HTTP {e.code} on {endpoint}: {e.reason}")
             return None
         except urllib.error.URLError as e:
-            if "claim_task" not in endpoint:
+            if "claim_task" not in endpoint and "timed out" not in str(e).lower():
                 logger.warn("HELPER", f"Connection issue on {endpoint}: {e.reason}")
             return None
+        except TimeoutError:
+            return None
         except Exception as e:
-            logger.debug("HELPER", f"Exception on {endpoint}: {e}")
+            if "timed out" not in str(e).lower():
+                logger.debug("HELPER", f"Exception on {endpoint}: {e}")
             return None
         return None
 

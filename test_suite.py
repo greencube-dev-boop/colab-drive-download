@@ -1243,8 +1243,10 @@ class TestTwoStagePipeline(unittest.TestCase):
 
     def test_encoder_module_has_config_defined(self):
         import encoder
-        # Verify encoder has config imported and does not crash with NameError
+        # Verify encoder has config, threading, and time imported and does not crash with NameError
         self.assertTrue(hasattr(encoder, "config"), "encoder module missing config import")
+        self.assertTrue(hasattr(encoder, "threading"), "encoder module missing threading import")
+        self.assertTrue(hasattr(encoder, "time"), "encoder module missing time import")
         self.assertTrue(hasattr(encoder.config, "CHUNKS_STAGING_DIR"))
 
     def test_cleanup_task_files_protects_drive_raw_files(self):
