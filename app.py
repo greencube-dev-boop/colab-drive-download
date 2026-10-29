@@ -117,6 +117,27 @@ def main(enable_debug_logs: bool = True):
             res = cluster_manager.complete_task(wid, job_id, chunk_idx, out_chunk_path, fsize)
             return JSONResponse(content=res)
 
+        @fastapi_app.post("/api/cluster/release_task")
+        @fastapi_app.post("/api/cluster/release_task/")
+        async def api_release_task(request: Request):
+            try:
+                data = await request.json()
+            except Exception:
+                data = {}
+            wid = data.get("worker_id", "")
+            job_id = int(data.get("job_id", 0))
+            chunk_idx = int(data.get("chunk_idx", -1))
+            res = cluster_manager.release_task(wid, job_id, chunk_idx)
+            return JSONResponse(content=res)
+
+        @fastapi_app.get("/api/cluster/chunk/{job_id}/{chunk_idx}")
+        async def api_get_chunk(job_id: int, chunk_idx: int):
+            chunk_path = cluster_manager.get_chunk_raw_path(job_id, chunk_idx)
+            if chunk_path and os.path.exists(chunk_path) and os.path.getsize(chunk_path) > 0:
+                from fastapi.responses import FileResponse
+                return FileResponse(chunk_path, media_type="video/x-matroska", filename=os.path.basename(chunk_path))
+            return JSONResponse(status_code=404, content={"error": f"Chunk #{chunk_idx} of Job #{job_id} not found"})
+
         @fastapi_app.get("/api/cluster/status")
         @fastapi_app.get("/api/cluster/status/")
         async def api_cluster_status():

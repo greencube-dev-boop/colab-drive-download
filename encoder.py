@@ -255,6 +255,12 @@ def convert_worker(task: Dict[str, Any]):
         finally:
             unregister_proc(task, s_proc)
 
+        try:
+            if hasattr(os, "sync"):
+                os.sync()
+        except Exception:
+            pass
+
         if not task.get("cancelled"):
             raw_chunks = sorted(glob.glob(os.path.join(task_chunks_dir, "seg_*.mkv")))
 

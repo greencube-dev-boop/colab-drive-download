@@ -245,6 +245,36 @@ def complete_task(worker_id: str, job_id: int, chunk_idx: int, out_chunk_path: s
             "all_chunks_done": all_done
         }
 
+def release_task(worker_id: str, job_id: int, chunk_idx: int) -> Dict[str, Any]:
+    """Releases a claimed/leased chunk back to pending status so another worker or retry can process it."""
+    with _cluster_lock:
+        if job_id not in _active_cluster_jobs:
+            return {"status": "error", "message": f"Job #{job_id} not active"}
+        job = _active_cluster_jobs[job_id]
+        chunks = job.get("chunks", {})
+        if chunk_idx not in chunks:
+            return {"status": "error", "message": f"Chunk #{chunk_idx} not found in job #{job_id}"}
+        chunk = chunks[chunk_idx]
+        if chunk.get("status") == "leased" and (chunk.get("worker_id") == worker_id or not worker_id):
+            chunk["status"] = "pending"
+            chunk["worker_id"] = None
+            chunk["leased_until"] = 0.0
+            chunk["pct"] = 0.0
+            logger.warn("REFINER", f"↩️ Chunk #{chunk_idx + 1} of Job #{job_id} released back to pending by '{worker_id}'.")
+            return {"status": "released", "job_id": job_id, "chunk_idx": chunk_idx}
+        return {"status": "ignored", "current_status": chunk.get("status")}
+
+def get_chunk_raw_path(job_id: int, chunk_idx: int) -> Optional[str]:
+    """Returns the local/drive raw chunk path on the coordinator for direct HTTP streaming."""
+    with _cluster_lock:
+        job = _active_cluster_jobs.get(job_id)
+        if not job:
+            return None
+        chunk = job.get("chunks", {}).get(chunk_idx)
+        if not chunk:
+            return None
+        return chunk.get("raw_path")
+
 def reclaim_stale_chunks():
     """Scans all active cluster jobs and automatically returns abandoned chunks to 'pending'."""
     with _cluster_lock:

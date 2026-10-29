@@ -1404,5 +1404,38 @@ class TestTwoStagePipeline(unittest.TestCase):
         self.assertEqual(task["chunk_status"][0]["curr_sec"], 100.0)
         self.assertEqual(task["chunk_status"][1]["curr_sec"], 100.0)
 
+    def test_release_task_and_get_chunk_raw_path(self):
+        import cluster_manager
+        job_info = {
+            "job_id": 555,
+            "title": "Release Task Movie",
+            "chunks": {
+                0: {"raw_path": "/fake/path/seg_000.mkv", "out_path": "/fake/path/enc_000.mkv", "dur_sec": 60.0, "status": "pending", "worker_id": None, "leased_until": 0.0}
+            }
+        }
+        cluster_manager.register_cluster_job(555, job_info)
+
+        # 1. Test get_chunk_raw_path
+        path = cluster_manager.get_chunk_raw_path(555, 0)
+        self.assertEqual(path, "/fake/path/seg_000.mkv")
+
+        # 2. Claim task
+        claimed = cluster_manager.claim_task("worker_rel_test", node_name="Worker Rel")
+        self.assertTrue(claimed["has_task"])
+        self.assertEqual(job_info["chunks"][0]["status"], "leased")
+
+        # 3. Release task
+        rel = cluster_manager.release_task("worker_rel_test", 555, 0)
+        self.assertEqual(rel["status"], "released")
+        self.assertEqual(job_info["chunks"][0]["status"], "pending")
+        self.assertIsNone(job_info["chunks"][0]["worker_id"])
+
+        # 4. Another worker can claim it now
+        reclaimed = cluster_manager.claim_task("worker_new", node_name="Worker New")
+        self.assertTrue(reclaimed["has_task"])
+        self.assertEqual(reclaimed["job_id"], 555)
+
+        cluster_manager.unregister_cluster_job(555)
+
 if __name__ == "__main__":
     unittest.main()

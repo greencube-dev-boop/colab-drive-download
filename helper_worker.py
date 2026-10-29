@@ -192,6 +192,34 @@ class HelperWorker:
         logger.debug("HELPER", f"📤 Notified Main coordinator of chunk #{chunk_idx} completion (Job #{job_id}).")
         return bool(res and res.get("status") == "accepted")
 
+    def release_task(self, job_id: int, chunk_idx: int) -> bool:
+        """Notifies coordinator to release a claimed chunk back to pending status for retry."""
+        payload = {
+            "worker_id": self.worker_id,
+            "job_id": job_id,
+            "chunk_idx": chunk_idx
+        }
+        res = self._http_request("/api/cluster/release_task", payload)
+        logger.debug("HELPER", f"↩️ Released Chunk #{chunk_idx + 1} of Job #{job_id} back to pending.")
+        return bool(res and res.get("status") == "released")
+
+    def download_chunk_file(self, endpoint: str, target_local_path: str) -> bool:
+        """Downloads raw chunk file directly from Main coordinator via HTTP stream if Drive sync is pending."""
+        if not self.master_url:
+            return False
+        url = f"{self.master_url.rstrip('/')}{endpoint}"
+        req = urllib.request.Request(url, headers={"User-Agent": f"ColabGPUHelper/{self.worker_id}"})
+        try:
+            with urllib.request.urlopen(req, timeout=45) as resp:
+                if resp.status != 200:
+                    return False
+                with open(target_local_path, "wb") as out_f:
+                    shutil.copyfileobj(resp, out_f)
+            return os.path.exists(target_local_path) and os.path.getsize(target_local_path) > 0
+        except Exception as e:
+            logger.debug("HELPER", f"HTTP chunk stream download error ({url}): {e}")
+            return False
+
     def encode_chunk(self, task: Dict[str, Any], slot_id: int = 0) -> bool:
         """
         Executes hardware-accelerated NVENC transcode on local SSD copy of chunk,
@@ -202,10 +230,6 @@ class HelperWorker:
         ref_cfg = task.get("refining_config", {})
         job_id = task["job_id"]
         chunk_idx = task["chunk_idx"]
-
-        if not os.path.exists(raw_drive_chunk):
-            logger.error("HELPER", f"[Slot {slot_id}] Error: Source chunk does not exist on Drive: {raw_drive_chunk}")
-            return False
 
         chunk_name = os.path.basename(raw_drive_chunk)
         local_raw = os.path.join(self.local_temp_dir, f"in_slot{slot_id}_{chunk_name}")
@@ -218,8 +242,38 @@ class HelperWorker:
                 except Exception:
                     pass
 
-        # 1. Copy raw segment from Google Drive to local fast SSD
-        shutil.copyfile(raw_drive_chunk, local_raw)
+        # 1. Fetch raw segment: Try Google Drive first (with retry/cache invalidation), fallback to direct HTTP stream
+        found_on_drive = False
+        for attempt in range(4):
+            if os.path.exists(raw_drive_chunk) and os.path.getsize(raw_drive_chunk) > 0:
+                found_on_drive = True
+                break
+            # Force Colab FUSE directory cache refresh by re-listing parent directory
+            try:
+                p_dir = os.path.dirname(raw_drive_chunk)
+                if os.path.exists(p_dir):
+                    os.listdir(p_dir)
+            except Exception:
+                pass
+            time.sleep(1.0)
+
+        if found_on_drive:
+            try:
+                shutil.copyfile(raw_drive_chunk, local_raw)
+            except Exception as e:
+                logger.warn("HELPER", f"[Slot {slot_id}] Drive copy failed ({e}); falling back to HTTP stream...")
+                found_on_drive = False
+
+        if not found_on_drive or not os.path.exists(local_raw) or os.path.getsize(local_raw) == 0:
+            logger.notify("HELPER", f"⏳ Chunk #{chunk_idx + 1} pending Drive sync. Streaming directly from Main coordinator via HTTP...")
+            chunk_ep = f"/api/cluster/chunk/{job_id}/{chunk_idx}"
+            dl_ok = self.download_chunk_file(chunk_ep, local_raw)
+            if not dl_ok:
+                logger.warn("HELPER", f"[Slot {slot_id}] ⚠️ Source chunk #{chunk_idx + 1} not yet accessible on Drive or HTTP. Releasing back to queue...")
+                self.release_task(job_id, chunk_idx)
+                return False
+            f_mb = os.path.getsize(local_raw) / (1024 * 1024)
+            logger.notify("HELPER", f"✅ Chunk #{chunk_idx + 1} ({f_mb:.1f} MB) received via direct HTTP stream from Main!")
 
         # 2. Build FFmpeg transcode command
         scale_filter = ref_cfg.get("scale_filter", "null")
@@ -346,7 +400,7 @@ class HelperWorker:
                 with self.active_slots_lock:
                     self.active_slots[slot_id] = task
                 self.announce_to_drive(status="encoding")
-                self.encode_chunk(task, slot_id=slot_id)
+                success = self.encode_chunk(task, slot_id=slot_id)
                 with self.active_slots_lock:
                     self.active_slots[slot_id] = None
 
@@ -354,7 +408,11 @@ class HelperWorker:
                     has_any_active = any(s is not None for s in self.active_slots.values())
                 if not has_any_active:
                     self.announce_to_drive(status="idle")
-                time.sleep(0.5)
+
+                if not success:
+                    time.sleep(3.0)
+                else:
+                    time.sleep(0.5)
             else:
                 idle_ticks += 1
                 if idle_ticks == 1 or idle_ticks % 20 == 0:
