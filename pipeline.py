@@ -536,7 +536,7 @@ def _refine_job_worker(job: Dict[str, Any]):
         "cancelled": False,
         "active_proc": None,
         "active_procs": [],
-        "convert_pct": 5.0,
+        "convert_pct": 0.0,
         "chunk_status": {}
     }
 
@@ -545,13 +545,13 @@ def _refine_job_worker(job: Dict[str, Any]):
 
     try:
         logger.notify("REFINER", f"🎬 Starting Job #{job_id}: '{job.get('title')}' -> Target: {cfg.get('res_preset', '480p')} {cfg.get('video_codec', 'H.265 / HEVC')}")
-        database.update_item_status("refine_queue", job_id, status="refining", convert_pct=5.0)
+        database.update_item_status("refine_queue", job_id, status="refining", convert_pct=0.0)
         shutil.copy2(raw_drive_path, local_raw_copy)
 
         if refine_task.get("cancelled"):
             return
 
-        database.update_item_status("refine_queue", job_id, status="refining", convert_pct=10.0)
+        database.update_item_status("refine_queue", job_id, status="refining", convert_pct=0.0)
         convert_worker(refine_task)
 
         if refine_task.get("cancelled"):

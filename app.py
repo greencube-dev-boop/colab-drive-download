@@ -71,53 +71,59 @@ def main(enable_debug_logs: bool = True):
 
     cluster_manager.start_cluster_daemon()
 
-    @demo.app.post("/api/cluster/register")
-    @demo.app.post("/api/cluster/register/")
-    async def api_register_worker(request: Request):
-        try:
-            data = await request.json()
-        except Exception:
-            data = {}
-        res = cluster_manager.register_worker(data)
-        return JSONResponse(content=res)
+    def mount_cluster_api(fastapi_app):
+        if fastapi_app is None:
+            return
 
-    @demo.app.post("/api/cluster/heartbeat")
-    @demo.app.post("/api/cluster/heartbeat/")
-    async def api_heartbeat_worker(request: Request):
-        try:
-            data = await request.json()
-        except Exception:
-            data = {}
-        wid = data.get("worker_id", "")
-        res = cluster_manager.heartbeat_worker(wid, data)
-        return JSONResponse(content=res)
+        @fastapi_app.post("/api/cluster/register")
+        @fastapi_app.post("/api/cluster/register/")
+        async def api_register_worker(request: Request):
+            try:
+                data = await request.json()
+            except Exception:
+                data = {}
+            res = cluster_manager.register_worker(data)
+            return JSONResponse(content=res)
 
-    @demo.app.get("/api/cluster/claim_task")
-    @demo.app.get("/api/cluster/claim_task/")
-    async def api_claim_task(worker_id: str = ""):
-        res = cluster_manager.claim_task(worker_id)
-        return JSONResponse(content=res)
+        @fastapi_app.post("/api/cluster/heartbeat")
+        @fastapi_app.post("/api/cluster/heartbeat/")
+        async def api_heartbeat_worker(request: Request):
+            try:
+                data = await request.json()
+            except Exception:
+                data = {}
+            wid = data.get("worker_id", "")
+            res = cluster_manager.heartbeat_worker(wid, data)
+            return JSONResponse(content=res)
 
-    @demo.app.post("/api/cluster/complete_task")
-    @demo.app.post("/api/cluster/complete_task/")
-    async def api_complete_task(request: Request):
-        try:
-            data = await request.json()
-        except Exception:
-            data = {}
-        wid = data.get("worker_id", "")
-        job_id = int(data.get("job_id", 0))
-        chunk_idx = int(data.get("chunk_idx", -1))
-        out_chunk_path = data.get("out_chunk_path", "")
-        fsize = float(data.get("file_size_mb", 0.0))
-        res = cluster_manager.complete_task(wid, job_id, chunk_idx, out_chunk_path, fsize)
-        return JSONResponse(content=res)
+        @fastapi_app.get("/api/cluster/claim_task")
+        @fastapi_app.get("/api/cluster/claim_task/")
+        async def api_claim_task(worker_id: str = ""):
+            res = cluster_manager.claim_task(worker_id)
+            return JSONResponse(content=res)
 
-    @demo.app.get("/api/cluster/status")
-    @demo.app.get("/api/cluster/status/")
-    async def api_cluster_status():
-        status = cluster_manager.get_cluster_status()
-        return JSONResponse(content=status)
+        @fastapi_app.post("/api/cluster/complete_task")
+        @fastapi_app.post("/api/cluster/complete_task/")
+        async def api_complete_task(request: Request):
+            try:
+                data = await request.json()
+            except Exception:
+                data = {}
+            wid = data.get("worker_id", "")
+            job_id = int(data.get("job_id", 0))
+            chunk_idx = int(data.get("chunk_idx", -1))
+            out_chunk_path = data.get("out_chunk_path", "")
+            fsize = float(data.get("file_size_mb", 0.0))
+            res = cluster_manager.complete_task(wid, job_id, chunk_idx, out_chunk_path, fsize)
+            return JSONResponse(content=res)
+
+        @fastapi_app.get("/api/cluster/status")
+        @fastapi_app.get("/api/cluster/status/")
+        async def api_cluster_status():
+            status = cluster_manager.get_cluster_status()
+            return JSONResponse(content=status)
+
+    mount_cluster_api(getattr(demo, "app", None))
 
     print(f"\n🌐 Launching Web Interface on port {args.port} (share={args.share})...")
 
@@ -147,6 +153,11 @@ def main(enable_debug_logs: bool = True):
                 inline=True,
                 prevent_thread_lock=True
             )
+
+    # Re-mount cluster REST API routes on the active server app created by demo.launch()
+    active_app = getattr(demo, "server_app", None) or getattr(demo, "app", None)
+    mount_cluster_api(active_app)
+    print("🔌 Distributed GPU Cluster REST API mounted on active web server.")
 
     # 3. Setup Colab native proxy links (if in Google Colab kernel)
     try:

@@ -1227,5 +1227,25 @@ class TestTwoStagePipeline(unittest.TestCase):
                     break
             self.assertTrue(found_param, f"Debug toggle parameter missing from {nb_name}")
 
+    def test_refiner_initial_progress_starts_at_zero(self):
+        # Verify that enqueued refine jobs start strictly at 0.0% progress
+        job_id = database.enqueue_refine({
+            "title": "Initial Zero Progress Test Movie (2026)",
+            "raw_drive_path": "/fake/raw/zero.mkv",
+            "target_refined_path": "/fake/refined/zero.mkv",
+            "raw_size_mb": 500.0,
+            "refining_config": {"res_preset": "720p"}
+        })
+        items = database.get_refine_queue()
+        task = next((it for it in items if it["id"] == job_id), None)
+        self.assertIsNotNone(task)
+        self.assertEqual(task.get("convert_pct"), 0.0)
+
+    def test_encoder_module_has_config_defined(self):
+        import encoder
+        # Verify encoder has config imported and does not crash with NameError
+        self.assertTrue(hasattr(encoder, "config"), "encoder module missing config import")
+        self.assertTrue(hasattr(encoder.config, "CHUNKS_STAGING_DIR"))
+
 if __name__ == "__main__":
     unittest.main()

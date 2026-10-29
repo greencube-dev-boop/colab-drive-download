@@ -6,6 +6,7 @@ import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, List
+import config
 from config import TEMP_DIR, DRIVE_DIR, sanitize_filename, tasks_lock
 import logger
 
@@ -317,7 +318,7 @@ def convert_worker(task: Dict[str, Any]):
             total_dur = sum(c.get("dur_sec", 1.0) for c in chunks.values())
             if total_dur > 0:
                 ratio = total_curr / total_dur
-                task["convert_pct"] = min(99.0, max(5.0, 5.0 + (ratio * 94.0)))
+                task["convert_pct"] = min(99.0, max(0.0, ratio * 99.0))
 
             now = time.time()
             if force_sync or (now - _last_db_progress_sync[0]) >= 2.0:
@@ -327,7 +328,7 @@ def convert_worker(task: Dict[str, Any]):
                     database.update_item_status(
                         "refine_queue",
                         task["id"],
-                        convert_pct=task.get("convert_pct", 5.0),
+                        convert_pct=task.get("convert_pct", 0.0),
                         chunk_status=json.dumps(chunks)
                     )
                 except Exception:
