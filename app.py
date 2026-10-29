@@ -38,16 +38,25 @@ import config
 from config import tasks, tasks_lock
 import database
 from pipeline import ensure_daemons_running
+import logger
 
-def main():
+def main(enable_debug_logs: bool = True):
     parser = argparse.ArgumentParser(description="Two-Stage Google Drive Downloader & GPU Refiner")
     parser.add_argument("--port", type=int, default=7860, help="Port to bind the server on")
     parser.add_argument("--share", action="store_true", default=True, help="Create a public gradio.live share link")
     parser.add_argument("--no-share", dest="share", action="store_false", help="Disable public share link")
+    parser.add_argument("--debug", action="store_true", default=None, help="Enable verbose debug log notifications")
+    parser.add_argument("--no-debug", dest="debug", action="store_false", help="Disable verbose debug logs")
     args, _ = parser.parse_known_args()
+
+    if args.debug is not None:
+        enable_debug_logs = args.debug
+    logger.set_debug(enable_debug_logs)
+    logger.set_log_file(getattr(config, "SYSTEM_LOG_FILE", None))
 
     print("=" * 72)
     print("🚀 Initializing Two-Stage Google Drive Downloader & GPU Refiner Engine...")
+    print(f"📋 Debug Log Notifications: {'ENABLED (Verbose mode)' if logger.is_debug() else 'DISABLED (Quiet mode)'}")
     print("=" * 72)
 
     config.cleanup_drive_root_stray_files()

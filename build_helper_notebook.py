@@ -25,6 +25,7 @@ def generate_helper_notebook():
     # Read modular files needed by the helper
     modules = [
         "config.py",
+        "logger.py",
         "helper_worker.py"
     ]
     bundle = {}
@@ -115,17 +116,21 @@ print("🎉 Setup complete! Helper workspace ready.")
     # Cell 2: Launch Helper Worker
     add_code("""#@title 🚀 Step 2: Start Autonomous GPU Worker Loop
 #@markdown Launches the helper node. It auto-discovers the Main coordinator and begins encoding video chunks.
+enable_debug_logs = True #@param {type:"boolean"}
 
 import time
+import logger
+logger.set_debug(enable_debug_logs)
 import helper_worker
 
 print("=" * 72)
 print("🟢 Launching Autonomous GPU Worker Node...")
+print(f"   Debug Log Notifications: {'ENABLED (Verbose)' if enable_debug_logs else 'DISABLED (Quiet)'}")
 print("   Keep this cell running to provide GPU compute.")
 print("=" * 72 + "\\n")
 
 try:
-    helper_worker.run_helper_main()
+    helper_worker.run_helper_main(enable_debug_logs=enable_debug_logs)
 except KeyboardInterrupt:
     print("\\n🛑 Worker stopped by user.")
 """)

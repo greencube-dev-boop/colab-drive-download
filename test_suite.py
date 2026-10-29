@@ -1167,5 +1167,65 @@ class TestTwoStagePipeline(unittest.TestCase):
         self.assertIn("Helper (Tesla T4)", html)
         self.assertIn("Main Local GPU", html)
 
+    def test_logger_notifications_and_debug_toggle(self):
+        import logger
+        logger.clear_logs()
+
+        # 1. Test Debug Enabled (Default)
+        logger.set_debug(True)
+        self.assertTrue(logger.is_debug())
+
+        logger.notify("TEST", "High priority notification")
+        logger.debug("TEST", "Verbose debug event")
+        logger.warn("TEST", "Warning notification")
+        logger.error("TEST", "Error notification")
+        logger.success("TEST", "Success notification")
+
+        logs = logger.get_recent_logs()
+        self.assertEqual(len(logs), 5)
+        text = logger.get_recent_logs_text()
+        self.assertIn("High priority notification", text)
+        self.assertIn("Verbose debug event", text)
+
+        # 2. Test Debug Disabled (Quiet mode)
+        logger.clear_logs()
+        logger.set_debug(False)
+        self.assertFalse(logger.is_debug())
+
+        logger.debug("TEST", "This should be suppressed")
+        logger.notify("TEST", "This milestone should appear")
+
+        logs = logger.get_recent_logs()
+        self.assertEqual(len(logs), 1)
+        self.assertEqual(logs[0]["message"], "This milestone should appear")
+
+        # 3. Test File Persistence
+        test_log_file = os.path.join(self.test_dir, "test_system.log")
+        logger.set_log_file(test_log_file)
+        logger.notify("TEST", "Persisted file notification")
+        self.assertTrue(os.path.exists(test_log_file))
+        with open(test_log_file, "r", encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn("Persisted file notification", content)
+        logger.set_log_file(None)
+
+        # Restore debug enabled
+        logger.set_debug(True)
+
+    def test_notebooks_contain_debug_toggle_parameter(self):
+        # Verify both generated notebooks include the enable_debug_logs Colab form toggle
+        for nb_name in ["drive_downloader_gpu_refiner.ipynb", "drive_downloader_gpu_helper.ipynb"]:
+            nb_path = os.path.join(os.path.dirname(__file__), nb_name)
+            self.assertTrue(os.path.exists(nb_path), f"Notebook missing: {nb_name}")
+            with open(nb_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            found_param = False
+            for cell in data["cells"]:
+                source = "".join(cell.get("source", []))
+                if 'enable_debug_logs = True #@param {type:"boolean"}' in source:
+                    found_param = True
+                    break
+            self.assertTrue(found_param, f"Debug toggle parameter missing from {nb_name}")
+
 if __name__ == "__main__":
     unittest.main()

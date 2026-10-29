@@ -8,6 +8,7 @@ from typing import Dict, Any, List, Optional, Tuple
 
 import config
 import database
+import logger
 
 _cluster_lock = threading.RLock()
 _active_cluster_jobs: Dict[int, Dict[str, Any]] = {}
@@ -98,6 +99,7 @@ def register_worker(worker_data: Dict[str, Any]) -> Dict[str, Any]:
     node_name = worker_data.get("node_name", f"Worker ({gpu_name})")
     worker_data["node_name"] = node_name
     database.upsert_cluster_worker(worker_data)
+    logger.success("CLUSTER", f"🟢 Remote GPU Worker registered: {node_name} [{worker_id}] ({gpu_name}, {worker_data.get('vram_mb', 0)} MB VRAM)")
 
     # Also mirror worker file to local cluster workers directory
     try:
@@ -193,6 +195,8 @@ def claim_task(worker_id: str, node_name: Optional[str] = None) -> Dict[str, Any
                         "status": "encoding"
                     })
 
+                    logger.notify("CLUSTER", f"📤 Leased Chunk #{c_idx} of Job #{job_id} ('{job.get('title', f'Job #{job_id}')}') to {node_name or worker_id}")
+
                     return {
                         "has_task": True,
                         "job_id": job_id,
@@ -227,6 +231,8 @@ def complete_task(worker_id: str, job_id: int, chunk_idx: int, out_chunk_path: s
         database.increment_worker_chunks(worker_id)
 
         all_done = all(c.get("status") == "done" for c in chunks.values())
+        done_count = sum(1 for c in chunks.values() if c.get("status") == "done")
+        logger.success("CLUSTER", f"✅ Chunk #{chunk_idx} of Job #{job_id} finished by '{worker_id}' ({file_size_mb:.1f} MB). Progress: {done_count}/{len(chunks)} chunks done.")
         return {
             "status": "accepted",
             "chunk_idx": chunk_idx,
@@ -243,7 +249,7 @@ def reclaim_stale_chunks():
             for c_idx, c in job.get("chunks", {}).items():
                 if c.get("status") == "leased" and now > c.get("leased_until", 0.0):
                     abandoned_worker = c.get("worker_id", "unknown")
-                    print(f"[ClusterManager] Reclaiming abandoned chunk #{c_idx} of job #{job_id} from worker '{abandoned_worker}' (lease expired)")
+                    logger.warn("CLUSTER", f"⚠️ Reclaiming abandoned Chunk #{c_idx} of Job #{job_id} from worker '{abandoned_worker}' (lease expired)")
                     c["status"] = "pending"
                     c["worker_id"] = None
                     c["leased_until"] = 0.0

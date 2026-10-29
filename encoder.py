@@ -7,6 +7,7 @@ import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, List
 from config import TEMP_DIR, DRIVE_DIR, sanitize_filename, tasks_lock
+import logger
 
 # Cache NVENC detections
 _nvenc_checked = False

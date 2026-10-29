@@ -140,6 +140,10 @@ CHUNK_DURATION_SEC = 240.0         # 4 minutes per keyframe segment (optimal bal
 CHUNK_LEASE_TIMEOUT_SEC = 90.0     # 90 seconds lease duration
 WORKER_HEARTBEAT_TIMEOUT_SEC = 45.0 # Mark worker offline if no heartbeat for 45s
 
+# Verbose Logging & Debug Notifications Toggle
+DEBUG_LOGS: bool = (os.environ.get("ENABLE_DEBUG_LOGS", "1") != "0")
+SYSTEM_LOG_FILE: str = os.path.join(DATA_DIR, "system.log")
+
 # Database Paths: Google Drive vs Local working copy
 DRIVE_QUEUE_DB = os.path.join(DATA_DIR, "queue.db")
 LOCAL_QUEUE_DB = os.path.join(LOCAL_DATA_DIR, "queue.db")

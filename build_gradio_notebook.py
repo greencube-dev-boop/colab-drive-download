@@ -26,6 +26,7 @@ def generate_notebook():
     # Read all modular files to bundle as fallback
     modules = [
         "config.py",
+        "logger.py",
         "database.py",
         "metadata_manager.py",
         "classifier.py",
@@ -173,6 +174,7 @@ print(f"🎉 Setup complete! Current workspace: {os.getcwd()}")
     # Cell 2: Launch Web App & Keep-Alive Loop
     add_code("""#@title 🚀 Step 2: Launch Web Dashboard & Keep-Alive Heartbeat
 #@markdown Starts the web server with multi-path access: Cloudflare Tunnel, Google Colab native proxy, and Gradio share.
+enable_debug_logs = True #@param {type:"boolean"}
 
 import os
 import sys
@@ -183,6 +185,9 @@ if os.path.exists("/content/colab-drive-download"):
 if "." not in sys.path:
     sys.path.insert(0, ".")
 
+import logger
+logger.set_debug(enable_debug_logs)
+
 # Setup Colab native direct link window anchor
 try:
     from google.colab import output
@@ -191,7 +196,7 @@ except Exception:
     pass
 
 import app
-app.main()
+app.main(enable_debug_logs=enable_debug_logs)
 """)
 
     nb = {

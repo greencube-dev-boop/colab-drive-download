@@ -15,6 +15,7 @@ import database
 import metadata_manager
 import classifier
 from resolvers import resolve_video_source
+import logger
 from downloader import (
     download_hls_stream, download_ytdlp, download_aria2c_or_requests, download_aria2c_torrent, _kill_proc
 )
@@ -543,6 +544,7 @@ def _refine_job_worker(job: Dict[str, Any]):
         _active_refine_tasks[job_id] = refine_task
 
     try:
+        logger.notify("REFINER", f"🎬 Starting Job #{job_id}: '{job.get('title')}' -> Target: {cfg.get('res_preset', '480p')} {cfg.get('video_codec', 'H.265 / HEVC')}")
         database.update_item_status("refine_queue", job_id, status="refining", convert_pct=5.0)
         shutil.copy2(raw_drive_path, local_raw_copy)
 
@@ -581,11 +583,12 @@ def _refine_job_worker(job: Dict[str, Any]):
             year=job.get("year")
         )
         database.complete_refine_job(job_id, final_size_mb=final_size_mb)
+        logger.success("REFINER", f"🎉 Refined Job #{job_id} ('{job.get('title')}') successfully completed! Saved to Drive: {target_refined_path} ({final_size_mb:.1f} MB)")
 
     except Exception as e:
         if not refine_task.get("cancelled"):
             err_msg = str(e)
-            print(f"[RefineWorker] Error refining job #{job_id}: {err_msg}")
+            logger.error("REFINER", f"Error refining job #{job_id}: {err_msg}")
             database.update_item_status("refine_queue", job_id, status="failed", error_msg=err_msg)
     finally:
         cleanup_task_files(job_id, refine_task)

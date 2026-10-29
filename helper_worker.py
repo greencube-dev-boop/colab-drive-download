@@ -11,6 +11,7 @@ import threading
 from typing import Dict, Any, Optional, List
 
 import config
+import logger
 
 def get_gpu_info() -> Dict[str, Any]:
     """Inspects system hardware for NVIDIA GPU specs."""
@@ -125,13 +126,14 @@ class HelperWorker:
                     return json.loads(body)
         except urllib.error.HTTPError as e:
             if "claim_task" not in endpoint:
-                print(f"[HelperWorker] Notice: HTTP {e.code} on {endpoint}: {e.reason}")
+                logger.warn("HELPER", f"HTTP {e.code} on {endpoint}: {e.reason}")
             return None
         except urllib.error.URLError as e:
             if "claim_task" not in endpoint:
-                print(f"[HelperWorker] Notice: Connection issue on {endpoint}: {e.reason}")
+                logger.warn("HELPER", f"Connection issue on {endpoint}: {e.reason}")
             return None
-        except Exception:
+        except Exception as e:
+            logger.debug("HELPER", f"Exception on {endpoint}: {e}")
             return None
         return None
 
@@ -143,13 +145,13 @@ class HelperWorker:
             "gpu_name": self.gpu_info["gpu_name"],
             "vram_mb": self.gpu_info["vram_mb"]
         }
-        print(f"📡 Registering with Main coordinator ({self.master_url})...")
+        logger.notify("HELPER", f"📡 Registering with Main coordinator ({self.master_url})...")
         res = self._http_request("/api/cluster/register", reg_payload)
         if res and res.get("status") == "registered":
             assigned = res.get("assigned_name", self.node_name)
-            print(f"✅ Successfully registered with Main coordinator as '{assigned}'!")
+            logger.success("HELPER", f"Successfully registered with Main coordinator as '{assigned}'!")
         else:
-            print("📁 Using Google Drive shared beacon for auto-discovery and synchronization...")
+            logger.warn("HELPER", "Direct HTTP registration pending; synced via Google Drive shared beacon.")
 
         self.announce_to_drive(status="idle")
         return True
@@ -160,6 +162,8 @@ class HelperWorker:
         payload["worker_id"] = self.worker_id
         res = self._http_request("/api/cluster/heartbeat", payload)
         self.announce_to_drive(status=payload.get("status", "idle"))
+        if payload.get("status") == "encoding":
+            logger.debug("HELPER", f"💓 Heartbeat: Chunk #{payload.get('chunk_idx')} ({payload.get('pct', 0.0):.1f}%) @ {payload.get('fps', 0)} fps")
         return bool(res and res.get("status") == "ok")
 
     def claim_task(self) -> Optional[Dict[str, Any]]:
@@ -167,6 +171,7 @@ class HelperWorker:
         endpoint = f"/api/cluster/claim_task?worker_id={self.worker_id}"
         res = self._http_request(endpoint)
         if res and res.get("has_task"):
+            logger.notify("HELPER", f"📥 Claimed Chunk #{res.get('chunk_idx')} of '{res.get('title', 'Job')}' (Total chunks: {res.get('total_chunks')})")
             return res
         return None
 
@@ -180,6 +185,7 @@ class HelperWorker:
             "file_size_mb": file_size_mb
         }
         res = self._http_request("/api/cluster/complete_task", payload)
+        logger.debug("HELPER", f"📤 Notified Main coordinator of chunk #{chunk_idx} completion (Job #{job_id}).")
         return bool(res and res.get("status") == "accepted")
 
     def encode_chunk(self, task: Dict[str, Any], slot_id: int = 0) -> bool:
@@ -194,7 +200,7 @@ class HelperWorker:
         chunk_idx = task["chunk_idx"]
 
         if not os.path.exists(raw_drive_chunk):
-            print(f"[HelperWorker:Slot-{slot_id}] Error: Source chunk does not exist on Drive: {raw_drive_chunk}")
+            logger.error("HELPER", f"[Slot {slot_id}] Error: Source chunk does not exist on Drive: {raw_drive_chunk}")
             return False
 
         chunk_name = os.path.basename(raw_drive_chunk)
@@ -241,7 +247,7 @@ class HelperWorker:
         ])
 
         # 3. Launch FFmpeg process with live heartbeat monitor
-        print(f"[HelperWorker:Slot-{slot_id}] ⚡ Encoding Chunk #{chunk_idx} of Job #{job_id} on {self.gpu_info['gpu_name']}...")
+        logger.notify("HELPER", f"⚡ [Slot {slot_id}] Encoding Chunk #{chunk_idx} of Job #{job_id} on {self.gpu_info['gpu_name']}...")
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
 
         last_hb_time = time.time()
@@ -270,15 +276,16 @@ class HelperWorker:
                             "speed": curr_speed,
                             "status": "encoding"
                         })
+                        logger.debug("HELPER", f"⚡ [Slot {slot_id}] Chunk #{chunk_idx} progress: {curr_fps:.0f} fps | Speed: {curr_speed}")
                         last_hb_time = now
             proc.wait()
         except Exception as e:
             proc.kill()
-            print(f"[HelperWorker:Slot-{slot_id}] Exception during encoding: {e}")
+            logger.error("HELPER", f"[Slot {slot_id}] Exception during encoding: {e}")
             return False
 
         if proc.returncode != 0 or not os.path.exists(local_out) or os.path.getsize(local_out) == 0:
-            print(f"[HelperWorker:Slot-{slot_id}] FFmpeg transcode failed (exit code: {proc.returncode})")
+            logger.error("HELPER", f"[Slot {slot_id}] FFmpeg transcode failed (exit code: {proc.returncode})")
             return False
 
         # 4. Copy completed chunk directly to Google Drive
@@ -286,7 +293,7 @@ class HelperWorker:
         shutil.copyfile(local_out, out_drive_chunk)
 
         fsize_mb = os.path.getsize(out_drive_chunk) / (1024 * 1024)
-        print(f"[HelperWorker:Slot-{slot_id}] ✅ Chunk #{chunk_idx} finished ({fsize_mb:.1f} MB). Stored on Drive.")
+        logger.success("HELPER", f"[Slot {slot_id}] Chunk #{chunk_idx} finished ({fsize_mb:.1f} MB). Stored on Drive.")
 
         # 5. Notify Main coordinator
         self.complete_task(job_id, chunk_idx, out_drive_chunk, fsize_mb)
@@ -303,6 +310,7 @@ class HelperWorker:
 
     def _worker_slot_loop(self, slot_id: int):
         """Worker thread for a single GPU slot (max 2 slots per GPU)."""
+        idle_ticks = 0
         while self.running:
             if not self.master_url:
                 time.sleep(3)
@@ -310,6 +318,7 @@ class HelperWorker:
 
             task = self.claim_task()
             if task:
+                idle_ticks = 0
                 with self.active_slots_lock:
                     self.active_slots[slot_id] = task
                 self.announce_to_drive(status="encoding")
@@ -323,17 +332,21 @@ class HelperWorker:
                     self.announce_to_drive(status="idle")
                 time.sleep(0.5)
             else:
+                idle_ticks += 1
+                if idle_ticks == 1 or idle_ticks % 20 == 0:
+                    logger.debug("HELPER", f"[Slot {slot_id}] Idle: Waiting for available video chunks...")
                 time.sleep(3)
 
     def run(self):
         """Main worker execution loop launching 2 concurrent GPU worker slots."""
-        print("=" * 72)
-        print(f"🚀 Colab GPU Helper Node Started: {self.node_name}")
-        print(f"   Worker ID: {self.worker_id}")
-        print(f"   GPU Detected: {self.gpu_info['gpu_name']} ({self.gpu_info['vram_mb']} MB VRAM)")
-        print(f"   NVENC Support: {'Yes (Hardware Accelerated)' if is_nvenc_available() else 'No (CPU Fallback)'}")
-        print(f"   Concurrency: {self.MAX_CONCURRENT_CHUNKS} chunks simultaneously per GPU")
-        print("=" * 72)
+        logger.notify("HELPER", "=" * 68)
+        logger.notify("HELPER", f"🚀 Colab GPU Helper Node Started: {self.node_name}")
+        logger.notify("HELPER", f"   Worker ID: {self.worker_id}")
+        logger.notify("HELPER", f"   GPU: {self.gpu_info['gpu_name']} ({self.gpu_info['vram_mb']} MB VRAM)")
+        logger.notify("HELPER", f"   NVENC Hardware Acceleration: {'Yes' if is_nvenc_available() else 'No (CPU Fallback)'}")
+        logger.notify("HELPER", f"   Concurrency: {self.MAX_CONCURRENT_CHUNKS} chunks simultaneously per GPU")
+        logger.notify("HELPER", f"   Debug Log Notifications: {'ENABLED (Verbose)' if logger.is_debug() else 'DISABLED (Milestones only)'}")
+        logger.notify("HELPER", "=" * 68)
 
         self.announce_to_drive(status="idle")
 
@@ -349,10 +362,10 @@ class HelperWorker:
             if not self.master_url:
                 self.master_url = self.discover_master_url()
                 if self.master_url:
-                    print(f"🌐 Discovered Main Coordinator: {self.master_url}")
+                    logger.notify("HELPER", f"🌐 Discovered Main Coordinator: {self.master_url}")
                     self.register_with_master()
                 else:
-                    print("⏳ Waiting for Main coordinator beacon on shared Google Drive (master.json)...")
+                    logger.warn("HELPER", "⏳ Waiting for Main coordinator beacon on shared Google Drive (master.json)...")
                     self.announce_to_drive(status="waiting_for_master")
                     time.sleep(5)
                     continue
@@ -363,12 +376,14 @@ class HelperWorker:
             self.send_heartbeat({"status": "encoding" if is_active else "idle"})
             time.sleep(10)
 
-def run_helper_main():
+def run_helper_main(enable_debug_logs: bool = True):
+    """Entry point for Helper Colab notebook."""
+    logger.set_debug(enable_debug_logs)
     worker = HelperWorker()
     try:
         worker.run()
     except KeyboardInterrupt:
-        print("\n🛑 Helper Worker interrupted by user. Shutting down...")
+        logger.notify("HELPER", "🛑 Helper Worker interrupted by user. Shutting down...")
         worker.announce_to_drive(status="offline")
 
 if __name__ == "__main__":

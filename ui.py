@@ -32,6 +32,7 @@ from pipeline import (
     get_unqueued_raw_files, enqueue_unqueued_raw_file, delete_unqueued_raw_file
 )
 import cluster_manager
+import logger
 import threading
 
 # ---------------------------------------------------------
@@ -1090,6 +1091,24 @@ def create_ui():
 
                 cluster_html_component = gr.HTML(value=render_cluster_html)
 
+            # =================================================
+            # TAB 5: 📜 REAL-TIME SYSTEM & CLUSTER LOGS
+            # =================================================
+            with gr.Tab("📜 System Logs", id="tab_logs"):
+                with gr.Row():
+                    gr.Markdown("### 📜 Real-Time System & GPU Cluster Activity Logs")
+                    chk_debug_toggle = gr.Checkbox(label="Enable Verbose Debug Logs", value=logger.is_debug(), scale=1)
+                    btn_refresh_logs = gr.Button("🔄 Refresh Logs", scale=1)
+                    btn_clear_logs = gr.Button("🧹 Clear In-Memory Logs", scale=1)
+
+                logs_text_area = gr.TextArea(
+                    label="Event Log Notification Stream",
+                    value=logger.get_recent_logs_text,
+                    lines=18,
+                    max_lines=28,
+                    interactive=False
+                )
+
         # Periodic Refresh Timer for Live Queue Updating
         refresh_timer = gr.Timer(value=3.0)
         refresh_timer.tick(
@@ -1146,6 +1165,16 @@ def create_ui():
         btn_cleanup_offline.click(
             fn=lambda: (database.cleanup_stale_cluster_workers(timeout_sec=0.0), render_cluster_html())[1],
             outputs=[cluster_html_component]
+        )
+        chk_debug_toggle.change(
+            fn=lambda v: (logger.set_debug(v), logger.get_recent_logs_text())[1],
+            inputs=[chk_debug_toggle],
+            outputs=[logs_text_area]
+        )
+        btn_refresh_logs.click(fn=logger.get_recent_logs_text, outputs=[logs_text_area])
+        btn_clear_logs.click(
+            fn=lambda: (logger.clear_logs(), "Logs cleared.")[1],
+            outputs=[logs_text_area]
         )
 
         # Native Queue Reordering & Cancellation Handler (Dual Gradio DOM + API mechanism)
