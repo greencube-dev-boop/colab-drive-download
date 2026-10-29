@@ -195,7 +195,8 @@ def claim_task(worker_id: str, node_name: Optional[str] = None) -> Dict[str, Any
                         "status": "encoding"
                     })
 
-                    logger.notify("CLUSTER", f"📤 Leased Chunk #{c_idx} of Job #{job_id} ('{job.get('title', f'Job #{job_id}')}') to {node_name or worker_id}")
+                    worker_label = node_name or worker_id
+                    logger.notify("REFINER", f"⚡ Starting transcode of Chunk #{c_idx + 1}/{len(chunks)} for Job #{job_id} ('{job.get('title', f'Job #{job_id}')}') on '{worker_label}'")
 
                     return {
                         "has_task": True,
@@ -232,7 +233,8 @@ def complete_task(worker_id: str, job_id: int, chunk_idx: int, out_chunk_path: s
 
         all_done = all(c.get("status") == "done" for c in chunks.values())
         done_count = sum(1 for c in chunks.values() if c.get("status") == "done")
-        logger.success("CLUSTER", f"✅ Chunk #{chunk_idx} of Job #{job_id} finished by '{worker_id}' ({file_size_mb:.1f} MB). Progress: {done_count}/{len(chunks)} chunks done.")
+        pct = (done_count / len(chunks)) * 100.0 if chunks else 100.0
+        logger.success("REFINER", f"✅ Chunk #{chunk_idx + 1}/{len(chunks)} of Job #{job_id} finished by '{worker_id}' ({file_size_mb:.1f} MB). Overall progress: {done_count}/{len(chunks)} chunks done ({pct:.1f}%).")
         return {
             "status": "accepted",
             "chunk_idx": chunk_idx,
@@ -249,7 +251,7 @@ def reclaim_stale_chunks():
             for c_idx, c in job.get("chunks", {}).items():
                 if c.get("status") == "leased" and now > c.get("leased_until", 0.0):
                     abandoned_worker = c.get("worker_id", "unknown")
-                    logger.warn("CLUSTER", f"⚠️ Reclaiming abandoned Chunk #{c_idx} of Job #{job_id} from worker '{abandoned_worker}' (lease expired)")
+                    logger.warn("REFINER", f"⚠️ Chunk #{c_idx + 1} of Job #{job_id} lease expired from worker '{abandoned_worker}'! Reclaimed back to pending for retry.")
                     c["status"] = "pending"
                     c["worker_id"] = None
                     c["leased_until"] = 0.0

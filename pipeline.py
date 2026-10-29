@@ -50,13 +50,37 @@ def cleanup_task_files(task_id: int, task: Optional[Dict[str, Any]] = None):
                 pass
 
     if task:
-        for key in ["raw_path", "temp_path", "url"]:
+        for key in ["temp_path"]:
             p = task.get(key)
-            if p and os.path.exists(p) and (key != "url" or task.get("is_torrent_file")):
+            if p and os.path.exists(p):
                 try:
                     os.remove(p)
                 except Exception:
                     pass
+
+        # Safely clean up raw_path ONLY if it is a local scratch download file
+        # NEVER delete files residing in Google Drive raw or storage directories!
+        raw_p = task.get("raw_path")
+        if raw_p and os.path.exists(raw_p):
+            is_drive_file = False
+            raw_dir = getattr(config, "RAW_DIR", "")
+            drive_dir = getattr(config, "DRIVE_DIR", "")
+            if raw_dir and os.path.abspath(raw_p).startswith(os.path.abspath(raw_dir)):
+                is_drive_file = True
+            elif drive_dir and os.path.abspath(raw_p).startswith(os.path.abspath(drive_dir)):
+                is_drive_file = True
+            if not is_drive_file:
+                try:
+                    os.remove(raw_p)
+                except Exception:
+                    pass
+
+        p_url = task.get("url")
+        if p_url and task.get("is_torrent_file") and os.path.exists(p_url):
+            try:
+                os.remove(p_url)
+            except Exception:
+                pass
 
 def cancel_task_by_id(task_id: int, table_name: Optional[str] = None, dismiss: bool = False) -> bool:
     """
@@ -211,7 +235,7 @@ def run_download_pipeline(task: Dict[str, Any]):
         exists, st_exists, existing_path = metadata_manager.check_media_exists(pre_info)
         if exists:
             msg = f"Skipped: Already in Drive as {st_exists} ({os.path.basename(existing_path)})"
-            print(f"[Deduplication] Task #{t_id} '{task.get('title')}' -> {msg}")
+            logger.warn("DOWNLOAD", f"⚠️ Skipped Task #{t_id} ('{task.get('title')}'): Already in Drive as {st_exists} ({os.path.basename(existing_path)})")
             task["status"] = msg
             task["cancelled"] = True
             task["download_pct"] = 100.0
@@ -219,6 +243,7 @@ def run_download_pipeline(task: Dict[str, Any]):
             return
 
         task["status"] = "Downloading"
+        logger.notify("DOWNLOAD", f"🚀 Started downloading Task #{t_id}: '{task.get('title')}'")
         database.update_item_status("download_queue", db_id, status="downloading")
         download_worker(task)
 
@@ -227,12 +252,12 @@ def run_download_pipeline(task: Dict[str, Any]):
             requeued, retry_num = database.requeue_download_for_retry(db_id, max_retries=config.MAX_DOWNLOAD_START_RETRIES)
             if requeued:
                 msg = f"Start timeout (90s): Moved to end of queue for retry ({retry_num}/3)"
-                print(f"[Pipeline] Task #{t_id} {msg}")
+                logger.warn("DOWNLOAD", f"⏳ Start timeout for Task #{t_id} ('{task.get('title')}'): Requeued for retry ({retry_num}/3)")
                 task["status"] = msg
                 task["cancelled"] = True
             else:
                 msg = "Timeout: Failed to start after 3 attempts (no active swarm/seeds)"
-                print(f"[Pipeline] Task #{t_id} {msg}")
+                logger.error("DOWNLOAD", f"❌ Failed to start Task #{t_id} ('{task.get('title')}'): Swarm inactive after 3 attempts.")
                 task["status"] = msg
                 task["error_msg"] = msg
                 task["cancelled"] = True
@@ -242,7 +267,7 @@ def run_download_pipeline(task: Dict[str, Any]):
         # 2. Check for Low Speed demote (< 100 KB/s for 120s)
         if task.get("demote_low_speed"):
             msg = "Demoted to Low-Speed Queue (< 100 KB/s for 120s)"
-            print(f"[Pipeline] Task #{t_id} {msg}")
+            logger.warn("DOWNLOAD", f"🐢 Demoted Task #{t_id} ('{task.get('title')}') to Low-Speed Queue (< 100 KB/s for 120s)")
             database.demote_to_low_speed_queue(db_id, reason=msg)
             task["status"] = msg
             task["cancelled"] = True
@@ -265,7 +290,7 @@ def run_download_pipeline(task: Dict[str, Any]):
         media_info = classifier.classify_media(task.get("title", "") or downloaded_name)
         exists, st_exists, existing_path = metadata_manager.check_media_exists(media_info)
         if exists:
-            print(f"[Deduplication] Task #{t_id} downloaded duplicate detected. Purging local copy -> {task['raw_path']}")
+            logger.warn("DOWNLOAD", f"⚠️ Purging duplicate download Task #{t_id}: Already exists in Drive ({st_exists})")
             try:
                 if os.path.exists(task["raw_path"]):
                     os.remove(task["raw_path"])
@@ -300,6 +325,7 @@ def run_download_pipeline(task: Dict[str, Any]):
         shutil.move(task["raw_path"], drive_raw_path)
         invalidate_unqueued_cache()
         raw_size_mb = os.path.getsize(drive_raw_path) / (1024 * 1024)
+        logger.success("DOWNLOAD", f"✅ Download complete: '{standard_raw_filename}' ({raw_size_mb:.1f} MB). Staged in Drive raw folder: {drive_raw_path}")
 
         # Determine expected refined output path in Google Drive
         container_choice = task.get("container_format", "mkv").lower()
@@ -371,7 +397,7 @@ def run_download_pipeline(task: Dict[str, Any]):
     except Exception as e:
         if not task.get("cancelled"):
             err_msg = str(e)
-            print(f"[DownloadWorker] Error on task #{t_id}: {err_msg}")
+            logger.error("DOWNLOAD", f"❌ Download error on Task #{t_id} ('{task.get('title')}'): {err_msg}")
             task["status"] = "Error"
             task["error_msg"] = err_msg
             database.update_item_status("download_queue", db_id, status="failed", error_msg=err_msg)
@@ -520,13 +546,11 @@ def _refine_job_worker(job: Dict[str, Any]):
         database.update_item_status("refine_queue", job_id, status="failed", error_msg=err)
         return
 
-    os.makedirs(LOCAL_REFINE_DIR, exist_ok=True)
-    local_raw_copy = os.path.join(LOCAL_REFINE_DIR, f"refine_{job_id}_{os.path.basename(raw_drive_path)}")
-
     refine_task: Dict[str, Any] = {
         "id": job_id,
         "title": job.get("title", "Refined Video"),
-        "raw_path": local_raw_copy,
+        "raw_path": raw_drive_path,
+        "raw_drive_path": raw_drive_path,
         "res_preset": cfg.get("res_preset", "480p"),
         "video_codec": cfg.get("video_codec", "H.265 / HEVC"),
         "container_format": cfg.get("container_format", "mkv"),
@@ -546,12 +570,10 @@ def _refine_job_worker(job: Dict[str, Any]):
     try:
         logger.notify("REFINER", f"🎬 Starting Job #{job_id}: '{job.get('title')}' -> Target: {cfg.get('res_preset', '480p')} {cfg.get('video_codec', 'H.265 / HEVC')}")
         database.update_item_status("refine_queue", job_id, status="refining", convert_pct=0.0)
-        shutil.copy2(raw_drive_path, local_raw_copy)
 
         if refine_task.get("cancelled"):
             return
 
-        database.update_item_status("refine_queue", job_id, status="refining", convert_pct=0.0)
         convert_worker(refine_task)
 
         if refine_task.get("cancelled"):
@@ -583,12 +605,12 @@ def _refine_job_worker(job: Dict[str, Any]):
             year=job.get("year")
         )
         database.complete_refine_job(job_id, final_size_mb=final_size_mb)
-        logger.success("REFINER", f"🎉 Refined Job #{job_id} ('{job.get('title')}') successfully completed! Saved to Drive: {target_refined_path} ({final_size_mb:.1f} MB)")
+        logger.success("REFINER", f"🎉 Finished Job #{job_id}! Saved complete refined video to Drive: '{os.path.basename(target_refined_path)}' ({final_size_mb:.1f} MB) -> {target_refined_path}. Chunk staging cleared.")
 
     except Exception as e:
         if not refine_task.get("cancelled"):
             err_msg = str(e)
-            logger.error("REFINER", f"Error refining job #{job_id}: {err_msg}")
+            logger.error("REFINER", f"❌ Error refining Job #{job_id} ('{job.get('title')}'): {err_msg}")
             database.update_item_status("refine_queue", job_id, status="failed", error_msg=err_msg)
     finally:
         cleanup_task_files(job_id, refine_task)

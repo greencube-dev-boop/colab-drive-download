@@ -1247,5 +1247,65 @@ class TestTwoStagePipeline(unittest.TestCase):
         self.assertTrue(hasattr(encoder, "config"), "encoder module missing config import")
         self.assertTrue(hasattr(encoder.config, "CHUNKS_STAGING_DIR"))
 
+    def test_cleanup_task_files_protects_drive_raw_files(self):
+        import pipeline
+        # Create a mock file in config.RAW_DIR
+        drive_raw = os.path.join(config.RAW_DIR, "TestProtection.mkv")
+        with open(drive_raw, "wb") as f:
+            f.write(b"safe_drive_raw_content")
+        self.assertTrue(os.path.exists(drive_raw))
+
+        # Also create a mock local scratch raw file in config.LOCAL_RAW_DIR
+        local_raw = os.path.join(config.LOCAL_RAW_DIR, "task_888_local.mkv")
+        with open(local_raw, "wb") as f:
+            f.write(b"scratch_content")
+        self.assertTrue(os.path.exists(local_raw))
+
+        # Running cleanup_task_files on a task referencing drive_raw must NEVER delete drive_raw
+        mock_task_drive = {"id": 887, "raw_path": drive_raw}
+        pipeline.cleanup_task_files(887, mock_task_drive)
+        self.assertTrue(os.path.exists(drive_raw), "cleanup_task_files erroneously deleted a file in RAW_DIR!")
+
+        # Running cleanup_task_files on a local scratch raw file SHOULD delete it
+        mock_task_local = {"id": 888, "raw_path": local_raw}
+        pipeline.cleanup_task_files(888, mock_task_local)
+        self.assertFalse(os.path.exists(local_raw), "cleanup_task_files failed to delete scratch local raw file!")
+
+    def test_refine_job_worker_uses_raw_drive_path_directly_without_shutil_copy(self):
+        import pipeline
+        drive_raw = os.path.join(config.RAW_DIR, "DirectRawTest.mkv")
+        with open(drive_raw, "wb") as f:
+            f.write(b"direct_raw_content")
+
+        job = {
+            "id": 999,
+            "title": "Direct Raw Test Movie",
+            "raw_drive_path": drive_raw,
+            "target_refined_path": os.path.join(config.REFINED_MOVIES_DIR, "Direct Raw Test Movie.mkv"),
+            "refining_config": {"res_preset": "480p", "video_codec": "H.265 / HEVC"}
+        }
+
+        captured_raw_paths = []
+        def mock_convert_worker(task):
+            captured_raw_paths.append(task.get("raw_path"))
+            # Simulate output created
+            temp_p = os.path.join(config.TEMP_DIR, "mock_output.mkv")
+            with open(temp_p, "wb") as f:
+                f.write(b"mock_refined_data")
+            task["temp_path"] = temp_p
+
+        with patch("pipeline.convert_worker", mock_convert_worker), \
+             patch("shutil.copy2") as mock_copy2, \
+             patch("pipeline.bypass_trash_delete"):
+            pipeline._refine_job_worker(job)
+
+        # Ensure convert_worker was called with the direct drive path (no local copy step)
+        self.assertEqual(len(captured_raw_paths), 1)
+        self.assertEqual(captured_raw_paths[0], drive_raw)
+        # Ensure shutil.copy2 was NEVER called with drive_raw as source (no multi-GB FUSE copy)
+        for call_args in mock_copy2.call_args_list:
+            src = call_args[0][0]
+            self.assertNotEqual(src, drive_raw, "shutil.copy2 was erroneously called on raw_drive_path!")
+
 if __name__ == "__main__":
     unittest.main()

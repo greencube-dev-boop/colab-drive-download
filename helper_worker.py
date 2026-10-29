@@ -171,7 +171,7 @@ class HelperWorker:
         endpoint = f"/api/cluster/claim_task?worker_id={self.worker_id}"
         res = self._http_request(endpoint)
         if res and res.get("has_task"):
-            logger.notify("HELPER", f"📥 Claimed Chunk #{res.get('chunk_idx')} of '{res.get('title', 'Job')}' (Total chunks: {res.get('total_chunks')})")
+            logger.notify("HELPER", f"📥 Claimed Chunk #{res.get('chunk_idx', 0) + 1}/{res.get('total_chunks')} of Job #{res.get('job_id')} ('{res.get('title', 'Job')}')")
             return res
         return None
 
@@ -247,7 +247,7 @@ class HelperWorker:
         ])
 
         # 3. Launch FFmpeg process with live heartbeat monitor
-        logger.notify("HELPER", f"⚡ [Slot {slot_id}] Encoding Chunk #{chunk_idx} of Job #{job_id} on {self.gpu_info['gpu_name']}...")
+        logger.notify("HELPER", f"⚡ Starting transcode of Chunk #{chunk_idx + 1} for Job #{job_id} ('{task.get('title')}') on {self.gpu_info['gpu_name']} (Slot {slot_id})...")
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1)
 
         last_hb_time = time.time()
@@ -276,16 +276,16 @@ class HelperWorker:
                             "speed": curr_speed,
                             "status": "encoding"
                         })
-                        logger.debug("HELPER", f"⚡ [Slot {slot_id}] Chunk #{chunk_idx} progress: {curr_fps:.0f} fps | Speed: {curr_speed}")
+                        logger.debug("HELPER", f"⚡ [Slot {slot_id}] Chunk #{chunk_idx + 1} progress: {curr_fps:.0f} fps | Speed: {curr_speed}")
                         last_hb_time = now
             proc.wait()
         except Exception as e:
             proc.kill()
-            logger.error("HELPER", f"[Slot {slot_id}] Exception during encoding: {e}")
+            logger.error("HELPER", f"[Slot {slot_id}] Exception during Chunk #{chunk_idx + 1} encoding: {e}")
             return False
 
         if proc.returncode != 0 or not os.path.exists(local_out) or os.path.getsize(local_out) == 0:
-            logger.error("HELPER", f"[Slot {slot_id}] FFmpeg transcode failed (exit code: {proc.returncode})")
+            logger.error("HELPER", f"❌ Chunk #{chunk_idx + 1} transcode failed on {self.gpu_info['gpu_name']} (Slot {slot_id}) [exit code: {proc.returncode}]")
             return False
 
         # 4. Copy completed chunk directly to Google Drive
@@ -293,7 +293,7 @@ class HelperWorker:
         shutil.copyfile(local_out, out_drive_chunk)
 
         fsize_mb = os.path.getsize(out_drive_chunk) / (1024 * 1024)
-        logger.success("HELPER", f"[Slot {slot_id}] Chunk #{chunk_idx} finished ({fsize_mb:.1f} MB). Stored on Drive.")
+        logger.success("HELPER", f"✅ Chunk #{chunk_idx + 1} transcode complete ({fsize_mb:.1f} MB) on {self.gpu_info['gpu_name']} (Slot {slot_id}). Saved to Drive.")
 
         # 5. Notify Main coordinator
         self.complete_task(job_id, chunk_idx, out_drive_chunk, fsize_mb)

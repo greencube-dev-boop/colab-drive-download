@@ -225,49 +225,14 @@ def convert_worker(task: Dict[str, Any]):
     if task.get("cancelled"):
         return
 
-    # 4. Audio track extraction according to audio_preset
-    audio_preset = task.get("audio_preset", "Opus 64 kbps")
-    audio_path = os.path.join(TEMP_DIR, f"audio_{task['id']}")
-
-    if "opus 48" in audio_preset.lower():
-        audio_path += ".opus"
-        a_args = ["-vn", "-c:a", "libopus", "-b:a", "48k", "-vbr", "on"]
-    elif "aac 128" in audio_preset.lower():
-        audio_path += ".aac"
-        a_args = ["-vn", "-c:a", "aac", "-b:a", "128k"]
-    elif "aac" in audio_preset.lower():
-        audio_path += ".aac"
-        a_args = ["-vn", "-c:a", "aac", "-b:a", "96k"]
-    elif "copy" in audio_preset.lower() or "passthrough" in audio_preset.lower():
-        audio_path += ".mka"
-        a_args = ["-vn", "-c:a", "copy"]
-    else:
-        # Default: Opus 64 kbps (100% frame-perfect sync)
-        audio_path += ".opus"
-        a_args = ["-vn", "-c:a", "libopus", "-b:a", "64k", "-vbr", "on"]
-
-    if os.path.exists(audio_path):
-        os.remove(audio_path)
-
-    if a_streams:
-        a_cmd = ["ffmpeg", "-nostdin", "-y", "-i", task["raw_path"], *a_args, audio_path]
-        a_proc = subprocess.Popen(a_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        register_proc(task, a_proc)
-        try:
-            a_proc.wait()
-        finally:
-            unregister_proc(task, a_proc)
-
-    if task.get("cancelled"):
-        return
-
-    # 5. Keyframe-aligned video partitioning
+    # 4. Keyframe-aligned video partitioning
     num_workers = task.get("parallel_workers", 3)
     raw_chunks: List[str] = []
 
     if duration > 90 and num_workers > 1:
         target_chunk_sec = int(getattr(config, "CHUNK_DURATION_SEC", 240.0))
         seg_target_duration = max(30, min(target_chunk_sec, int(duration / num_workers)))
+        logger.notify("REFINER", f"✂️ Starting chunking for Job #{task['id']} ('{task.get('title')}') into 4-minute keyframe segments (Duration: {int(duration)}s)...")
         split_cmd = [
             "ffmpeg", "-nostdin", "-y",
             "-i", task["raw_path"],
@@ -278,10 +243,12 @@ def convert_worker(task: Dict[str, Any]):
             "-reset_timestamps", "1",
             os.path.join(task_chunks_dir, "seg_%03d.mkv")
         ]
-        s_proc = subprocess.Popen(split_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        s_proc = subprocess.Popen(split_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         register_proc(task, s_proc)
         try:
-            s_proc.wait()
+            _, s_errs = s_proc.communicate()
+            if s_proc.returncode != 0:
+                logger.warn("REFINER", f"⚠️ Chunking process warning (code {s_proc.returncode}): {s_errs[-200:].strip() if s_errs else ''}")
         finally:
             unregister_proc(task, s_proc)
 
@@ -291,6 +258,58 @@ def convert_worker(task: Dict[str, Any]):
     # Fallback to single chunk if splitting produced nothing or video was short
     if not raw_chunks:
         raw_chunks = [task["raw_path"]]
+
+    logger.notify("REFINER", f"📦 Generated {len(raw_chunks)} chunks for Job #{task['id']} in Drive staging: {task_chunks_dir}")
+
+    # 5. Background Audio Track Extraction
+    # Runs concurrently in a background thread so all GPUs immediately start transcoding video chunks without waiting!
+    audio_preset = task.get("audio_preset", "Opus 64 kbps")
+    audio_path = os.path.join(TEMP_DIR, f"audio_{task['id']}")
+
+    if "opus 48" in audio_preset.lower():
+        audio_path += ".opus"
+        a_args = ["-vn", "-c:a", "libopus", "-ac", "2", "-b:a", "48k", "-vbr", "on"]
+    elif "aac 128" in audio_preset.lower():
+        audio_path += ".aac"
+        a_args = ["-vn", "-c:a", "aac", "-b:a", "128k"]
+    elif "aac" in audio_preset.lower():
+        audio_path += ".aac"
+        a_args = ["-vn", "-c:a", "aac", "-b:a", "96k"]
+    elif "copy" in audio_preset.lower() or "passthrough" in audio_preset.lower():
+        audio_path += ".mka"
+        a_args = ["-vn", "-c:a", "copy"]
+    else:
+        # Default: Opus 64 kbps with stereo downmix (100% compatibility & crystal-clear audio)
+        audio_path += ".opus"
+        a_args = ["-vn", "-c:a", "libopus", "-ac", "2", "-b:a", "64k", "-vbr", "on"]
+
+    if os.path.exists(audio_path):
+        try:
+            os.remove(audio_path)
+        except Exception:
+            pass
+
+    audio_thread = None
+    if a_streams:
+        def _extract_audio_worker():
+            try:
+                logger.notify("REFINER", f"🎵 Extracting audio track ({audio_preset}) in background...")
+                a_cmd = ["ffmpeg", "-nostdin", "-y", "-i", task["raw_path"], *a_args, audio_path]
+                a_proc = subprocess.Popen(a_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+                register_proc(task, a_proc)
+                try:
+                    _, a_errs = a_proc.communicate()
+                    if a_proc.returncode != 0:
+                        logger.warn("REFINER", f"⚠️ Audio extraction warning (code {a_proc.returncode}): {a_errs[-200:].strip() if a_errs else ''}")
+                    else:
+                        logger.notify("REFINER", f"✅ Audio track extraction complete: {os.path.basename(audio_path)}")
+                finally:
+                    unregister_proc(task, a_proc)
+            except Exception as ex:
+                logger.warn("REFINER", f"⚠️ Audio extraction thread error: {ex}")
+
+        audio_thread = threading.Thread(target=_extract_audio_worker, daemon=True, name=f"AudioExtract_{task['id']}")
+        audio_thread.start()
 
     task["chunk_status"] = {}
     for idx, cp in enumerate(raw_chunks):
@@ -487,13 +506,15 @@ def convert_worker(task: Dict[str, Any]):
             c_idx = c_task["chunk_idx"]
             raw_cp = c_task["raw_chunk_path"]
             out_cp = c_task["out_chunk_path"]
+            worker_label = "Main Local GPU" if has_main_gpu else "Main Local CPU"
 
             try:
+                logger.notify("REFINER", f"⚡ Starting transcode of Chunk #{c_idx + 1}/{len(chunks_dict)} for Job #{task['id']} on {worker_label}")
                 encode_single_chunk(c_idx, raw_cp)
                 fsize = os.path.getsize(out_cp) / (1024 * 1024) if os.path.exists(out_cp) else 0.0
                 cluster_manager.complete_task(local_worker_id, task["id"], c_idx, out_cp, fsize)
             except Exception as e:
-                print(f"[Encoder] Local chunk #{c_idx} encoding notice: {e}")
+                logger.error("REFINER", f"❌ Local chunk #{c_idx + 1} encoding error on {worker_label}: {e}")
                 chunks_dict[c_idx]["status"] = "pending"
                 chunks_dict[c_idx]["worker_id"] = None
                 time.sleep(1.0)
@@ -542,6 +563,7 @@ def convert_worker(task: Dict[str, Any]):
 
     # 7. Concat video chunks and mux with continuous audio
     encoded_chunks.sort()
+    logger.notify("REFINER", f"🧩 All {len(encoded_chunks)} chunks completed for Job #{task['id']}! Starting segment concatenation and audio muxing...")
     concat_list_file = os.path.join(TEMP_DIR, f"concat_{task['id']}.txt")
     with open(concat_list_file, "w") as lf:
         for c in encoded_chunks:
@@ -564,6 +586,11 @@ def convert_worker(task: Dict[str, Any]):
 
     if task.get("cancelled"):
         return
+
+    # Ensure background audio extraction has completed before muxing
+    if audio_thread and audio_thread.is_alive():
+        logger.notify("REFINER", "⏳ Waiting for background audio extraction to finalize before muxing...")
+        audio_thread.join(timeout=300.0)
 
     # 8. Mux into chosen container (MKV or MP4)
     container_choice = task.get("container_format", "mkv").lower()

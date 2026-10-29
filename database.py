@@ -213,7 +213,14 @@ def enqueue_download(item: Dict[str, Any]) -> int:
                 now
             ))
             _commit_and_sync(conn, force=True)
-            return cur.lastrowid
+            new_id = cur.lastrowid
+            try:
+                import logger
+                is_low_str = " (Low-Speed Queue)" if is_low else ""
+                logger.notify("DOWNLOAD", f"➕ Added to download queue: #{new_id} '{item.get('title', 'Untitled')}'{is_low_str} (Queue Pos: #{next_idx})")
+            except Exception:
+                pass
+            return new_id
         finally:
             conn.close()
 
@@ -249,7 +256,16 @@ def enqueue_refine(item: Dict[str, Any]) -> int:
                 now
             ))
             _commit_and_sync(conn, force=True)
-            return cur.lastrowid
+            new_id = cur.lastrowid
+            try:
+                import logger
+                ref_cfg = item.get("refining_config", {})
+                res_preset = ref_cfg.get("res_preset", "480p")
+                codec = ref_cfg.get("video_codec", "H.265")
+                logger.notify("REFINER", f"➕ Added to refine queue: Job #{new_id} '{item.get('title', 'Untitled')}' (Target: {res_preset} {codec}, Queue Pos: #{next_idx})")
+            except Exception:
+                pass
+            return new_id
         finally:
             conn.close()
 
@@ -735,6 +751,11 @@ def get_cluster_workers(active_only: bool = False, timeout_sec: float = 45.0) ->
                 if is_stale and d["status"] != "offline":
                     d["status"] = "offline"
                     cur.execute("UPDATE cluster_workers SET status = 'offline' WHERE worker_id = ?", (d["worker_id"],))
+                    try:
+                        import logger
+                        logger.warn("CLUSTER", f"🔴 Helper went offline: '{d.get('node_name', d['worker_id'])}' [{d['worker_id']}] (No heartbeat for >{int(timeout_sec)}s)")
+                    except Exception:
+                        pass
                 if active_only and d["status"] == "offline":
                     continue
                 results.append(d)
