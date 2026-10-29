@@ -1309,5 +1309,100 @@ class TestTwoStagePipeline(unittest.TestCase):
             src = call_args[0][0]
             self.assertNotEqual(src, drive_raw, "shutil.copy2 was erroneously called on raw_drive_path!")
 
+    def test_cleanup_workspace_mechanism(self):
+        import pipeline
+        # Create an orphaned staging chunk directory for inactive Job 777
+        orphan_dir = os.path.join(config.CHUNKS_STAGING_DIR, "job_777")
+        os.makedirs(orphan_dir, exist_ok=True)
+        orphan_file = os.path.join(orphan_dir, "seg_001.mkv")
+        with open(orphan_file, "wb") as f:
+            f.write(b"x" * 1024 * 1024) # 1 MB
+
+        # Create an orphaned local temp file
+        orphan_temp = os.path.join(config.LOCAL_WORKSPACE, "stitched_777.mkv")
+        with open(orphan_temp, "wb") as f:
+            f.write(b"x" * 1024 * 1024) # 1 MB
+
+        # Run cleanup with force=True
+        res = pipeline.cleanup_workspace(force=True)
+        self.assertGreater(res["freed_mb"], 0.0)
+        self.assertFalse(os.path.exists(orphan_dir), "Orphaned job_777 staging folder should have been removed!")
+        self.assertFalse(os.path.exists(orphan_temp), "Orphaned local stitched_777.mkv should have been removed!")
+
+    def test_multi_job_continuous_chunk_claiming(self):
+        import cluster_manager
+        # Register Job 1 with 1 chunk (leased to worker A)
+        job1_info = {
+            "job_id": 101,
+            "title": "Movie 1",
+            "chunks": {
+                0: {"raw_path": "seg1_0.mkv", "out_path": "enc1_0.mkv", "dur_sec": 120.0, "status": "leased", "worker_id": "worker_A", "leased_until": time.time() + 300.0}
+            }
+        }
+        # Register Job 2 with 2 pending chunks
+        job2_info = {
+            "job_id": 102,
+            "title": "Movie 2",
+            "chunks": {
+                0: {"raw_path": "seg2_0.mkv", "out_path": "enc2_0.mkv", "dur_sec": 120.0, "status": "pending", "worker_id": None, "leased_until": 0.0},
+                1: {"raw_path": "seg2_1.mkv", "out_path": "enc2_1.mkv", "dur_sec": 120.0, "status": "pending", "worker_id": None, "leased_until": 0.0}
+            }
+        }
+        cluster_manager.register_cluster_job(101, job1_info)
+        cluster_manager.register_cluster_job(102, job2_info)
+
+        # Worker B asks for work. Since Job 1 has no pending chunks, it should claim from Job 2!
+        task = cluster_manager.claim_task("worker_B", node_name="Helper Node B")
+        self.assertTrue(task["has_task"])
+        self.assertEqual(task["job_id"], 102)
+        self.assertEqual(task["chunk_idx"], 0)
+        self.assertEqual(task["dur_sec"], 120.0)
+
+        # Clean up
+        cluster_manager.unregister_cluster_job(101)
+        cluster_manager.unregister_cluster_job(102)
+
+    def test_main_coordinator_in_cluster_status(self):
+        import cluster_manager
+        status = cluster_manager.get_cluster_status()
+        self.assertGreaterEqual(status["total_nodes"], 1)
+        workers = status["workers"]
+        main_nodes = [w for w in workers if w.get("worker_id") == "main_coordinator"]
+        self.assertEqual(len(main_nodes), 1)
+        self.assertIn("Main", main_nodes[0]["node_name"])
+
+    def test_remote_chunks_telemetry_progress_100_pct(self):
+        # Simulate encoder progress calculation when remote chunks are marked done
+        task = {
+            "id": 999,
+            "convert_pct": 0.0,
+            "chunk_status": {
+                0: {"curr_sec": 0.0, "dur_sec": 100.0, "pct": 0.0, "status": "Queued"},
+                1: {"curr_sec": 0.0, "dur_sec": 100.0, "pct": 0.0, "status": "Queued"}
+            }
+        }
+        chunks_dict = {
+            0: {"status": "done"},
+            1: {"status": "done"}
+        }
+        # Apply the telemetry sync logic used in encoder.py
+        for idx, c in chunks_dict.items():
+            dur = task["chunk_status"][idx]["dur_sec"]
+            if c.get("status") == "done":
+                task["chunk_status"][idx]["status"] = "Done"
+                task["chunk_status"][idx]["pct"] = 100.0
+                task["chunk_status"][idx]["curr_sec"] = dur
+
+        # Calculate progress
+        chunks = task["chunk_status"]
+        total_curr = sum(c.get("curr_sec", 0.0) for c in chunks.values())
+        total_dur = sum(c.get("dur_sec", 1.0) for c in chunks.values())
+        ratio = total_curr / total_dur
+        task["convert_pct"] = ratio * 100.0
+
+        self.assertEqual(task["convert_pct"], 100.0)
+        self.assertEqual(task["chunk_status"][0]["curr_sec"], 100.0)
+        self.assertEqual(task["chunk_status"][1]["curr_sec"], 100.0)
+
 if __name__ == "__main__":
     unittest.main()

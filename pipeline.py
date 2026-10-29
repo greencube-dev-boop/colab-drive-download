@@ -82,6 +82,129 @@ def cleanup_task_files(task_id: int, task: Optional[Dict[str, Any]] = None):
             except Exception:
                 pass
 
+def cleanup_workspace(force: bool = False) -> Dict[str, Any]:
+    """
+    Cleans up temporary, orphaned, and stale files from the Colab local workspace and Drive staging.
+    - Removes finished/orphaned chunk staging directories (drive/downloader/staging/chunks/job_X)
+    - Removes orphaned stitched/concat/audio/segment files in LOCAL_WORKSPACE
+    - Removes stale temp files in LOCAL_RAW_DIR, LOCAL_REFINE_DIR, TRASH_STAGING_DIR
+    """
+    freed_bytes = 0
+    cleaned_staging_folders = 0
+    cleaned_local_files = 0
+
+    # 1. Gather all currently active job IDs across download, refine, and cluster
+    active_ids = set()
+    with _refine_lock:
+        active_ids.update(str(k) for k in _active_refine_tasks.keys())
+    with _dl_lock:
+        active_ids.update(str(k) for k in _active_download_tasks.keys())
+    with tasks_lock:
+        active_ids.update(str(t.get("id")) for t in config.tasks if t.get("id"))
+    try:
+        import cluster_manager
+        with cluster_manager._cluster_lock:
+            active_ids.update(str(k) for k in cluster_manager._active_cluster_jobs.keys())
+    except Exception:
+        pass
+
+    now = time.time()
+
+    # 2. Clean orphaned chunk staging folders on Google Drive
+    chunks_staging = getattr(config, "CHUNKS_STAGING_DIR", "")
+    if chunks_staging and os.path.exists(chunks_staging):
+        try:
+            for item in os.listdir(chunks_staging):
+                full_p = os.path.join(chunks_staging, item)
+                if os.path.isdir(full_p) and item.startswith("job_"):
+                    jid = item[4:]
+                    if jid not in active_ids or force:
+                        try:
+                            if not force:
+                                db_item = database.get_queue_item("refine_queue", int(jid)) if jid.isdigit() else None
+                                if db_item and db_item.get("status") not in ["completed", "failed", "cancelled"]:
+                                    continue
+                            dir_size = 0
+                            for dp, _, fns in os.walk(full_p):
+                                for fn in fns:
+                                    fp = os.path.join(dp, fn)
+                                    if os.path.exists(fp):
+                                        dir_size += os.path.getsize(fp)
+                            shutil.rmtree(full_p, ignore_errors=True)
+                            freed_bytes += dir_size
+                            cleaned_staging_folders += 1
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    # 3. Clean ephemeral local scratch directories
+    local_ws = getattr(config, "LOCAL_WORKSPACE", "")
+    if local_ws and os.path.exists(local_ws):
+        try:
+            for root, dirs, files in os.walk(local_ws):
+                for fn in files:
+                    if fn.endswith(".db") or fn.endswith(".db-journal") or fn.endswith(".json"):
+                        continue
+                    fp = os.path.join(root, fn)
+                    try:
+                        mtime = os.path.getmtime(fp)
+                        age_sec = now - mtime
+                        is_active_job_file = any(f"_{aid}." in fn or f"_{aid}_" in fn or f"job_{aid}" in fp for aid in active_ids)
+                        should_delete = False
+                        if force and not is_active_job_file:
+                            should_delete = True
+                        elif not is_active_job_file and age_sec > 1200:
+                            should_delete = True
+                        elif age_sec > 7200:
+                            should_delete = True
+
+                        if should_delete and os.path.exists(fp):
+                            f_size = os.path.getsize(fp)
+                            os.remove(fp)
+                            freed_bytes += f_size
+                            cleaned_local_files += 1
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    # 4. Clean trash staging directory
+    trash_dir = getattr(config, "TRASH_STAGING_DIR", "")
+    if trash_dir and os.path.exists(trash_dir):
+        try:
+            for item in os.listdir(trash_dir):
+                fp = os.path.join(trash_dir, item)
+                try:
+                    if os.path.isfile(fp):
+                        freed_bytes += os.path.getsize(fp)
+                        os.remove(fp)
+                        cleaned_local_files += 1
+                    elif os.path.isdir(fp):
+                        shutil.rmtree(fp, ignore_errors=True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    freed_mb = freed_bytes / (1024 * 1024)
+    free_gb = 0.0
+    try:
+        _, _, free_b = shutil.disk_usage(local_ws or "/content")
+        free_gb = free_b / (1024 ** 3)
+    except Exception:
+        pass
+
+    if freed_mb > 0 or force:
+        logger.notify("SYSTEM", f"🧹 Workspace cleanup: Reclaimed {freed_mb:.1f} MB. Available local disk: {free_gb:.1f} GB.")
+
+    return {
+        "freed_mb": freed_mb,
+        "free_gb": free_gb,
+        "cleaned_staging_folders": cleaned_staging_folders,
+        "cleaned_local_files": cleaned_local_files
+    }
+
 def cancel_task_by_id(task_id: int, table_name: Optional[str] = None, dismiss: bool = False) -> bool:
     """
     Cancels an active or queued process, kills subprocesses, updates DB with reason, and removes temp files.
@@ -170,6 +293,10 @@ def clear_done_tasks():
         config.tasks = [t for t in config.tasks if t.get("status") not in ["Done", "Error", "Cancelled", "Completed", "Staged", "Cancelled by user"]]
     database.clear_completed("download_queue")
     database.clear_completed("refine_queue")
+    try:
+        cleanup_workspace(force=False)
+    except Exception:
+        pass
 
 def download_worker(task: Dict[str, Any]):
     """Downloads video stream or torrent payload directly into local VM workspace."""
@@ -616,15 +743,20 @@ def _refine_job_worker(job: Dict[str, Any]):
         cleanup_task_files(job_id, refine_task)
         with _refine_lock:
             _active_refine_tasks.pop(job_id, None)
+        config.conversion_semaphore.release()
+        try:
+            cleanup_workspace(force=False)
+        except Exception:
+            pass
 
 def _refine_daemon_loop():
-    """Continuous background loop strictly executing refining jobs in order_idx ASC sequence."""
+    """Continuous background loop executing refining jobs concurrently up to MAX_ACTIVE_CLUSTER_JOBS."""
     while True:
         if not config.refine_worker_active:
             time.sleep(2.0)
             continue
 
-        acquired = conversion_semaphore.acquire(blocking=False)
+        acquired = config.conversion_semaphore.acquire(blocking=False)
         if not acquired:
             time.sleep(1.0)
             continue
@@ -632,14 +764,15 @@ def _refine_daemon_loop():
         try:
             job = database.claim_next_refine_job()
             if job:
-                _refine_job_worker(job)
+                t = threading.Thread(target=_refine_job_worker, args=(job,), daemon=True, name=f"RefineWorker_{job['id']}")
+                t.start()
             else:
+                config.conversion_semaphore.release()
                 time.sleep(2.0)
         except Exception as e:
             print(f"[RefineDaemon] Exception in loop: {e}")
+            config.conversion_semaphore.release()
             time.sleep(2.0)
-        finally:
-            conversion_semaphore.release()
 
 # Start background daemons
 _daemons_started = False
@@ -647,6 +780,10 @@ def ensure_daemons_running():
     global _daemons_started
     if not _daemons_started:
         _daemons_started = True
+        try:
+            cleanup_workspace(force=False)
+        except Exception:
+            pass
         threading.Thread(target=_download_daemon_loop, daemon=True, name="DownloadDaemon").start()
         threading.Thread(target=_low_speed_download_daemon_loop, daemon=True, name="LowSpeedDownloadDaemon").start()
         threading.Thread(target=_refine_daemon_loop, daemon=True, name="RefineDaemon").start()

@@ -674,12 +674,21 @@ def render_cluster_html() -> str:
     # 2. Worker Cards Section
     html_parts.append('<div style="font-weight: 700; font-size: 16px; color: #cdd6f4; display: flex; align-items: center; gap: 8px; margin-top: 8px;">🖥️ Registered GPU Compute Nodes</div>')
 
+    remote_workers = [w for w in workers if w.get("worker_id") != "main_coordinator"]
+    if not remote_workers:
+        html_parts.append("""
+        <div style="background: rgba(203, 166, 247, 0.08); border: 1px dashed rgba(203, 166, 247, 0.3); border-radius: 8px; padding: 12px 16px; margin-bottom: 8px; color: #a6adc8; font-size: 13px; display: flex; align-items: center; justify-content: space-between;">
+            <div>⏳ <strong>No Remote GPU Workers Connected Yet</strong> — All transcoding currently handled by Main. Connect helper notebooks for distributed multi-GPU speedup!</div>
+            <span style="color: #cba6f7; font-weight: 600; font-size: 12px;">0 Remote Helpers</span>
+        </div>
+        """)
+
     if not workers:
         html_parts.append("""
         <div style="background: #181825; border: 1px dashed #313244; border-radius: 10px; padding: 24px; text-align: center; color: #a6adc8;">
-            <div style="font-size: 18px; margin-bottom: 6px;">⏳ No Remote GPU Workers Connected Yet</div>
+            <div style="font-size: 18px; margin-bottom: 6px;">⏳ No GPU Workers Connected Yet</div>
             <div style="font-size: 13px; color: #6c7086; max-width: 500px; margin: 0 auto;">
-                Refining will use this notebook's local GPU. To connect external helper Colab notebooks, see the setup guide below.
+                Connect external helper Colab notebooks using the setup guide below.
             </div>
         </div>
         """)
@@ -1066,6 +1075,7 @@ def create_ui():
                             btn_refresh_refine_queue = gr.Button("🔄 Refresh Refining Queue")
                             btn_toggle_refine_pause = gr.Button("⏸️ Pause / Resume Refiner")
                             btn_clear_refine_done = gr.Button("🧹 Clear Completed Refined")
+                            btn_cleanup_workspace = gr.Button("🧹 Clean Workspace Disk")
 
                         refine_status_msg = gr.Markdown("🟢 Refiner Daemon is active and monitoring persistent SQLite queue.")
                         refine_queue_html = gr.HTML(value=render_refine_queue_html)
@@ -1088,6 +1098,7 @@ def create_ui():
                     gr.Markdown("### 🖥️ Distributed GPU Refiner Cluster & Active Helpers")
                     btn_refresh_cluster = gr.Button("🔄 Refresh Nodes", scale=1)
                     btn_cleanup_offline = gr.Button("🧹 Clear Offline Nodes", scale=1)
+                    btn_cleanup_workspace_cluster = gr.Button("🧹 Clean Workspace Disk", scale=1)
 
                 cluster_html_component = gr.HTML(value=render_cluster_html)
 
@@ -1165,6 +1176,20 @@ def create_ui():
         btn_cleanup_offline.click(
             fn=lambda: (database.cleanup_stale_cluster_workers(timeout_sec=0.0), render_cluster_html())[1],
             outputs=[cluster_html_component]
+        )
+
+        def handle_clean_workspace():
+            import pipeline
+            pipeline.cleanup_workspace(force=True)
+            return render_refine_queue_html(), render_cluster_html()
+
+        btn_cleanup_workspace.click(
+            fn=handle_clean_workspace,
+            outputs=[refine_queue_html, cluster_html_component]
+        )
+        btn_cleanup_workspace_cluster.click(
+            fn=handle_clean_workspace,
+            outputs=[refine_queue_html, cluster_html_component]
         )
         chk_debug_toggle.change(
             fn=lambda v: (logger.set_debug(v), logger.get_recent_logs_text())[1],

@@ -6,6 +6,7 @@ import uuid
 import shutil
 import urllib.request
 import urllib.error
+import urllib.parse
 import subprocess
 import threading
 from typing import Dict, Any, Optional, List
@@ -171,7 +172,7 @@ class HelperWorker:
 
     def claim_task(self) -> Optional[Dict[str, Any]]:
         """Polls Main for next available chunk assignment."""
-        endpoint = f"/api/cluster/claim_task?worker_id={self.worker_id}"
+        endpoint = f"/api/cluster/claim_task?worker_id={self.worker_id}&node_name={urllib.parse.quote(self.node_name)}"
         res = self._http_request(endpoint)
         if res and res.get("has_task"):
             logger.notify("HELPER", f"📥 Claimed Chunk #{res.get('chunk_idx', 0) + 1}/{res.get('total_chunks')} of Job #{res.get('job_id')} ('{res.get('title', 'Job')}')")
@@ -238,7 +239,11 @@ class HelperWorker:
             else:
                 v_args = ["-c:v", "libx265", "-crf", str(crf), "-preset", "veryfast"]
 
-        cmd = ["ffmpeg", "-nostdin", "-y", "-i", local_raw]
+        cmd = ["ffmpeg", "-nostdin", "-y"]
+        # Direct VRAM hardware decoding via NVDEC: eliminates CPU decoding bottleneck
+        if has_nvenc:
+            cmd.extend(["-hwaccel", "cuda"])
+        cmd.extend(["-i", local_raw])
         if scale_filter != "null":
             cmd.extend(["-vf", scale_filter])
         cmd.extend([
@@ -248,6 +253,8 @@ class HelperWorker:
             "-progress", "pipe:1",
             local_out
         ])
+
+        dur_sec = float(task.get("dur_sec", 240.0))
 
         # 3. Launch FFmpeg process with live heartbeat monitor
         logger.notify("HELPER", f"⚡ Starting transcode of Chunk #{chunk_idx + 1} for Job #{job_id} ('{task.get('title')}') on {self.gpu_info['gpu_name']} (Slot {slot_id})...")
@@ -264,11 +271,22 @@ class HelperWorker:
                 if line.startswith("fps="):
                     try:
                         curr_fps = float(line.split("=")[1].strip())
+                        task["fps"] = curr_fps
                     except Exception:
                         pass
                 elif line.startswith("speed="):
                     curr_speed = line.split("=")[1].strip()
+                    task["speed"] = curr_speed
                 elif line.startswith("out_time_us="):
+                    try:
+                        us = int(line.split("=")[1])
+                        curr_sec = us / 1_000_000.0
+                        curr_pct = min(99.0, max(0.0, (curr_sec / max(1.0, dur_sec)) * 100.0))
+                        task["pct"] = curr_pct
+                        task["fps"] = curr_fps
+                        task["speed"] = curr_speed
+                    except Exception:
+                        pass
                     now = time.time()
                     if (now - last_hb_time) >= 10.0:
                         self.send_heartbeat({
@@ -279,8 +297,11 @@ class HelperWorker:
                             "speed": curr_speed,
                             "status": "encoding"
                         })
-                        logger.debug("HELPER", f"⚡ [Slot {slot_id}] Chunk #{chunk_idx + 1} progress: {curr_fps:.0f} fps | Speed: {curr_speed}")
+                        logger.debug("HELPER", f"⚡ [Slot {slot_id}] Chunk #{chunk_idx + 1} progress: {curr_pct:.1f}% @ {curr_fps:.0f} fps | Speed: {curr_speed}")
                         last_hb_time = now
+                elif line == "progress=end":
+                    curr_pct = 100.0
+                    task["pct"] = 100.0
             proc.wait()
         except Exception as e:
             proc.kill()
@@ -373,10 +394,21 @@ class HelperWorker:
                     time.sleep(5)
                     continue
 
-            # Periodic heartbeat to stay active
+            # Periodic heartbeat to stay active and extend leases for all currently encoding slots
             with self.active_slots_lock:
-                is_active = any(s is not None for s in self.active_slots.values())
-            self.send_heartbeat({"status": "encoding" if is_active else "idle"})
+                active_tasks = [t for t in self.active_slots.values() if t is not None]
+            if active_tasks:
+                for at in active_tasks:
+                    self.send_heartbeat({
+                        "job_id": at.get("job_id"),
+                        "chunk_idx": at.get("chunk_idx"),
+                        "pct": at.get("pct", 0.0),
+                        "fps": at.get("fps", 0.0),
+                        "speed": at.get("speed", "--"),
+                        "status": "encoding"
+                    })
+            else:
+                self.send_heartbeat({"status": "idle"})
             time.sleep(10)
 
 def run_helper_main(enable_debug_logs: bool = True):

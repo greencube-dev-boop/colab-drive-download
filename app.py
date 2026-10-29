@@ -98,8 +98,8 @@ def main(enable_debug_logs: bool = True):
 
         @fastapi_app.get("/api/cluster/claim_task")
         @fastapi_app.get("/api/cluster/claim_task/")
-        async def api_claim_task(worker_id: str = ""):
-            res = cluster_manager.claim_task(worker_id)
+        async def api_claim_task(worker_id: str = "", node_name: str = ""):
+            res = cluster_manager.claim_task(worker_id, node_name=node_name)
             return JSONResponse(content=res)
 
         @fastapi_app.post("/api/cluster/complete_task")

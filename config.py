@@ -137,8 +137,9 @@ LOCAL_CLUSTER_MASTER_FILE = os.path.join(LOCAL_CLUSTER_DIR, "master.json")
 
 # Distributed Cluster Configuration
 CHUNK_DURATION_SEC = 240.0         # 4 minutes per keyframe segment (optimal balance of fault tolerance & low Drive FUSE I/O)
-CHUNK_LEASE_TIMEOUT_SEC = 90.0     # 90 seconds lease duration
+CHUNK_LEASE_TIMEOUT_SEC = 300.0    # 5 minutes lease duration (prevents false abandonments during 4-min chunk transcodes)
 WORKER_HEARTBEAT_TIMEOUT_SEC = 45.0 # Mark worker offline if no heartbeat for 45s
+MAX_ACTIVE_CLUSTER_JOBS = 2        # Continuous pipeline: pre-buffers next job's chunks so GPU workers never sit idle
 
 # Verbose Logging & Debug Notifications Toggle
 DEBUG_LOGS: bool = (os.environ.get("ENABLE_DEBUG_LOGS", "1") != "0")
@@ -168,7 +169,7 @@ for d in [
 # Concurrency Semaphores & Worker Limits
 MAX_DOWNLOAD_WORKERS = 3
 MAX_LOW_SPEED_DOWNLOAD_WORKERS = 0  # 0 indicates UNLIMITED concurrent low-speed downloads
-MAX_REFINE_WORKERS = 1
+MAX_REFINE_WORKERS = MAX_ACTIVE_CLUSTER_JOBS
 
 download_semaphore = threading.Semaphore(MAX_DOWNLOAD_WORKERS)
 low_speed_download_semaphore = None  # None: unlimited concurrency for slow-lane trickle downloads

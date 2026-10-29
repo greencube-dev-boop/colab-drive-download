@@ -18,6 +18,7 @@ _gpu_hevc_nvenc_available = False
 _gpu_h264_nvenc_available = False
 _hevc_preset = "p4"
 _h264_preset = "p4"
+_main_gpu_slot_lock = threading.Lock()
 
 def check_hardware_encoders():
     """Verifies that NVIDIA GPU, hevc_nvenc, and h264_nvenc are actually functional."""
@@ -363,7 +364,11 @@ def convert_worker(task: Dict[str, Any]):
         task["chunk_status"][idx]["status"] = "Encoding"
 
         def run_ffmpeg(selected_args):
-            cmd = ["ffmpeg", "-nostdin", "-y", "-i", chunk_path]
+            cmd = ["ffmpeg", "-nostdin", "-y"]
+            # Direct VRAM hardware decoding via NVDEC: eliminates CPU decoding bottleneck
+            if use_gpu and selected_args != cpu_fallback_args:
+                cmd.extend(["-hwaccel", "cuda"])
+            cmd.extend(["-i", chunk_path])
             if scale_filter != "null":
                 cmd.extend(["-vf", scale_filter])
             cmd.extend([
@@ -391,6 +396,9 @@ def convert_worker(task: Dict[str, Any]):
                                 dur_s = task["chunk_status"][idx]["dur_sec"]
                                 task["chunk_status"][idx]["pct"] = min(100.0, (curr_sec / dur_s) * 100)
                                 _update_overall_progress()
+                                # Keep chunk lease alive during active local transcoding
+                                if idx in chunks_dict:
+                                    chunks_dict[idx]["leased_until"] = time.time() + 300.0
                             except ValueError:
                                 pass
                         elif line.startswith("speed="):
@@ -443,9 +451,11 @@ def convert_worker(task: Dict[str, Any]):
         base = os.path.splitext(os.path.basename(cp))[0]
         out_chunk_path = os.path.join(task_chunks_dir, f"enc_{base}.mkv")
         is_already_done = os.path.exists(out_chunk_path) and os.path.getsize(out_chunk_path) > 0
+        dur_val = task["chunk_status"][idx]["dur_sec"]
         chunks_dict[idx] = {
             "raw_path": cp,
             "out_path": out_chunk_path,
+            "dur_sec": dur_val,
             "status": "done" if is_already_done else "pending",
             "worker_id": "cached" if is_already_done else None,
             "leased_until": 0.0,
@@ -456,6 +466,7 @@ def convert_worker(task: Dict[str, Any]):
         if is_already_done:
             task["chunk_status"][idx]["status"] = "Done"
             task["chunk_status"][idx]["pct"] = 100.0
+            task["chunk_status"][idx]["curr_sec"] = dur_val
 
     cluster_job_info = {
         "job_id": task["id"],
@@ -477,75 +488,81 @@ def convert_worker(task: Dict[str, Any]):
     online_helpers = cluster_manager.get_online_helper_count()
 
     if not has_main_gpu:
+        # Non-GPU Main notebook: zero transcoding on Main (pure coordinator, all chunks delegated to GPU helpers)
+        local_concurrency = 0
         if online_helpers > 0:
-            local_concurrency = 0
-            print(f"[Encoder] Main GPU not available, but {online_helpers} remote GPU helper(s) connected. Delegating chunks to GPU cluster (CPU paused).")
+            logger.notify("REFINER", f"ℹ️ Main notebook is CPU coordinator. Delegating all chunks to {online_helpers} connected GPU helper(s).")
         else:
-            local_concurrency = 1
-            print("[Encoder] Main GPU not available and no GPU helpers connected. Transcoding via CPU fallback (1 chunk at a time).")
+            logger.warn("REFINER", "⏳ Main notebook has no GPU. Waiting for remote GPU helper(s) to connect...")
     else:
-        # Main has GPU: encode up to 2 chunks concurrently on Main GPU
-        local_concurrency = min(2, len(raw_chunks))
+        # Main has GPU: dedicate exactly 1 slot for Main GPU to prevent resource contention with downloads & coordination
+        local_concurrency = 1
 
     def local_cluster_worker(local_worker_id: str):
         while not task.get("cancelled"):
-            # Dynamic CPU Fallback Rule: If Main is CPU-only, yield/pause whenever GPU helpers are connected
-            if not has_main_gpu:
-                helpers = cluster_manager.get_online_helper_count()
-                if helpers > 0:
-                    time.sleep(2.0)
-                    if all(c.get("status") == "done" for c in chunks_dict.values()):
-                        break
-                    continue
+            if all(c.get("status") == "done" for c in chunks_dict.values()):
+                break
 
-            c_task = cluster_manager.claim_task(local_worker_id, node_name="Main Local GPU" if has_main_gpu else "Main Local CPU")
-            if not c_task or not c_task.get("has_task"):
-                if all(c.get("status") == "done" for c in chunks_dict.values()):
-                    break
+            # Check if there are any pending chunks for this job before acquiring GPU lock
+            has_pending = any(c.get("status") == "pending" or (c.get("status") == "leased" and time.time() > c.get("leased_until", 0.0)) for c in chunks_dict.values())
+            if not has_pending:
+                time.sleep(1.0)
+                continue
+
+            acquired = _main_gpu_slot_lock.acquire(blocking=False)
+            if not acquired:
                 time.sleep(0.5)
                 continue
 
-            c_idx = c_task["chunk_idx"]
-            raw_cp = c_task["raw_chunk_path"]
-            out_cp = c_task["out_chunk_path"]
-            worker_label = "Main Local GPU" if has_main_gpu else "Main Local CPU"
-
             try:
-                logger.notify("REFINER", f"⚡ Starting transcode of Chunk #{c_idx + 1}/{len(chunks_dict)} for Job #{task['id']} on {worker_label}")
-                encode_single_chunk(c_idx, raw_cp)
-                fsize = os.path.getsize(out_cp) / (1024 * 1024) if os.path.exists(out_cp) else 0.0
-                cluster_manager.complete_task(local_worker_id, task["id"], c_idx, out_cp, fsize)
-            except Exception as e:
-                logger.error("REFINER", f"❌ Local chunk #{c_idx + 1} encoding error on {worker_label}: {e}")
-                chunks_dict[c_idx]["status"] = "pending"
-                chunks_dict[c_idx]["worker_id"] = None
-                time.sleep(1.0)
+                c_task = cluster_manager.claim_task(local_worker_id, node_name="Main Local GPU", target_job_id=task["id"])
+                if not c_task or not c_task.get("has_task"):
+                    time.sleep(0.5)
+                    continue
 
-    # Launch local worker threads (or 1 standby thread to resume CPU if remote helpers drop)
-    effective_workers = local_concurrency if (has_main_gpu or online_helpers == 0) else 1
-    with ThreadPoolExecutor(max_workers=max(1, effective_workers)) as executor:
-        futures = []
-        if has_main_gpu:
-            futures = [executor.submit(local_cluster_worker, f"main_gpu_slot_{i}") for i in range(local_concurrency)]
-        else:
-            # CPU fallback worker
-            futures = [executor.submit(local_cluster_worker, "main_cpu_slot_0")]
+                c_idx = c_task["chunk_idx"]
+                raw_cp = c_task["raw_chunk_path"]
+                out_cp = c_task["out_chunk_path"]
 
+                try:
+                    encode_single_chunk(c_idx, raw_cp)
+                    fsize = os.path.getsize(out_cp) / (1024 * 1024) if os.path.exists(out_cp) else 0.0
+                    cluster_manager.complete_task(local_worker_id, task["id"], c_idx, out_cp, fsize)
+                except Exception as e:
+                    logger.error("REFINER", f"❌ Local chunk #{c_idx + 1} encoding error on Main Local GPU: {e}")
+                    chunks_dict[c_idx]["status"] = "pending"
+                    chunks_dict[c_idx]["worker_id"] = None
+                    time.sleep(1.0)
+            finally:
+                _main_gpu_slot_lock.release()
+
+    # Launch local worker thread if Main has GPU; otherwise monitor cluster
+    futures = []
+    executor = None
+    if local_concurrency > 0:
+        executor = ThreadPoolExecutor(max_workers=local_concurrency)
+        futures = [executor.submit(local_cluster_worker, "main_gpu_slot_0")]
+
+    try:
         while not task.get("cancelled"):
             all_done = all(c.get("status") == "done" for c in chunks_dict.values())
             # Sync remote helper telemetry into task["chunk_status"]
             for idx, c in chunks_dict.items():
+                dur = task["chunk_status"][idx]["dur_sec"]
                 if c.get("status") == "done":
                     task["chunk_status"][idx]["status"] = "Done"
                     task["chunk_status"][idx]["pct"] = 100.0
+                    task["chunk_status"][idx]["curr_sec"] = dur
                 elif c.get("status") == "leased":
                     task["chunk_status"][idx]["status"] = "Encoding"
-                    if c.get("pct", 0) > 0:
-                        task["chunk_status"][idx]["pct"] = c["pct"]
+                    pct = max(0.0, min(100.0, float(c.get("pct", 0.0))))
+                    task["chunk_status"][idx]["pct"] = pct
+                    task["chunk_status"][idx]["curr_sec"] = (pct / 100.0) * dur
                     if c.get("speed"):
                         task["chunk_status"][idx]["speed"] = c["speed"]
             _update_overall_progress()
             if all_done:
+                task["convert_pct"] = 100.0
                 break
             time.sleep(0.5)
 
@@ -554,6 +571,9 @@ def convert_worker(task: Dict[str, Any]):
                 f.result(timeout=1.0)
             except Exception:
                 pass
+    finally:
+        if executor:
+            executor.shutdown(wait=False)
 
     _update_overall_progress(force_sync=True)
     cluster_manager.unregister_cluster_job(task["id"])

@@ -159,16 +159,19 @@ def get_cluster_job(job_id: int) -> Optional[Dict[str, Any]]:
     with _cluster_lock:
         return _active_cluster_jobs.get(job_id)
 
-def claim_task(worker_id: str, node_name: Optional[str] = None) -> Dict[str, Any]:
+def claim_task(worker_id: str, node_name: Optional[str] = None, target_job_id: Optional[int] = None) -> Dict[str, Any]:
     """
     Leases the next available video chunk to an idle GPU worker node.
     Prioritizes pending chunks, or expired leased chunks needing recovery.
+    If target_job_id is provided, only leases chunks for that specific job.
     """
     with _cluster_lock:
         now = time.time()
-        lease_sec = getattr(config, "CHUNK_LEASE_TIMEOUT_SEC", 90.0)
+        lease_sec = getattr(config, "CHUNK_LEASE_TIMEOUT_SEC", 300.0)
 
         for job_id, job in _active_cluster_jobs.items():
+            if target_job_id is not None and job_id != target_job_id:
+                continue
             if job.get("cancelled"):
                 continue
 
@@ -206,6 +209,7 @@ def claim_task(worker_id: str, node_name: Optional[str] = None) -> Dict[str, Any
                         "title": job.get("title", f"Job #{job_id}"),
                         "raw_chunk_path": c["raw_path"],
                         "out_chunk_path": c["out_path"],
+                        "dur_sec": float(c.get("dur_sec", 240.0)),
                         "refining_config": job.get("refining_config", {}),
                         "lease_seconds": int(lease_sec)
                     }
@@ -275,8 +279,53 @@ def get_cluster_status() -> Dict[str, Any]:
     """Returns a high-level summary of the GPU cluster health, nodes, and jobs."""
     discover_workers_from_drive()
     workers = database.get_cluster_workers(active_only=False)
-    online_count = sum(1 for w in workers if w.get("status") != "offline")
-    encoding_count = sum(1 for w in workers if w.get("status") == "encoding")
+
+    has_gpu = False
+    try:
+        import encoder
+        has_gpu = encoder.is_nvenc_available()
+    except Exception:
+        pass
+
+    # Check if Main GPU is actively encoding
+    main_st = "idle"
+    main_pct = 0.0
+    main_fps = 0.0
+    main_speed = "--"
+    main_job_id = 0
+    main_chunk_idx = -1
+    with _cluster_lock:
+        for j_id, j in _active_cluster_jobs.items():
+            for c_i, c in j.get("chunks", {}).items():
+                if c.get("status") == "leased" and "main" in str(c.get("worker_id", "")).lower():
+                    main_st = "encoding"
+                    main_job_id = j_id
+                    main_chunk_idx = c_i
+                    main_pct = c.get("pct", 0.0)
+                    main_fps = c.get("fps", 0.0)
+                    main_speed = c.get("speed", "--")
+                    break
+            if main_st == "encoding":
+                break
+
+    main_node = {
+        "worker_id": "main_coordinator",
+        "node_name": "Main (Tesla T4)" if has_gpu else "Main (CPU Coordinator)",
+        "gpu_name": "NVIDIA GPU NVENC (1 Slot)" if has_gpu else "None (CPU Coordinator)",
+        "vram_mb": 15360 if has_gpu else 0,
+        "status": main_st,
+        "last_heartbeat": time.time(),
+        "total_chunks_processed": 0,
+        "current_job_id": main_job_id,
+        "current_chunk_idx": main_chunk_idx,
+        "current_progress": main_pct,
+        "current_fps": main_fps,
+        "current_speed": main_speed
+    }
+
+    all_workers = [main_node] + [w for w in workers if w.get("worker_id") != "main_coordinator"]
+    online_count = sum(1 for w in all_workers if w.get("status") != "offline")
+    encoding_count = sum(1 for w in all_workers if w.get("status") == "encoding")
 
     with _cluster_lock:
         total_chunks = 0
@@ -288,13 +337,13 @@ def get_cluster_status() -> Dict[str, Any]:
             done_chunks += sum(1 for c in chunks.values() if c.get("status") == "done")
 
     return {
-        "total_nodes": len(workers),
+        "total_nodes": len(all_workers),
         "online_nodes": online_count,
         "encoding_nodes": encoding_count,
         "active_jobs": active_jobs_count,
         "total_chunks": total_chunks,
         "done_chunks": done_chunks,
-        "workers": workers
+        "workers": all_workers
     }
 
 def _cluster_daemon_loop():
