@@ -7,7 +7,7 @@ import shutil
 import threading
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Callable
 import config
 from config import TEMP_DIR, DRIVE_DIR, sanitize_filename, tasks_lock
 import logger
@@ -118,7 +118,7 @@ def get_bitrate_for_resolution(res_limit: int) -> tuple[str, str]:
         return "2800k", "5600k"
     return "4000k", "8000k"
 
-def convert_worker(task: Dict[str, Any]):
+def convert_worker(task: Dict[str, Any], on_transcode_complete: Optional[Any] = None):
     """Transcodes downloaded raw video according to Universal Output Settings."""
     if task.get("cancelled"):
         return
@@ -342,11 +342,18 @@ def convert_worker(task: Dict[str, Any]):
     def _update_overall_progress(force_sync: bool = False):
         chunks = task.get("chunk_status", {})
         if chunks:
-            total_curr = sum(c.get("curr_sec", 0.0) for c in chunks.values())
-            total_dur = sum(c.get("dur_sec", 1.0) for c in chunks.values())
-            if total_dur > 0:
-                ratio = total_curr / total_dur
-                task["convert_pct"] = min(99.0, max(0.0, ratio * 99.0))
+            all_done = all(c.get("status") in ["Done", "done"] for c in chunks.values())
+            if all_done:
+                task["convert_pct"] = 100.0
+            else:
+                total_curr = sum(c.get("curr_sec", 0.0) for c in chunks.values())
+                total_dur = sum(c.get("dur_sec", 1.0) for c in chunks.values())
+                if total_dur > 0 and total_curr > 0:
+                    ratio = total_curr / total_dur
+                    task["convert_pct"] = min(99.0, max(0.0, ratio * 99.0))
+                else:
+                    d_c = sum(1 for c in chunks.values() if c.get("status") in ["Done", "done"])
+                    task["convert_pct"] = min(99.0, (d_c / len(chunks)) * 99.0)
 
             now = time.time()
             if force_sync or (now - _last_db_progress_sync[0]) >= 2.0:
@@ -493,6 +500,19 @@ def convert_worker(task: Dict[str, Any]):
     has_main_gpu = is_nvenc_available()
     online_helpers = cluster_manager.get_online_helper_count()
 
+    if has_main_gpu:
+        try:
+            import database
+            database.upsert_cluster_worker({
+                "worker_id": "main_coordinator",
+                "node_name": "Main (Tesla T4)",
+                "gpu_name": "NVIDIA GPU NVENC (1 Slot)",
+                "vram_mb": 15360,
+                "status": "idle"
+            })
+        except Exception:
+            pass
+
     if not has_main_gpu:
         # Non-GPU Main notebook: zero transcoding on Main (pure coordinator, all chunks delegated to GPU helpers)
         local_concurrency = 0
@@ -509,21 +529,21 @@ def convert_worker(task: Dict[str, Any]):
             if all(c.get("status") == "done" for c in chunks_dict.values()):
                 break
 
-            # Check if there are any pending chunks for this job before acquiring GPU lock
+            # Fast check: are there pending chunks or expired leases?
             has_pending = any(c.get("status") == "pending" or (c.get("status") == "leased" and time.time() > c.get("leased_until", 0.0)) for c in chunks_dict.values())
             if not has_pending:
-                time.sleep(1.0)
+                time.sleep(0.2)
                 continue
 
             acquired = _main_gpu_slot_lock.acquire(blocking=False)
             if not acquired:
-                time.sleep(0.5)
+                time.sleep(0.1)
                 continue
 
             try:
                 c_task = cluster_manager.claim_task(local_worker_id, node_name="Main Local GPU", target_job_id=task["id"])
                 if not c_task or not c_task.get("has_task"):
-                    time.sleep(0.5)
+                    time.sleep(0.2)
                     continue
 
                 c_idx = c_task["chunk_idx"]
@@ -538,7 +558,7 @@ def convert_worker(task: Dict[str, Any]):
                     logger.error("REFINER", f"❌ Local chunk #{c_idx + 1} encoding error on Main Local GPU: {e}")
                     chunks_dict[c_idx]["status"] = "pending"
                     chunks_dict[c_idx]["worker_id"] = None
-                    time.sleep(1.0)
+                    time.sleep(0.5)
             finally:
                 _main_gpu_slot_lock.release()
 
@@ -547,7 +567,7 @@ def convert_worker(task: Dict[str, Any]):
     executor = None
     if local_concurrency > 0:
         executor = ThreadPoolExecutor(max_workers=local_concurrency)
-        futures = [executor.submit(local_cluster_worker, "main_gpu_slot_0")]
+        futures = [executor.submit(local_cluster_worker, "main_coordinator")]
 
     try:
         while not task.get("cancelled"):
@@ -583,6 +603,13 @@ def convert_worker(task: Dict[str, Any]):
 
     _update_overall_progress(force_sync=True)
     cluster_manager.unregister_cluster_job(task["id"])
+
+    # Notify pipeline that GPU transcoding is 100% complete so next job can immediately be pre-chunked
+    if on_transcode_complete and callable(on_transcode_complete):
+        try:
+            on_transcode_complete()
+        except Exception as e:
+            logger.debug("REFINER", f"Notice from on_transcode_complete callback: {e}")
 
     if task.get("cancelled"):
         return

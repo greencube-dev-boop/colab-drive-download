@@ -356,10 +356,16 @@ def render_refine_queue_html() -> str:
                 except Exception:
                     chunks = {}
             if chunks:
-                total_curr = sum(c.get("curr_sec", 0.0) for c in chunks.values())
-                total_dur = sum(c.get("dur_sec", 1.0) for c in chunks.values())
-                if total_dur > 0:
-                    pct = max(pct, min(99.9, (total_curr / total_dur) * 100.0))
+                d_c = sum(1 for c in chunks.values() if c.get("status") in ["Done", "done"])
+                if d_c == len(chunks) and len(chunks) > 0:
+                    pct = 100.0
+                else:
+                    total_curr = sum(c.get("curr_sec", 0.0) for c in chunks.values())
+                    total_dur = sum(c.get("dur_sec", 1.0) for c in chunks.values())
+                    if total_dur > 0 and total_curr > 0:
+                        pct = max(pct, min(99.0, (total_curr / total_dur) * 100.0))
+                    else:
+                        pct = max(pct, min(99.0, (d_c / len(chunks)) * 100.0))
 
             cfg = job.get("refining_config", {})
             res_tag = cfg.get("res_preset", "480p").split()[0]
@@ -369,8 +375,11 @@ def render_refine_queue_html() -> str:
 
             chunks_done_label = ""
             if chunks:
-                d_c = sum(1 for c in chunks.values() if c.get("status") == "Done")
-                chunks_done_label = f"({d_c}/{len(chunks)} Chunks)"
+                d_c = sum(1 for c in chunks.values() if c.get("status") in ["Done", "done"])
+                if d_c == len(chunks) and len(chunks) > 0:
+                    chunks_done_label = f"({d_c}/{len(chunks)} Chunks Done - Muxing Audio)"
+                else:
+                    chunks_done_label = f"({d_c}/{len(chunks)} Chunks)"
 
             html_parts.append(f"""
             <div id="refine-card-{j_id}" style="background: #1e1e2e; border: 1px solid #cba6f7; border-radius: 10px; padding: 16px 20px; box-shadow: 0 4px 12px rgba(0,0,0,0.3);">
@@ -641,6 +650,8 @@ def render_cluster_html() -> str:
     workers = status.get("workers", [])
     total_nodes = status.get("total_nodes", 0)
     online_nodes = status.get("online_nodes", 0)
+    total_gpus = status.get("total_gpus", total_nodes)
+    total_slots = status.get("total_slots", online_nodes * 2)
     encoding_nodes = status.get("encoding_nodes", 0)
     active_jobs = status.get("active_jobs", 0)
     total_chunks = status.get("total_chunks", 0)
@@ -653,12 +664,12 @@ def render_cluster_html() -> str:
     html_parts.append(f"""
     <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px;">
         <div style="background: #1e1e2e; border: 1px solid #313244; border-radius: 10px; padding: 14px; text-align: center;">
-            <div style="font-size: 11px; text-transform: uppercase; color: #a6adc8; font-weight: 700; letter-spacing: 0.5px;">Cluster Nodes</div>
-            <div style="font-size: 24px; font-weight: 800; color: #a6e3a1; margin-top: 4px;">{online_nodes} <span style="font-size: 14px; color: #6c7086; font-weight: 500;">/ {total_nodes} Total</span></div>
+            <div style="font-size: 11px; text-transform: uppercase; color: #a6adc8; font-weight: 700; letter-spacing: 0.5px;">Active GPUs</div>
+            <div style="font-size: 24px; font-weight: 800; color: #a6e3a1; margin-top: 4px;">{total_gpus} <span style="font-size: 14px; color: #89b4fa; font-weight: 600;">({total_slots} Slots)</span></div>
         </div>
         <div style="background: #1e1e2e; border: 1px solid #313244; border-radius: 10px; padding: 14px; text-align: center;">
             <div style="font-size: 11px; text-transform: uppercase; color: #a6adc8; font-weight: 700; letter-spacing: 0.5px;">Active Transcodes</div>
-            <div style="font-size: 24px; font-weight: 800; color: #89b4fa; margin-top: 4px;">{encoding_nodes} <span style="font-size: 14px; color: #6c7086; font-weight: 500;">Encoding</span></div>
+            <div style="font-size: 24px; font-weight: 800; color: #89b4fa; margin-top: 4px;">{encoding_nodes} <span style="font-size: 14px; color: #6c7086; font-weight: 500;">Slots Encoding</span></div>
         </div>
         <div style="background: #1e1e2e; border: 1px solid #313244; border-radius: 10px; padding: 14px; text-align: center;">
             <div style="font-size: 11px; text-transform: uppercase; color: #a6adc8; font-weight: 700; letter-spacing: 0.5px;">Cluster Chunks</div>

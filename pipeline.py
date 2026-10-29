@@ -694,6 +694,14 @@ def _refine_job_worker(job: Dict[str, Any]):
     with _refine_lock:
         _active_refine_tasks[job_id] = refine_task
 
+    semaphore_released = [False]
+
+    def _release_conversion_slot():
+        if not semaphore_released[0]:
+            semaphore_released[0] = True
+            config.conversion_semaphore.release()
+            logger.notify("REFINER", f"⚡ GPU Transcoding phase completed for Job #{job_id}. Slot freed: pre-chunking next queued video immediately.")
+
     try:
         logger.notify("REFINER", f"🎬 Starting Job #{job_id}: '{job.get('title')}' -> Target: {cfg.get('res_preset', '480p')} {cfg.get('video_codec', 'H.265 / HEVC')}")
         database.update_item_status("refine_queue", job_id, status="refining", convert_pct=0.0)
@@ -701,7 +709,11 @@ def _refine_job_worker(job: Dict[str, Any]):
         if refine_task.get("cancelled"):
             return
 
-        convert_worker(refine_task)
+        try:
+            convert_worker(refine_task, on_transcode_complete=_release_conversion_slot)
+        except TypeError:
+            convert_worker(refine_task)
+            _release_conversion_slot()
 
         if refine_task.get("cancelled"):
             return
@@ -743,7 +755,9 @@ def _refine_job_worker(job: Dict[str, Any]):
         cleanup_task_files(job_id, refine_task)
         with _refine_lock:
             _active_refine_tasks.pop(job_id, None)
-        config.conversion_semaphore.release()
+        if not semaphore_released[0]:
+            semaphore_released[0] = True
+            config.conversion_semaphore.release()
         try:
             cleanup_workspace(force=False)
         except Exception:

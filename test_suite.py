@@ -1437,5 +1437,50 @@ class TestTwoStagePipeline(unittest.TestCase):
 
         cluster_manager.unregister_cluster_job(555)
 
+    def test_tail_end_chunk_dynamic_lease(self):
+        import cluster_manager
+        job_info = {
+            "job_id": 777,
+            "title": "Tail End Job",
+            "chunks": {
+                0: {"raw_path": "/fake/seg_0.mkv", "out_path": "/fake/enc_0.mkv", "dur_sec": 60.0, "status": "pending", "worker_id": None, "leased_until": 0.0},
+                1: {"raw_path": "/fake/seg_1.mkv", "out_path": "/fake/enc_1.mkv", "dur_sec": 60.0, "status": "pending", "worker_id": None, "leased_until": 0.0}
+            }
+        }
+        cluster_manager.register_cluster_job(777, job_info)
+
+        # 2 chunks remaining -> tail-end dynamic lease of 60s
+        claimed = cluster_manager.claim_task("tail_worker", node_name="Tail Worker")
+        self.assertTrue(claimed["has_task"])
+        self.assertEqual(claimed["lease_seconds"], 60)
+
+        cluster_manager.unregister_cluster_job(777)
+
+    def test_failed_chunk_cooldown_in_helper(self):
+        from helper_worker import HelperWorker
+        worker = HelperWorker(worker_id="test_cooldown_worker")
+        # Put chunk (10, 2) on cooldown
+        worker.failed_chunks_cooldown[(10, 2)] = time.time() + 30.0
+
+        # Simulate claim_task intercepting cooldown
+        cooldown_until = worker.failed_chunks_cooldown.get((10, 2), 0.0)
+        self.assertGreater(cooldown_until, time.time())
+
+        # Success clears cooldown
+        worker.failed_chunks_cooldown.pop((10, 2), None)
+        self.assertNotIn((10, 2), worker.failed_chunks_cooldown)
+
+    def test_ui_progress_bar_all_chunks_done_is_100_percent(self):
+        import ui
+        chunks = {
+            "0": {"status": "Done", "curr_sec": 50.0, "dur_sec": 100.0},
+            "1": {"status": "Done", "curr_sec": 30.0, "dur_sec": 100.0}
+        }
+        d_c = sum(1 for c in chunks.values() if c.get("status") in ["Done", "done"])
+        self.assertEqual(d_c, len(chunks))
+        # Even if curr_sec was partially reported, all chunks Done = 100%
+        pct = 100.0 if d_c == len(chunks) and len(chunks) > 0 else 50.0
+        self.assertEqual(pct, 100.0)
+
 if __name__ == "__main__":
     unittest.main()

@@ -687,18 +687,26 @@ def upsert_cluster_worker(worker: Dict[str, Any]) -> bool:
             vram_mb = int(worker.get("vram_mb", 0))
             tunnel_url = worker.get("tunnel_url", "")
             now = time.time()
+            file_hb = float(worker.get("last_heartbeat") or now)
+            reg_time = float(worker.get("registered_at") or now)
+            init_status = "offline" if (now - file_hb) > 45.0 else worker.get("status", "idle")
+
             cur.execute("""
                 INSERT INTO cluster_workers 
                 (worker_id, node_name, gpu_name, vram_mb, tunnel_url, current_job_id, current_chunk_idx, current_progress, current_fps, current_speed, last_heartbeat, status, total_chunks_processed, registered_at)
-                VALUES (?, ?, ?, ?, ?, 0, -1, 0.0, 0.0, '--', ?, 'idle', 0, ?)
+                VALUES (?, ?, ?, ?, ?, 0, -1, 0.0, 0.0, '--', ?, ?, 0, ?)
                 ON CONFLICT(worker_id) DO UPDATE SET
                     node_name = excluded.node_name,
                     gpu_name = excluded.gpu_name,
                     vram_mb = excluded.vram_mb,
                     tunnel_url = CASE WHEN excluded.tunnel_url != '' THEN excluded.tunnel_url ELSE cluster_workers.tunnel_url END,
-                    last_heartbeat = excluded.last_heartbeat,
-                    status = CASE WHEN cluster_workers.status = 'offline' THEN 'idle' ELSE cluster_workers.status END
-            """, (w_id, node_name, gpu_name, vram_mb, tunnel_url, now, now))
+                    last_heartbeat = MAX(cluster_workers.last_heartbeat, excluded.last_heartbeat),
+                    status = CASE 
+                        WHEN (? - excluded.last_heartbeat) > 45.0 THEN 'offline'
+                        WHEN cluster_workers.status = 'offline' AND (? - excluded.last_heartbeat) <= 45.0 THEN 'idle' 
+                        ELSE cluster_workers.status 
+                    END
+            """, (w_id, node_name, gpu_name, vram_mb, tunnel_url, file_hb, init_status, reg_time, now, now))
             _commit_and_sync(conn, force=True)
             return True
         finally:
@@ -776,14 +784,14 @@ def remove_cluster_worker(worker_id: str) -> bool:
         finally:
             conn.close()
 
-def cleanup_stale_cluster_workers(timeout_sec: float = 120.0) -> int:
+def cleanup_stale_cluster_workers(timeout_sec: float = 60.0) -> int:
     """Removes offline worker nodes that haven't sent a heartbeat for longer than timeout_sec."""
     with _db_lock:
         conn = _get_connection()
         try:
             cur = conn.cursor()
             cutoff = time.time() - timeout_sec
-            cur.execute("DELETE FROM cluster_workers WHERE last_heartbeat < ? AND status = 'offline'", (cutoff,))
+            cur.execute("DELETE FROM cluster_workers WHERE (last_heartbeat < ? AND status = 'offline') OR (last_heartbeat < ?)", (cutoff, time.time() - 90.0))
             count = cur.rowcount
             _commit_and_sync(conn, force=True)
             return count

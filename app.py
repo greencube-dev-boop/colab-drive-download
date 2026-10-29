@@ -132,11 +132,31 @@ def main(enable_debug_logs: bool = True):
 
         @fastapi_app.get("/api/cluster/chunk/{job_id}/{chunk_idx}")
         async def api_get_chunk(job_id: int, chunk_idx: int):
-            chunk_path = cluster_manager.get_chunk_raw_path(job_id, chunk_idx)
-            if chunk_path and os.path.exists(chunk_path) and os.path.getsize(chunk_path) > 0:
-                from fastapi.responses import FileResponse
-                return FileResponse(chunk_path, media_type="video/x-matroska", filename=os.path.basename(chunk_path))
-            return JSONResponse(status_code=404, content={"error": f"Chunk #{chunk_idx} of Job #{job_id} not found"})
+            try:
+                chunk_path = cluster_manager.get_chunk_raw_path(job_id, chunk_idx)
+                if not chunk_path or not os.path.exists(chunk_path):
+                    return JSONResponse(status_code=404, content={"error": f"Chunk #{chunk_idx} of Job #{job_id} not found on disk"})
+                fsize = os.path.getsize(chunk_path)
+                if fsize == 0:
+                    return JSONResponse(status_code=404, content={"error": f"Chunk #{chunk_idx} of Job #{job_id} is 0 bytes"})
+
+                from fastapi.responses import StreamingResponse
+
+                def iterfile():
+                    with open(chunk_path, "rb") as f:
+                        while chunk := f.read(1024 * 1024):
+                            yield chunk
+
+                headers = {
+                    "Content-Length": str(fsize),
+                    "Content-Disposition": f'attachment; filename="{os.path.basename(chunk_path)}"',
+                    "Accept-Ranges": "bytes"
+                }
+                return StreamingResponse(iterfile(), media_type="video/x-matroska", headers=headers)
+            except Exception as e:
+                import logger
+                logger.error("CLUSTER", f"Error streaming chunk #{chunk_idx} of Job #{job_id}: {e}")
+                return JSONResponse(status_code=500, content={"error": str(e)})
 
         @fastapi_app.get("/api/cluster/status")
         @fastapi_app.get("/api/cluster/status/")

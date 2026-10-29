@@ -64,12 +64,14 @@ def discover_workers_from_drive():
     """
     Scans shared Google Drive folder for worker beacon files (data/cluster/workers/worker_*.json).
     Allows Main to discover active helper nodes natively through shared storage.
+    Prunes stale worker files whose last heartbeat is older than 45 seconds.
     """
     search_dirs = [
         getattr(config, "CLUSTER_WORKERS_DIR", os.path.join(config.DATA_DIR, "cluster", "workers")),
         getattr(config, "LOCAL_CLUSTER_WORKERS_DIR", os.path.join(config.LOCAL_DATA_DIR, "cluster", "workers"))
     ]
     seen_ids = set()
+    now = time.time()
     for sdir in search_dirs:
         if not os.path.exists(sdir):
             continue
@@ -81,6 +83,16 @@ def discover_workers_from_drive():
                         w_data = json.load(f)
                     if isinstance(w_data, dict) and w_data.get("worker_id"):
                         wid = w_data["worker_id"]
+                        hb = float(w_data.get("last_heartbeat") or 0.0)
+                        if (now - hb) > 45.0:
+                            # Prune stale dead worker beacon from Drive so it doesn't linger
+                            try:
+                                os.remove(fpath)
+                            except Exception:
+                                pass
+                            database.remove_cluster_worker(wid)
+                            continue
+
                         if wid not in seen_ids:
                             seen_ids.add(wid)
                             database.upsert_cluster_worker(w_data)
@@ -176,6 +188,10 @@ def claim_task(worker_id: str, node_name: Optional[str] = None, target_job_id: O
                 continue
 
             chunks = job.get("chunks", {})
+            unfinished_count = sum(1 for c in chunks.values() if c.get("status") != "done")
+            # Dynamic lease: for tail-end chunks (<= 2 left), drop lease from 300s to 60s
+            effective_lease_sec = 60.0 if unfinished_count <= 2 else lease_sec
+
             for c_idx in sorted(chunks.keys()):
                 c = chunks[c_idx]
                 is_pending = (c["status"] == "pending")
@@ -186,7 +202,7 @@ def claim_task(worker_id: str, node_name: Optional[str] = None, target_job_id: O
                     c["status"] = "leased"
                     c["worker_id"] = worker_id
                     c["worker_name"] = node_name or worker_id
-                    c["leased_until"] = now + lease_sec
+                    c["leased_until"] = now + effective_lease_sec
 
                     # Update database worker tracking
                     database.heartbeat_cluster_worker(worker_id, {
@@ -211,7 +227,7 @@ def claim_task(worker_id: str, node_name: Optional[str] = None, target_job_id: O
                         "out_chunk_path": c["out_path"],
                         "dur_sec": float(c.get("dur_sec", 240.0)),
                         "refining_config": job.get("refining_config", {}),
-                        "lease_seconds": int(lease_sec)
+                        "lease_seconds": int(effective_lease_sec)
                     }
 
     return {"has_task": False, "wait_seconds": 5}
@@ -338,14 +354,17 @@ def get_cluster_status() -> Dict[str, Any]:
             if main_st == "encoding":
                 break
 
+    main_db = next((w for w in workers if w.get("worker_id") == "main_coordinator"), {})
+    main_chunks_processed = int(main_db.get("total_chunks_processed", 0))
+
     main_node = {
         "worker_id": "main_coordinator",
         "node_name": "Main (Tesla T4)" if has_gpu else "Main (CPU Coordinator)",
         "gpu_name": "NVIDIA GPU NVENC (1 Slot)" if has_gpu else "None (CPU Coordinator)",
         "vram_mb": 15360 if has_gpu else 0,
-        "status": main_st,
+        "status": main_st if has_gpu else "coordinator",
         "last_heartbeat": time.time(),
-        "total_chunks_processed": 0,
+        "total_chunks_processed": main_chunks_processed,
         "current_job_id": main_job_id,
         "current_chunk_idx": main_chunk_idx,
         "current_progress": main_pct,
@@ -353,8 +372,23 @@ def get_cluster_status() -> Dict[str, Any]:
         "current_speed": main_speed
     }
 
-    all_workers = [main_node] + [w for w in workers if w.get("worker_id") != "main_coordinator"]
-    online_count = sum(1 for w in all_workers if w.get("status") != "offline")
+    # Filter out workers that have no heartbeat for > 45s (stale/disconnected)
+    now = time.time()
+    active_remote = [
+        w for w in workers 
+        if w.get("worker_id") != "main_coordinator" 
+        and w.get("status") != "offline" 
+        and (now - float(w.get("last_heartbeat") or 0.0)) <= 45.0
+    ]
+
+    all_workers = [main_node] + active_remote
+    online_count = sum(1 for w in all_workers if w.get("status") not in ["offline", "coordinator"])
+    if not has_gpu:
+        online_gpus = len(active_remote)
+    else:
+        online_gpus = len(active_remote) + 1
+
+    total_slots = (1 if has_gpu else 0) + (len(active_remote) * 2)
     encoding_count = sum(1 for w in all_workers if w.get("status") == "encoding")
 
     with _cluster_lock:
@@ -368,6 +402,8 @@ def get_cluster_status() -> Dict[str, Any]:
 
     return {
         "total_nodes": len(all_workers),
+        "total_gpus": online_gpus,
+        "total_slots": total_slots,
         "online_nodes": online_count,
         "encoding_nodes": encoding_count,
         "active_jobs": active_jobs_count,

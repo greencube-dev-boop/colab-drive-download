@@ -60,6 +60,7 @@ class HelperWorker:
         self.running: bool = True
         self.active_slots: Dict[int, Optional[Dict[str, Any]]] = {0: None, 1: None}
         self.active_slots_lock = threading.Lock()
+        self.failed_chunks_cooldown: Dict[Any, float] = {}
         self.local_temp_dir = os.path.join(getattr(config, "LOCAL_WORKSPACE", "/content/temp"), "helper_work")
         os.makedirs(self.local_temp_dir, exist_ok=True)
 
@@ -175,6 +176,13 @@ class HelperWorker:
         endpoint = f"/api/cluster/claim_task?worker_id={self.worker_id}&node_name={urllib.parse.quote(self.node_name)}"
         res = self._http_request(endpoint)
         if res and res.get("has_task"):
+            j_id = res.get("job_id", 0)
+            c_idx = res.get("chunk_idx", -1)
+            # Check if this worker recently failed this exact chunk
+            cooldown_until = self.failed_chunks_cooldown.get((j_id, c_idx), 0.0)
+            if time.time() < cooldown_until:
+                self.release_task(j_id, c_idx)
+                return None
             logger.notify("HELPER", f"📥 Claimed Chunk #{res.get('chunk_idx', 0) + 1}/{res.get('total_chunks')} of Job #{res.get('job_id')} ('{res.get('title', 'Job')}')")
             return res
         return None
@@ -270,6 +278,7 @@ class HelperWorker:
             dl_ok = self.download_chunk_file(chunk_ep, local_raw)
             if not dl_ok:
                 logger.warn("HELPER", f"[Slot {slot_id}] ⚠️ Source chunk #{chunk_idx + 1} not yet accessible on Drive or HTTP. Releasing back to queue...")
+                self.failed_chunks_cooldown[(job_id, chunk_idx)] = time.time() + 20.0
                 self.release_task(job_id, chunk_idx)
                 return False
             f_mb = os.path.getsize(local_raw) / (1024 * 1024)
@@ -360,11 +369,18 @@ class HelperWorker:
         except Exception as e:
             proc.kill()
             logger.error("HELPER", f"[Slot {slot_id}] Exception during Chunk #{chunk_idx + 1} encoding: {e}")
+            self.failed_chunks_cooldown[(job_id, chunk_idx)] = time.time() + 20.0
+            self.release_task(job_id, chunk_idx)
             return False
 
         if proc.returncode != 0 or not os.path.exists(local_out) or os.path.getsize(local_out) == 0:
             logger.error("HELPER", f"❌ Chunk #{chunk_idx + 1} transcode failed on {self.gpu_info['gpu_name']} (Slot {slot_id}) [exit code: {proc.returncode}]")
+            self.failed_chunks_cooldown[(job_id, chunk_idx)] = time.time() + 20.0
+            self.release_task(job_id, chunk_idx)
             return False
+
+        # Clear cooldown on success
+        self.failed_chunks_cooldown.pop((job_id, chunk_idx), None)
 
         # 4. Copy completed chunk directly to Google Drive
         os.makedirs(os.path.dirname(out_drive_chunk), exist_ok=True)
