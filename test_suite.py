@@ -74,8 +74,18 @@ class TestTwoStagePipeline(unittest.TestCase):
 
         metadata_manager.reset_cache()
         database.init_db()
+        try:
+            import cluster_manager
+            cluster_manager._active_cluster_jobs.clear()
+        except Exception:
+            pass
 
     def tearDown(self):
+        try:
+            import cluster_manager
+            cluster_manager._active_cluster_jobs.clear()
+        except Exception:
+            pass
         config.download_worker_active = False
         config.refine_worker_active = False
         metadata_manager.reset_cache()
@@ -1877,6 +1887,212 @@ class TestTwoStagePipeline(unittest.TestCase):
             for c in chunks_dict.values()
         )
         self.assertTrue(has_work)
+
+
+    def test_helper_tunnel_url_registration(self):
+        import cluster_manager
+        worker_data = {
+            "worker_id": "worker_tunnel_node_1",
+            "node_name": "Helper Tunnel Node 1",
+            "gpu_name": "Tesla T4",
+            "vram_mb": 15360,
+            "tunnel_url": "https://helper-abc.trycloudflare.com"
+        }
+        res = cluster_manager.register_worker(worker_data)
+        self.assertEqual(res["status"], "registered")
+        
+        w = database.get_cluster_worker("worker_tunnel_node_1")
+        self.assertIsNotNone(w)
+        self.assertEqual(w.get("tunnel_url"), "https://helper-abc.trycloudflare.com")
+
+    def test_signal_slot_free_dispatch(self):
+        import cluster_manager
+        job_id = 9001
+        job_info = {
+            "job_id": job_id,
+            "title": "Signal Free Dispatch Test",
+            "order_idx": 1,
+            "chunks": {
+                0: {"raw_path": "seg_000.mkv", "out_path": "enc_seg_000.mkv", "status": "pending", "leased_until": 0.0, "dur_sec": 120.0},
+                1: {"raw_path": "seg_001.mkv", "out_path": "enc_seg_001.mkv", "status": "pending", "leased_until": 0.0, "dur_sec": 120.0}
+            }
+        }
+        cluster_manager.register_cluster_job(job_id, job_info)
+
+        resp = cluster_manager.signal_slot_free("worker_sig_1", slot_id=0, node_name="Signal Helper 1")
+        self.assertTrue(resp.get("has_task"))
+        self.assertEqual(resp.get("job_id"), job_id)
+        self.assertEqual(resp.get("chunk_idx"), 0)
+
+        resp2 = cluster_manager.signal_slot_free("worker_sig_2", slot_id=0, node_name="Signal Helper 2")
+        self.assertTrue(resp2.get("has_task"))
+        self.assertEqual(resp2.get("chunk_idx"), 1)
+
+        resp3 = cluster_manager.signal_slot_free("worker_sig_3", slot_id=0, node_name="Signal Helper 3")
+        self.assertFalse(resp3.get("has_task"))
+
+        cluster_manager.unregister_cluster_job(job_id)
+
+    def test_chunk_priority_queue_ongoing_job_precedence(self):
+        import cluster_manager
+        job_101 = {
+            "job_id": 101,
+            "title": "Ongoing Job Priority 1",
+            "priority": 1,
+            "order_idx": 5,
+            "chunks": {
+                0: {"raw_path": "seg_101_0.mkv", "out_path": "enc_seg_101_0.mkv", "status": "pending", "leased_until": 0.0, "dur_sec": 100.0}
+            }
+        }
+        job_102 = {
+            "job_id": 102,
+            "title": "New Job Priority 2",
+            "priority": 2,
+            "order_idx": 1,
+            "chunks": {
+                0: {"raw_path": "seg_102_0.mkv", "out_path": "enc_seg_102_0.mkv", "status": "pending", "leased_until": 0.0, "dur_sec": 100.0}
+            }
+        }
+        cluster_manager.register_cluster_job(102, job_102)
+        cluster_manager.register_cluster_job(101, job_101)
+
+        task = cluster_manager.claim_task("worker_pq_1")
+        self.assertTrue(task.get("has_task"))
+        self.assertEqual(task.get("job_id"), 101)
+
+        cluster_manager.unregister_cluster_job(101)
+        cluster_manager.unregister_cluster_job(102)
+
+    def test_session_restart_reconciliation(self):
+        import cluster_manager
+        db_id = database.enqueue_refine({
+            "title": "Interrupted Video",
+            "raw_drive_path": os.path.join(self.test_dir, "raw", "interrupted.mkv"),
+            "target_refined_path": os.path.join(self.test_dir, "refined", "interrupted.mkv"),
+            "refining_config": {"res_preset": "480p"}
+        })
+        database.update_item_status("refine_queue", db_id, status="refining", convert_pct=50.0)
+
+        chunks_dir = os.path.join(getattr(config, 'CHUNKS_STAGING_DIR', os.path.join(config.DOWNLOADER_DIR, 'staging', 'chunks')), f'job_{db_id}')
+        os.makedirs(chunks_dir, exist_ok=True)
+        seg0 = os.path.join(chunks_dir, 'seg_000.mkv')
+        enc0 = os.path.join(chunks_dir, 'enc_seg_000.mkv')
+        seg1 = os.path.join(chunks_dir, 'seg_001.mkv')
+        for f in (seg0, enc0, seg1):
+            with open(f, 'wb') as fh:
+                fh.write(b'video_bytes_content_for_chunk')
+
+        reconciled = cluster_manager.reconcile_unfinished_jobs_on_startup()
+        self.assertIn(db_id, reconciled)
+
+        c_job = cluster_manager.get_cluster_job(db_id)
+        self.assertIsNotNone(c_job)
+        self.assertEqual(c_job['chunks'][0]['status'], 'done')
+        self.assertEqual(c_job['chunks'][1]['status'], 'pending')
+        self.assertEqual(c_job.get('priority', 2), 1)
+
+        task = cluster_manager.claim_task('worker_recov_1')
+        self.assertTrue(task.get('has_task'))
+        self.assertEqual(task.get('job_id'), db_id)
+        self.assertEqual(task.get('chunk_idx'), 1)
+
+        next_job = database.claim_next_refine_job()
+        self.assertIsNotNone(next_job)
+        self.assertEqual(next_job['id'], db_id)
+
+        cluster_manager.unregister_cluster_job(db_id)
+
+    def test_chunk_progress_telemetry(self):
+        import cluster_manager
+        job_id = 8800
+        job_info = {
+            "job_id": job_id,
+            "title": "Telemetry Test Video",
+            "chunks": {
+                0: {"raw_path": "seg_000.mkv", "out_path": "enc_seg_000.mkv", "status": "leased", "leased_until": time.time() + 300.0, "pct": 0.0, "dur_sec": 100.0}
+            }
+        }
+        cluster_manager.register_cluster_job(job_id, job_info)
+
+        res = cluster_manager.report_chunk_progress(
+            worker_id="worker_gpu_mgr",
+            job_id=job_id,
+            chunk_idx=0,
+            progress_pct=45.5,
+            fps=72.0,
+            speed="2.4x"
+        )
+        self.assertTrue(res.get("status") in ["ok", "updated"])
+        
+        chunk = job_info["chunks"][0]
+        self.assertEqual(chunk["pct"], 45.5)
+        self.assertEqual(chunk["fps"], 72.0)
+        self.assertEqual(chunk["speed"], "2.4x")
+
+        cluster_manager.unregister_cluster_job(job_id)
+
+    def test_api_signal_free_and_chunk_progress_endpoints(self):
+        import asyncio
+        from fastapi import FastAPI
+        from app import mount_cluster_api
+        import cluster_manager
+
+        app = FastAPI()
+        mount_cluster_api(app)
+
+        job_id = 9911
+        job_info = {
+            "job_id": job_id,
+            "title": "API Signal Free Test Video",
+            "chunks": {
+                0: {"raw_path": "seg_000.mkv", "out_path": "enc_seg_000.mkv", "status": "pending", "leased_until": 0.0, "dur_sec": 60.0}
+            }
+        }
+        cluster_manager.register_cluster_job(job_id, job_info)
+
+        sig_handler = None
+        prog_handler = None
+        for r in app.routes:
+            if hasattr(r, 'path') and r.path == '/api/cluster/signal_free':
+                sig_handler = r.endpoint
+            elif hasattr(r, 'path') and r.path == '/api/cluster/chunk_progress':
+                prog_handler = r.endpoint
+
+        self.assertIsNotNone(sig_handler)
+        self.assertIsNotNone(prog_handler)
+
+        class MockRequest:
+            def __init__(self, json_data):
+                self._data = json_data
+            async def json(self):
+                return self._data
+
+        req1 = MockRequest({'worker_id': 'test_api_worker_1', 'slot_id': 0, 'node_name': 'API Helper Node'})
+        resp1 = asyncio.run(sig_handler(req1))
+        data1 = json.loads(resp1.body.decode('utf-8'))
+        self.assertTrue(data1.get('has_task'))
+        self.assertEqual(data1.get('job_id'), job_id)
+        self.assertEqual(data1.get('chunk_idx'), 0)
+
+        req2 = MockRequest({'worker_id': 'test_api_worker_1', 'job_id': job_id, 'chunk_idx': 0, 'pct': 55.0, 'fps': 60.0, 'speed': '2.0x'})
+        resp2 = asyncio.run(prog_handler(req2))
+        data2 = json.loads(resp2.body.decode('utf-8'))
+        self.assertEqual(data2.get('status'), 'updated')
+
+        cluster_manager.unregister_cluster_job(job_id)
+
+    def test_classifier_caching(self):
+        import classifier
+        test_title = 'The.Batman.Part.II.2026.1080p.WEBRip'
+        res1 = classifier.classify_media(test_title)
+        self.assertEqual(res1['type'], 'movie')
+        self.assertEqual(res1['year'], 2026)
+        
+        norm_key = test_title.strip().lower()
+        self.assertIn(norm_key, classifier._classification_cache)
+        
+        res2 = classifier.classify_media(test_title)
+        self.assertEqual(res1, res2)
 
 if __name__ == "__main__":
     unittest.main()

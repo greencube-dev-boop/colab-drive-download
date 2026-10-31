@@ -409,6 +409,15 @@ def convert_worker(task: Dict[str, Any], on_transcode_complete: Optional[Any] = 
                                 dur_s = task["chunk_status"][idx]["dur_sec"]
                                 task["chunk_status"][idx]["pct"] = min(100.0, (curr_sec / dur_s) * 100)
                                 _update_overall_progress()
+                                try:
+                                    import cluster_manager
+                                    cluster_manager.report_chunk_progress(
+                                        "main_coordinator", task["id"], idx,
+                                        task["chunk_status"][idx]["pct"],
+                                        fps=0.0, speed=task["chunk_status"][idx].get("speed", "--")
+                                    )
+                                except Exception:
+                                    pass
                                 # Keep chunk lease alive during active local transcoding
                                 if idx in chunks_dict:
                                     chunks_dict[idx]["leased_until"] = time.time() + 300.0
@@ -559,11 +568,12 @@ def convert_worker(task: Dict[str, Any], on_transcode_complete: Optional[Any] = 
                 continue
 
             try:
-                c_task = cluster_manager.claim_task(local_worker_id, node_name="Main Local GPU", target_job_id=task["id"])
+                c_task = cluster_manager.signal_slot_free(local_worker_id, slot_id=0, node_name="Main Local GPU")
                 if not c_task or not c_task.get("has_task"):
                     time.sleep(0.2)
                     continue
 
+                j_id = c_task["job_id"]
                 c_idx = c_task["chunk_idx"]
                 raw_cp = c_task["raw_chunk_path"]
                 out_cp = c_task["out_chunk_path"]
@@ -571,11 +581,10 @@ def convert_worker(task: Dict[str, Any], on_transcode_complete: Optional[Any] = 
                 try:
                     encode_single_chunk(c_idx, raw_cp)
                     fsize = os.path.getsize(out_cp) / (1024 * 1024) if os.path.exists(out_cp) else 0.0
-                    cluster_manager.complete_task(local_worker_id, task["id"], c_idx, out_cp, fsize)
+                    cluster_manager.complete_task(local_worker_id, j_id, c_idx, out_cp, fsize)
                 except Exception as e:
                     logger.error("REFINER", f"❌ Local chunk #{c_idx + 1} encoding error on Main Local GPU: {e}")
-                    chunks_dict[c_idx]["status"] = "pending"
-                    chunks_dict[c_idx]["worker_id"] = None
+                    cluster_manager.release_task(local_worker_id, j_id, c_idx)
                     time.sleep(0.5)
             finally:
                 _main_gpu_slot_lock.release()

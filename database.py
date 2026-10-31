@@ -517,8 +517,9 @@ def toggle_download_queue_speed(item_id: int, to_low_speed: Optional[bool] = Non
 
 def claim_next_refine_job() -> Optional[Dict[str, Any]]:
     """
-    Atomically claims the next pending refining job in strict order (order_idx ASC, id ASC)
-    and transitions status to 'refining'.
+    Atomically claims the next refining job, prioritizing ongoing interrupted jobs
+    (status = 'refining') before claiming pending jobs (status = 'pending') in strict order
+    (order_idx ASC, id ASC).
     """
     with _db_lock:
         conn = _get_connection()
@@ -526,20 +527,36 @@ def claim_next_refine_job() -> Optional[Dict[str, Any]]:
             cur = conn.cursor()
             cur.execute("""
                 SELECT * FROM refine_queue 
-                WHERE status = 'pending'
-                ORDER BY order_idx ASC, id ASC LIMIT 1
+                WHERE status IN ('refining', 'pending')
+                ORDER BY 
+                    CASE 
+                        WHEN status = 'refining' THEN 0 
+                        ELSE 1 
+                    END,
+                    order_idx ASC, id ASC 
+                LIMIT 1
             """)
             row = cur.fetchone()
             if not row:
                 return None
 
             job_id = row["id"]
+            current_status = row["status"]
             now = _now_iso()
-            cur.execute("""
-                UPDATE refine_queue 
-                SET status = 'refining', updated_at = ? 
-                WHERE id = ? AND status = 'pending'
-            """, (now, job_id))
+
+            if current_status == "pending":
+                cur.execute("""
+                    UPDATE refine_queue 
+                    SET status = 'refining', updated_at = ? 
+                    WHERE id = ? AND status = 'pending'
+                """, (now, job_id))
+            else:
+                cur.execute("""
+                    UPDATE refine_queue 
+                    SET updated_at = ? 
+                    WHERE id = ? AND status = 'refining'
+                """, (now, job_id))
+
             _commit_and_sync(conn, force=True)
 
             if cur.rowcount == 0:

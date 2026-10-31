@@ -320,7 +320,8 @@ class HelperWorker:
             "worker_id": self.worker_id,
             "node_name": self.node_name,
             "gpu_name": self.gpu_info["gpu_name"],
-            "vram_mb": self.gpu_info["vram_mb"]
+            "vram_mb": self.gpu_info["vram_mb"],
+            "tunnel_url": getattr(self, "tunnel_url", "") or ""
         }
         logger.notify("HELPER", f"📡 Registering with Main coordinator ({self.master_url})...")
         res = self._http_request("/api/cluster/register", reg_payload)
@@ -372,6 +373,74 @@ class HelperWorker:
         if payload.get("status") == "encoding":
             logger.debug("HELPER", f"💓 Heartbeat: Chunk #{payload.get('chunk_idx')} ({payload.get('pct', 0.0):.1f}%) @ {payload.get('fps', 0)} fps")
         return res
+
+    def start_tunnel_and_server(self, port: int = 7861):
+        """Spawns local Cloudflare tunnel and starts a lightweight worker HTTP server."""
+        try:
+            import tunnel
+            self.tunnel_url = tunnel.start_cloudflare_tunnel(port=port)
+            if self.tunnel_url:
+                logger.notify("HELPER", f"🌐 Helper Cloudflare Tunnel active: {self.tunnel_url}")
+        except Exception as e:
+            logger.debug("HELPER", f"Notice: Could not start helper Cloudflare tunnel: {e}")
+
+        # Start lightweight HTTP server for coordinator health-checks / abort signals
+        try:
+            import http.server
+            worker_instance = self
+
+            class _WorkerHandler(http.server.BaseHTTPRequestHandler):
+                def do_GET(self):
+                    if "/health" in self.path:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.end_headers()
+                        res = {"status": "ok", "worker_id": worker_instance.worker_id}
+                        self.wfile.write(json.dumps(res).encode("utf-8"))
+                    else:
+                        self.send_response(200)
+                        self.end_headers()
+
+                def do_POST(self):
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"status":"ok"}')
+
+                def log_message(self, format, *args):
+                    pass
+
+            from http.server import ThreadingHTTPServer
+            self._httpd = ThreadingHTTPServer(("0.0.0.0", port), _WorkerHandler)
+            srv_thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
+            srv_thread.start()
+        except Exception as e:
+            logger.debug("HELPER", f"Notice: Worker local HTTP server could not bind to port {port}: {e}")
+
+    def signal_slot_free(self, slot_id: int = 0) -> Optional[Dict[str, Any]]:
+        """Signals Main that this GPU slot is idle and requests next chunk assignment from Priority Queue."""
+        now = time.time()
+        active_cooldowns = [
+            f"{j}:{c}" for (j, c), exp in self.failed_chunks_cooldown.items() if now < exp
+        ]
+        payload = {
+            "worker_id": self.worker_id,
+            "slot_id": slot_id,
+            "node_name": self.node_name,
+            "exclude_chunks": active_cooldowns
+        }
+        res = self._http_request("/api/cluster/signal_free", payload)
+        if res and res.get("has_task"):
+            j_id = res.get("job_id", 0)
+            c_idx = res.get("chunk_idx", -1)
+            cooldown_until = self.failed_chunks_cooldown.get((j_id, c_idx), 0.0)
+            if time.time() < cooldown_until:
+                self.release_task(j_id, c_idx)
+                time.sleep(2.0)
+                return None
+            logger.notify("HELPER", f"📥 Claimed Chunk #{res.get('chunk_idx', 0) + 1}/{res.get('total_chunks')} of Job #{res.get('job_id')} ('{res.get('title', 'Job')}')")
+            return res
+        return None
 
     def claim_task(self) -> Optional[Dict[str, Any]]:
         """Polls Main for next available chunk assignment."""
@@ -593,16 +662,16 @@ class HelperWorker:
                     except Exception:
                         pass
                     now = time.time()
-                    if (now - last_hb_time) >= 10.0:
-                        hb_res = self.send_heartbeat({
+                    if (now - last_hb_time) >= 2.0:
+                        prog_res = self._http_request("/api/cluster/chunk_progress", {
+                            "worker_id": self.worker_id,
                             "job_id": job_id,
                             "chunk_idx": chunk_idx,
                             "pct": curr_pct,
                             "fps": curr_fps,
-                            "speed": curr_speed,
-                            "status": "encoding"
+                            "speed": curr_speed
                         })
-                        if isinstance(hb_res, dict) and hb_res.get("abort_chunk"):
+                        if isinstance(prog_res, dict) and prog_res.get("abort_chunk"):
                             logger.notify("HELPER", f"🛑 [Slot {slot_id}] Chunk #{chunk_idx + 1} aborted by coordinator (winner completed). Freeing slot...")
                             proc.terminate()
                             try:
@@ -666,7 +735,7 @@ class HelperWorker:
                 time.sleep(3)
                 continue
 
-            task = self.claim_task()
+            task = self.signal_slot_free(slot_id=slot_id) or self.claim_task()
             if task:
                 idle_ticks = 0
                 with self.active_slots_lock:
@@ -701,6 +770,9 @@ class HelperWorker:
         logger.notify("HELPER", f"   Concurrency: {self.MAX_CONCURRENT_CHUNKS} chunks simultaneously per GPU")
         logger.notify("HELPER", f"   Debug Log Notifications: {'ENABLED (Verbose)' if logger.is_debug() else 'DISABLED (Milestones only)'}")
         logger.notify("HELPER", "=" * 68)
+
+        # 0. Start local Cloudflare tunnel & lightweight HTTP health/control server
+        self.start_tunnel_and_server(port=7861)
 
         # Start 2 concurrent worker slots per GPU
         threads = []

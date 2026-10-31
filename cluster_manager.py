@@ -66,10 +66,14 @@ def publish_master_beacon(master_url: str):
 def reset_cluster_on_startup():
     """
     Cleans up all stale remote workers, lingering worker beacon files, and previous session
-    state on coordinator startup so the new session starts with a clean slate.
+    state on coordinator startup so the new session starts with a clean slate, and reconciles
+    any ongoing/interrupted refining jobs into the Priority 1 Chunk Queue.
     """
     clean_inactive_workers(force_all_offline=True)
     logger.notify("CLUSTER", "🧹 GPU Cluster state reset for fresh session: purged stale remote workers.")
+    reconciled = reconcile_unfinished_jobs_on_startup()
+    if reconciled:
+        logger.notify("CLUSTER", f"🔄 Recovered {len(reconciled)} ongoing/interrupted job(s) from previous session.")
 
 def clean_inactive_workers(force_all_offline: bool = False, timeout_sec: float = 15.0) -> int:
     """
@@ -339,7 +343,15 @@ def claim_task(worker_id: str, node_name: Optional[str] = None, target_job_id: O
         # -------------------------------------------------------------
         # PASS 1: Pending chunks or expired primary leases across all jobs
         # -------------------------------------------------------------
-        for job_id, job in _active_cluster_jobs.items():
+        sorted_jobs = sorted(
+            _active_cluster_jobs.items(),
+            key=lambda item: (
+                int(item[1].get("priority", 2)),
+                int(item[1].get("order_idx", 99999)),
+                int(item[0])
+            )
+        )
+        for job_id, job in sorted_jobs:
             if target_job_id is not None and job_id != target_job_id:
                 continue
             if job.get("cancelled"):
@@ -401,7 +413,7 @@ def claim_task(worker_id: str, node_name: Optional[str] = None, target_job_id: O
         # If all chunks are leased and this worker is idle, duplicate a slow/stalled chunk!
         # -------------------------------------------------------------
         speculative_timeout = getattr(config, "SPECULATIVE_CHUNK_STALL_SEC", 45.0)
-        for job_id, job in _active_cluster_jobs.items():
+        for job_id, job in sorted_jobs:
             if target_job_id is not None and job_id != target_job_id:
                 continue
             if job.get("cancelled"):
@@ -549,6 +561,153 @@ def get_chunk_raw_path(job_id: int, chunk_idx: int) -> Optional[str]:
         if not chunk:
             return None
         return chunk.get("raw_path")
+
+def signal_slot_free(worker_id: str, slot_id: int = 0, node_name: Optional[str] = None, exclude_chunks: Optional[List[Any]] = None) -> Dict[str, Any]:
+    """
+    Called when a GPU worker slot (either on Main or Helper) becomes free.
+    Signals availability, updates worker telemetry to idle, and immediately claims the
+    highest-priority available chunk from the Chunk Priority Queue.
+    """
+    database.heartbeat_cluster_worker(worker_id, {
+        "status": "idle",
+        "current_job_id": 0,
+        "current_chunk_idx": -1,
+        "current_progress": 0.0,
+        "current_fps": 0.0,
+        "current_speed": "--"
+    })
+    return claim_task(worker_id, node_name=node_name, exclude_chunks=exclude_chunks)
+
+def report_chunk_progress(worker_id: str, job_id: int, chunk_idx: int, progress_pct: float, fps: float = 0.0, speed: str = "--") -> Dict[str, Any]:
+    """
+    Processes high-frequency live chunk progress updates from GPU managers.
+    Updates in-memory cluster job state instantly for smooth Gradio UI updates,
+    extends the active chunk lease, and updates worker state in the database.
+    """
+    with _cluster_lock:
+        now = time.time()
+        abort_chunk = False
+        extend_lease = True
+
+        if job_id in _active_cluster_jobs:
+            job = _active_cluster_jobs[job_id]
+            chunks = job.get("chunks", {})
+            if chunk_idx in chunks:
+                chunk = chunks[chunk_idx]
+                if chunk.get("status") == "done" and chunk.get("worker_id") != worker_id:
+                    return {"status": "aborted", "extend_lease": False, "abort_chunk": True}
+
+                is_primary = (chunk.get("worker_id") == worker_id)
+                is_spec = (chunk.get("speculative_worker_id") == worker_id)
+
+                pct = max(0.0, min(100.0, float(progress_pct)))
+                if pct > float(chunk.get("last_progress_pct", 0.0)):
+                    chunk["last_progress_pct"] = pct
+                    chunk["last_progress_time"] = now
+
+                chunk["pct"] = pct
+                chunk["fps"] = float(fps)
+                chunk["speed"] = str(speed)
+
+                lease_sec = getattr(config, "CHUNK_LEASE_TIMEOUT_SEC", 300.0)
+                if is_primary:
+                    chunk["leased_until"] = now + lease_sec
+                elif is_spec:
+                    chunk["speculative_until"] = now + 90.0
+
+        database.heartbeat_cluster_worker(worker_id, {
+            "job_id": job_id,
+            "chunk_idx": chunk_idx,
+            "pct": float(progress_pct),
+            "fps": float(fps),
+            "speed": str(speed),
+            "status": "encoding"
+        })
+
+    return {"status": "updated", "extend_lease": extend_lease, "abort_chunk": abort_chunk}
+
+def reconcile_unfinished_jobs_on_startup() -> List[int]:
+    """
+    Scans for interrupted jobs in refine_queue that were left in 'refining' or 'assembling'
+    status when coordinator restarted.
+    Reconstructs their chunk state from Drive/disk, marks finished chunks as 'done',
+    registers them with Priority 1 in ChunkPriorityQueue, and resumes processing.
+    """
+    reconciled_ids: List[int] = []
+    with _cluster_lock:
+        try:
+            with database._db_lock:
+                conn = database._get_connection()
+                try:
+                    cur = conn.cursor()
+                    cur.execute("""
+                        SELECT * FROM refine_queue 
+                        WHERE status IN ('refining', 'assembling')
+                        ORDER BY order_idx ASC, id ASC
+                    """)
+                    rows = [dict(r) for r in cur.fetchall()]
+                finally:
+                    conn.close()
+        except Exception as e:
+            logger.warn("CLUSTER", f"Could not query interrupted jobs: {e}")
+            return []
+
+        for row in rows:
+            job_id = int(row["id"])
+            title = row["title"]
+            raw_drive_path = row["raw_drive_path"]
+            raw_cfg = row.get("refining_config")
+            cfg = json.loads(raw_cfg) if isinstance(raw_cfg, str) and raw_cfg else (raw_cfg or {})
+
+            possible_chunk_dirs = [
+                os.path.join(getattr(config, "CHUNKS_STAGING_DIR", os.path.join(config.DOWNLOADER_DIR, "staging", "chunks")), f"job_{job_id}"),
+                os.path.join(getattr(config, "LOCAL_CHUNKS_DIR", os.path.join(config.LOCAL_WORKSPACE, "chunks")), f"job_{job_id}")
+            ]
+            chunks_dir = possible_chunk_dirs[0]
+            for cd in possible_chunk_dirs:
+                if os.path.exists(cd) and os.path.isdir(cd):
+                    chunks_dir = cd
+                    break
+
+            raw_chunk_files = sorted(glob.glob(os.path.join(chunks_dir, "seg_*.mkv")))
+
+            chunks_dict = {}
+            if raw_chunk_files:
+                for idx, rcp in enumerate(raw_chunk_files):
+                    base = os.path.splitext(os.path.basename(rcp))[0]
+                    out_path = os.path.join(chunks_dir, f"enc_{base}.mkv")
+                    is_done = os.path.exists(out_path) and os.path.getsize(out_path) > 0
+                    chunks_dict[idx] = {
+                        "raw_path": rcp,
+                        "out_path": out_path,
+                        "dur_sec": float(cfg.get("chunk_duration", 240.0)),
+                        "status": "done" if is_done else "pending",
+                        "worker_id": "resumed_cached" if is_done else None,
+                        "leased_until": 0.0,
+                        "pct": 100.0 if is_done else 0.0,
+                        "fps": 0.0,
+                        "speed": "--"
+                    }
+
+            job_info = {
+                "job_id": job_id,
+                "title": title,
+                "priority": 1,
+                "order_idx": int(row.get("order_idx", 0)),
+                "chunks_dir": chunks_dir,
+                "raw_path": raw_drive_path,
+                "chunks": chunks_dict,
+                "refining_config": cfg,
+                "cancelled": False
+            }
+            _active_cluster_jobs[job_id] = job_info
+            reconciled_ids.append(job_id)
+
+            done_cnt = sum(1 for c in chunks_dict.values() if c.get("status") == "done")
+            total_cnt = len(chunks_dict)
+            logger.notify("REFINER", f"🔄 [Recovery] Resumed interrupted Job #{job_id} ('{title}') with {done_cnt}/{total_cnt} chunks completed.")
+
+    return reconciled_ids
 
 def reclaim_stale_chunks():
     """Scans all active cluster jobs and automatically returns abandoned chunks to 'pending'."""

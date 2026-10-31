@@ -177,16 +177,24 @@ def _get_gemini_api_key() -> Optional[str]:
         pass
     return None
 
+_classification_cache: Dict[str, Dict[str, Any]] = {}
+
 def classify_media(title_or_filename: str) -> Dict[str, Any]:
     """
     Primary Media Classifier.
     Attempts classification with Gemini Model (free tier) if key is present;
     otherwise falls back to deterministic heuristic regex engine.
+    Results are cached in-memory for instant sub-microsecond subsequent lookups.
     """
+    norm_key = (title_or_filename or "").strip().lower()
+    if norm_key in _classification_cache:
+        return dict(_classification_cache[norm_key])
+
     fallback_result = heuristic_classify(title_or_filename)
     api_key = _get_gemini_api_key()
 
     if not api_key:
+        _classification_cache[norm_key] = fallback_result
         return fallback_result
 
     # Try Gemini API call
@@ -232,7 +240,7 @@ def classify_media(title_or_filename: str) -> Dict[str, Any]:
                 else:
                     year_val = fallback_result["year"]
 
-                return {
+                final_res = {
                     "type": parsed.get("type", fallback_result["type"]).lower(),
                     "show_name": parsed.get("show_name", fallback_result["show_name"]),
                     "season": int(parsed.get("season", fallback_result["season"]) or 0),
@@ -241,7 +249,10 @@ def classify_media(title_or_filename: str) -> Dict[str, Any]:
                     "title": parsed.get("title", fallback_result["title"]),
                     "formatted_name": parsed.get("formatted_name", fallback_result["formatted_name"])
                 }
+                _classification_cache[norm_key] = final_res
+                return final_res
     except Exception as e:
         print(f"[Classifier] Gemini API call skipped ({e}). Used heuristic.")
 
+    _classification_cache[norm_key] = fallback_result
     return fallback_result

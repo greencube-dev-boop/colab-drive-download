@@ -69,6 +69,38 @@ def mount_cluster_api(fastapi_app):
         res = cluster_manager.heartbeat_worker(wid, data)
         return JSONResponse(content=res)
 
+    @fastapi_app.post("/api/cluster/signal_free")
+    @fastapi_app.post("/api/cluster/signal_free/")
+    async def api_signal_free(request: Request):
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        wid = data.get("worker_id", "")
+        slot_id = int(data.get("slot_id", 0))
+        node_name = data.get("node_name", "")
+        exclude_chunks = data.get("exclude_chunks", [])
+        if isinstance(exclude_chunks, str):
+            exclude_chunks = [x.strip() for x in exclude_chunks.split(",") if x.strip()]
+        res = cluster_manager.signal_slot_free(wid, slot_id=slot_id, node_name=node_name, exclude_chunks=exclude_chunks)
+        return JSONResponse(content=res)
+
+    @fastapi_app.post("/api/cluster/chunk_progress")
+    @fastapi_app.post("/api/cluster/chunk_progress/")
+    async def api_chunk_progress(request: Request):
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        wid = data.get("worker_id", "")
+        job_id = int(data.get("job_id", 0))
+        chunk_idx = int(data.get("chunk_idx", -1))
+        pct = float(data.get("pct", 0.0))
+        fps = float(data.get("fps", 0.0))
+        speed = str(data.get("speed", "--"))
+        res = cluster_manager.report_chunk_progress(wid, job_id, chunk_idx, pct, fps=fps, speed=speed)
+        return JSONResponse(content=res)
+
     @fastapi_app.get("/api/cluster/claim_task")
     @fastapi_app.get("/api/cluster/claim_task/")
     async def api_claim_task(worker_id: str = "", node_name: str = "", exclude_chunks: str = ""):
