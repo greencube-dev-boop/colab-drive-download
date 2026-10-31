@@ -43,6 +43,23 @@ def is_nvenc_available() -> bool:
     except Exception:
         return False
 
+def bust_fuse_path(file_path: str) -> None:
+    """Traverses from Drive root down to file_path calling os.listdir to populate FUSE directory cache."""
+    try:
+        parts = []
+        cur = os.path.dirname(file_path)
+        while cur and cur != os.path.dirname(cur):
+            parts.append(cur)
+            cur = os.path.dirname(cur)
+        for p in reversed(parts):
+            if os.path.isdir(p):
+                try:
+                    os.listdir(p)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
 class HelperWorker:
     """
     Autonomous GPU Refiner Worker node running inside a Colab helper notebook.
@@ -356,7 +373,12 @@ class HelperWorker:
 
     def claim_task(self) -> Optional[Dict[str, Any]]:
         """Polls Main for next available chunk assignment."""
-        endpoint = f"/api/cluster/claim_task?worker_id={self.worker_id}&node_name={urllib.parse.quote(self.node_name)}"
+        now = time.time()
+        active_cooldowns = [
+            f"{j}:{c}" for (j, c), exp in self.failed_chunks_cooldown.items() if now < exp
+        ]
+        cooldown_param = f"&exclude_chunks={','.join(active_cooldowns)}" if active_cooldowns else ""
+        endpoint = f"/api/cluster/claim_task?worker_id={self.worker_id}&node_name={urllib.parse.quote(self.node_name)}{cooldown_param}"
         res = self._http_request(endpoint)
         if res and res.get("has_task"):
             j_id = res.get("job_id", 0)
@@ -365,6 +387,7 @@ class HelperWorker:
             cooldown_until = self.failed_chunks_cooldown.get((j_id, c_idx), 0.0)
             if time.time() < cooldown_until:
                 self.release_task(j_id, c_idx)
+                time.sleep(2.0)
                 return None
             logger.notify("HELPER", f"📥 Claimed Chunk #{res.get('chunk_idx', 0) + 1}/{res.get('total_chunks')} of Job #{res.get('job_id')} ('{res.get('title', 'Job')}')")
             return res
@@ -399,9 +422,14 @@ class HelperWorker:
         if not self.master_url:
             return False
         url = f"{self.master_url.rstrip('/')}{endpoint}"
-        req = urllib.request.Request(url, headers={"User-Agent": f"ColabGPUHelper/{self.worker_id}"})
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "*/*",
+            "X-Worker-ID": self.worker_id
+        }
+        req = urllib.request.Request(url, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=45) as resp:
+            with urllib.request.urlopen(req, timeout=120) as resp:
                 if resp.status != 200:
                     return False
                 with open(target_local_path, "wb") as out_f:
@@ -433,19 +461,24 @@ class HelperWorker:
                 except Exception:
                     pass
 
-        # 1. Fetch raw segment: Try Google Drive first (with retry/cache invalidation), fallback to direct HTTP stream
+        # 1. Fetch raw segment: Try Google Drive first (with deep cache invalidation), fallback to direct HTTP stream
         found_on_drive = False
+        candidate_paths = [raw_drive_chunk]
+        # Also check with local config.DOWNLOADER_DIR if different from coordinator's base path
+        chunk_fname = os.path.basename(raw_drive_chunk)
+        local_cand = os.path.join(getattr(config, "CHUNKS_STAGING_DIR", os.path.join(config.DOWNLOADER_DIR, "staging", "chunks")), f"job_{job_id}", chunk_fname)
+        if local_cand not in candidate_paths:
+            candidate_paths.append(local_cand)
+
         for attempt in range(4):
-            if os.path.exists(raw_drive_chunk) and os.path.getsize(raw_drive_chunk) > 0:
-                found_on_drive = True
+            for cand in candidate_paths:
+                bust_fuse_path(cand)
+                if os.path.exists(cand) and os.path.getsize(cand) > 0:
+                    raw_drive_chunk = cand
+                    found_on_drive = True
+                    break
+            if found_on_drive:
                 break
-            # Force Colab FUSE directory cache refresh by re-listing parent directory
-            try:
-                p_dir = os.path.dirname(raw_drive_chunk)
-                if os.path.exists(p_dir):
-                    os.listdir(p_dir)
-            except Exception:
-                pass
             time.sleep(1.0)
 
         if found_on_drive:

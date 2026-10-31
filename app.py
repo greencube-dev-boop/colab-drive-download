@@ -39,6 +39,95 @@ from config import tasks, tasks_lock
 import database
 from pipeline import ensure_daemons_running
 import logger
+import cluster_manager
+import os
+from fastapi import Request
+from fastapi.responses import JSONResponse, FileResponse
+
+def mount_cluster_api(fastapi_app):
+    if fastapi_app is None:
+        return
+
+    @fastapi_app.post("/api/cluster/register")
+    @fastapi_app.post("/api/cluster/register/")
+    async def api_register_worker(request: Request):
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        res = cluster_manager.register_worker(data)
+        return JSONResponse(content=res)
+
+    @fastapi_app.post("/api/cluster/heartbeat")
+    @fastapi_app.post("/api/cluster/heartbeat/")
+    async def api_heartbeat_worker(request: Request):
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        wid = data.get("worker_id", "")
+        res = cluster_manager.heartbeat_worker(wid, data)
+        return JSONResponse(content=res)
+
+    @fastapi_app.get("/api/cluster/claim_task")
+    @fastapi_app.get("/api/cluster/claim_task/")
+    async def api_claim_task(worker_id: str = "", node_name: str = "", exclude_chunks: str = ""):
+        exclude_list = [x.strip() for x in exclude_chunks.split(",") if x.strip()]
+        res = cluster_manager.claim_task(worker_id, node_name=node_name, exclude_chunks=exclude_list)
+        return JSONResponse(content=res)
+
+    @fastapi_app.post("/api/cluster/complete_task")
+    @fastapi_app.post("/api/cluster/complete_task/")
+    async def api_complete_task(request: Request):
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        wid = data.get("worker_id", "")
+        job_id = int(data.get("job_id", 0))
+        chunk_idx = int(data.get("chunk_idx", -1))
+        out_chunk_path = data.get("out_chunk_path", "")
+        fsize = float(data.get("file_size_mb", 0.0))
+        res = cluster_manager.complete_task(wid, job_id, chunk_idx, out_chunk_path, fsize)
+        return JSONResponse(content=res)
+
+    @fastapi_app.post("/api/cluster/release_task")
+    @fastapi_app.post("/api/cluster/release_task/")
+    async def api_release_task(request: Request):
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        wid = data.get("worker_id", "")
+        job_id = int(data.get("job_id", 0))
+        chunk_idx = int(data.get("chunk_idx", -1))
+        res = cluster_manager.release_task(wid, job_id, chunk_idx)
+        return JSONResponse(content=res)
+
+    @fastapi_app.get("/api/cluster/chunk/{job_id}/{chunk_idx}")
+    async def api_get_chunk(job_id: int, chunk_idx: int):
+        try:
+            chunk_path = cluster_manager.get_chunk_raw_path(job_id, chunk_idx)
+            if not chunk_path or not os.path.exists(chunk_path):
+                return JSONResponse(status_code=404, content={"error": f"Chunk #{chunk_idx} of Job #{job_id} not found on disk"})
+            fsize = os.path.getsize(chunk_path)
+            if fsize == 0:
+                return JSONResponse(status_code=404, content={"error": f"Chunk #{chunk_idx} of Job #{job_id} is 0 bytes"})
+
+            return FileResponse(
+                path=chunk_path,
+                media_type="video/x-matroska",
+                filename=os.path.basename(chunk_path)
+            )
+        except Exception as e:
+            logger.error("CLUSTER", f"Error streaming chunk #{chunk_idx} of Job #{job_id}: {e}")
+            return JSONResponse(status_code=500, content={"error": str(e)})
+
+    @fastapi_app.get("/api/cluster/status")
+    @fastapi_app.get("/api/cluster/status/")
+    async def api_cluster_status():
+        status = cluster_manager.get_cluster_status()
+        return JSONResponse(content=status)
 
 def main(enable_debug_logs: bool = True):
     parser = argparse.ArgumentParser(description="Two-Stage Google Drive Downloader & GPU Refiner")
@@ -64,107 +153,8 @@ def main(enable_debug_logs: bool = True):
     ensure_daemons_running()
     demo = create_ui()
 
-    # Mount Distributed GPU Cluster REST API endpoints on Gradio's underlying FastAPI app
-    import cluster_manager
-    from fastapi import Request
-    from fastapi.responses import JSONResponse
-
     cluster_manager.reset_cluster_on_startup()
     cluster_manager.start_cluster_daemon()
-
-    def mount_cluster_api(fastapi_app):
-        if fastapi_app is None:
-            return
-
-        @fastapi_app.post("/api/cluster/register")
-        @fastapi_app.post("/api/cluster/register/")
-        async def api_register_worker(request: Request):
-            try:
-                data = await request.json()
-            except Exception:
-                data = {}
-            res = cluster_manager.register_worker(data)
-            return JSONResponse(content=res)
-
-        @fastapi_app.post("/api/cluster/heartbeat")
-        @fastapi_app.post("/api/cluster/heartbeat/")
-        async def api_heartbeat_worker(request: Request):
-            try:
-                data = await request.json()
-            except Exception:
-                data = {}
-            wid = data.get("worker_id", "")
-            res = cluster_manager.heartbeat_worker(wid, data)
-            return JSONResponse(content=res)
-
-        @fastapi_app.get("/api/cluster/claim_task")
-        @fastapi_app.get("/api/cluster/claim_task/")
-        async def api_claim_task(worker_id: str = "", node_name: str = ""):
-            res = cluster_manager.claim_task(worker_id, node_name=node_name)
-            return JSONResponse(content=res)
-
-        @fastapi_app.post("/api/cluster/complete_task")
-        @fastapi_app.post("/api/cluster/complete_task/")
-        async def api_complete_task(request: Request):
-            try:
-                data = await request.json()
-            except Exception:
-                data = {}
-            wid = data.get("worker_id", "")
-            job_id = int(data.get("job_id", 0))
-            chunk_idx = int(data.get("chunk_idx", -1))
-            out_chunk_path = data.get("out_chunk_path", "")
-            fsize = float(data.get("file_size_mb", 0.0))
-            res = cluster_manager.complete_task(wid, job_id, chunk_idx, out_chunk_path, fsize)
-            return JSONResponse(content=res)
-
-        @fastapi_app.post("/api/cluster/release_task")
-        @fastapi_app.post("/api/cluster/release_task/")
-        async def api_release_task(request: Request):
-            try:
-                data = await request.json()
-            except Exception:
-                data = {}
-            wid = data.get("worker_id", "")
-            job_id = int(data.get("job_id", 0))
-            chunk_idx = int(data.get("chunk_idx", -1))
-            res = cluster_manager.release_task(wid, job_id, chunk_idx)
-            return JSONResponse(content=res)
-
-        @fastapi_app.get("/api/cluster/chunk/{job_id}/{chunk_idx}")
-        async def api_get_chunk(job_id: int, chunk_idx: int):
-            try:
-                chunk_path = cluster_manager.get_chunk_raw_path(job_id, chunk_idx)
-                if not chunk_path or not os.path.exists(chunk_path):
-                    return JSONResponse(status_code=404, content={"error": f"Chunk #{chunk_idx} of Job #{job_id} not found on disk"})
-                fsize = os.path.getsize(chunk_path)
-                if fsize == 0:
-                    return JSONResponse(status_code=404, content={"error": f"Chunk #{chunk_idx} of Job #{job_id} is 0 bytes"})
-
-                from fastapi.responses import StreamingResponse
-
-                def iterfile():
-                    with open(chunk_path, "rb") as f:
-                        while chunk := f.read(1024 * 1024):
-                            yield chunk
-
-                headers = {
-                    "Content-Length": str(fsize),
-                    "Content-Disposition": f'attachment; filename="{os.path.basename(chunk_path)}"',
-                    "Accept-Ranges": "bytes"
-                }
-                return StreamingResponse(iterfile(), media_type="video/x-matroska", headers=headers)
-            except Exception as e:
-                import logger
-                logger.error("CLUSTER", f"Error streaming chunk #{chunk_idx} of Job #{job_id}: {e}")
-                return JSONResponse(status_code=500, content={"error": str(e)})
-
-        @fastapi_app.get("/api/cluster/status")
-        @fastapi_app.get("/api/cluster/status/")
-        async def api_cluster_status():
-            status = cluster_manager.get_cluster_status()
-            return JSONResponse(content=status)
-
     mount_cluster_api(getattr(demo, "app", None))
 
     print(f"\n🌐 Launching Web Interface on port {args.port} (share={args.share})...")

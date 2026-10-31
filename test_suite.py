@@ -1741,5 +1741,77 @@ class TestTwoStagePipeline(unittest.TestCase):
         self.assertEqual(matched["status"], "assembling")
         database.cancel_queue_item("refine_queue", job_id)
 
+    def test_claim_task_exclude_chunks(self):
+        import cluster_manager
+        job_id = 999
+        job_info = {
+            "job_id": job_id,
+            "title": "Exclude Chunk Test Video",
+            "chunks": {
+                0: {"raw_path": "seg_000.mkv", "out_path": "enc_seg_000.mkv", "status": "pending", "leased_until": 0.0},
+                1: {"raw_path": "seg_001.mkv", "out_path": "enc_seg_001.mkv", "status": "pending", "leased_until": 0.0}
+            }
+        }
+        cluster_manager.register_cluster_job(job_id, job_info)
+
+        # Worker excludes chunk 0: should claim chunk 1
+        task = cluster_manager.claim_task("worker_ex_1", exclude_chunks=[(job_id, 0)])
+        self.assertTrue(task["has_task"])
+        self.assertEqual(task["chunk_idx"], 1)
+
+        # Worker excludes chunk 0 and 1: should receive has_task = False
+        task2 = cluster_manager.claim_task("worker_ex_2", exclude_chunks=[(job_id, 0), (job_id, 1)])
+        self.assertFalse(task2["has_task"])
+
+        # Clean up
+        cluster_manager.unregister_cluster_job(job_id)
+
+    def test_api_get_chunk_file_response(self):
+        import cluster_manager
+        from starlette.responses import FileResponse, JSONResponse
+        import asyncio
+
+        # Create dummy chunk
+        chunk_file = os.path.join(self.test_dir, "test_chunk.mkv")
+        with open(chunk_file, "wb") as f:
+            f.write(b"\x00" * 1024)
+
+        job_id = 1234
+        job_info = {
+            "job_id": job_id,
+            "title": "API Chunk Stream Test",
+            "chunks": {
+                0: {"raw_path": chunk_file, "out_path": "enc_0.mkv", "status": "pending", "leased_until": 0.0}
+            }
+        }
+        cluster_manager.register_cluster_job(job_id, job_info)
+
+        # Build mock fastapi app with route
+        from fastapi import FastAPI
+        app = FastAPI()
+        from app import mount_cluster_api
+        mount_cluster_api(app)
+
+        # Find the route handler
+        route_handler = None
+        for r in app.routes:
+            if hasattr(r, "path") and r.path == "/api/cluster/chunk/{job_id}/{chunk_idx}":
+                route_handler = r.endpoint
+                break
+        self.assertIsNotNone(route_handler)
+
+        # Test valid chunk retrieval -> returns FileResponse
+        resp = asyncio.run(route_handler(job_id=job_id, chunk_idx=0))
+        self.assertIsInstance(resp, FileResponse)
+        self.assertEqual(resp.path, chunk_file)
+        self.assertEqual(resp.media_type, "video/x-matroska")
+
+        # Test missing chunk -> returns 404 JSONResponse
+        resp_404 = asyncio.run(route_handler(job_id=job_id, chunk_idx=99))
+        self.assertIsInstance(resp_404, JSONResponse)
+        self.assertEqual(resp_404.status_code, 404)
+
+        cluster_manager.unregister_cluster_job(job_id)
+
 if __name__ == "__main__":
     unittest.main()

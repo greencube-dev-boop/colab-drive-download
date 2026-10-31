@@ -36,11 +36,19 @@ def _check_is_downloader_dir(candidate_dir: str) -> bool:
                     cluster_entries = [e.lower() for e in os.listdir(cluster_p)]
                 except Exception:
                     cluster_entries = []
-                if "master.json" in cluster_entries:
+                if "master.json" in cluster_entries or "workers" in cluster_entries:
                     return True
 
-        # 2. Check for typical project markers (notebooks or raw/refined directories)
-        if any(e.endswith(".ipynb") for e in entries) and any(d in entries for d in ["raw", "refined", "data"]):
+        # 2. Check for staging/chunks markers
+        if "staging" in entries and os.path.isdir(os.path.join(candidate_dir, "staging")):
+            return True
+
+        # 3. Check for typical media subfolders (raw, refined)
+        if any(k in entries for k in ["raw", "refined"]):
+            return True
+
+        # 4. Check for typical project markers (notebooks)
+        if any(e.endswith(".ipynb") for e in entries):
             return True
 
         return False
@@ -90,7 +98,7 @@ def resolve_downloader_dir() -> str:
             # 3b. Second pass: look for exact canonical folder name (case-insensitive)
             for entry in entries:
                 norm_name = re.sub(r'[\s\-_]+', ' ', entry.strip()).lower()
-                if norm_name == "colab drive download":
+                if norm_name in ["downloader", "colab drive download"]:
                     full_p = os.path.join(mydrive, entry)
                     if os.path.isdir(full_p):
                         return full_p
@@ -107,13 +115,15 @@ def resolve_downloader_dir() -> str:
                 if os.path.isdir(full_p) and _check_is_downloader_dir(full_p):
                     return full_p
                 norm_name = re.sub(r'[\s\-_]+', ' ', entry.strip()).lower()
-                if norm_name == "colab drive download":
+                if norm_name in ["downloader", "colab drive download"]:
                     if os.path.isdir(full_p):
                         return full_p
         except Exception:
             pass
 
     # Canonical default path in Google Drive
+    if os.path.isdir("/content/drive/MyDrive/downloader"):
+        return "/content/drive/MyDrive/downloader"
     canonical_dir = "/content/drive/MyDrive/colab drive download"
     return canonical_dir
 

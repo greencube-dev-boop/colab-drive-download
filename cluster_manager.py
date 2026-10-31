@@ -313,7 +313,7 @@ def get_cluster_job(job_id: int) -> Optional[Dict[str, Any]]:
     with _cluster_lock:
         return _active_cluster_jobs.get(job_id)
 
-def claim_task(worker_id: str, node_name: Optional[str] = None, target_job_id: Optional[int] = None) -> Dict[str, Any]:
+def claim_task(worker_id: str, node_name: Optional[str] = None, target_job_id: Optional[int] = None, exclude_chunks: Optional[List[Any]] = None) -> Dict[str, Any]:
     """
     Leases the next available video chunk to an idle GPU worker node.
     Prioritizes pending chunks, or expired leased chunks needing recovery.
@@ -323,6 +323,14 @@ def claim_task(worker_id: str, node_name: Optional[str] = None, target_job_id: O
     with _cluster_lock:
         now = time.time()
         lease_sec = getattr(config, "CHUNK_LEASE_TIMEOUT_SEC", 300.0)
+
+        exclude_set = set()
+        if exclude_chunks:
+            for x in exclude_chunks:
+                if isinstance(x, (tuple, list)) and len(x) == 2:
+                    exclude_set.add(f"{x[0]}:{x[1]}")
+                else:
+                    exclude_set.add(str(x))
 
         # -------------------------------------------------------------
         # PASS 1: Pending chunks or expired primary leases across all jobs
@@ -339,6 +347,8 @@ def claim_task(worker_id: str, node_name: Optional[str] = None, target_job_id: O
             effective_lease_sec = 60.0 if unfinished_count <= 2 else lease_sec
 
             for c_idx in sorted(chunks.keys()):
+                if exclude_set and f"{job_id}:{c_idx}" in exclude_set:
+                    continue
                 c = chunks[c_idx]
                 is_pending = (c["status"] == "pending")
                 is_expired = (c["status"] == "leased" and now > c.get("leased_until", 0.0))
@@ -395,6 +405,8 @@ def claim_task(worker_id: str, node_name: Optional[str] = None, target_job_id: O
 
             chunks = job.get("chunks", {})
             for c_idx in sorted(chunks.keys()):
+                if exclude_set and f"{job_id}:{c_idx}" in exclude_set:
+                    continue
                 c = chunks[c_idx]
                 if c.get("status") != "leased":
                     continue
