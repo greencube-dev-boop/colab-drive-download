@@ -293,7 +293,7 @@ def render_refine_queue_html() -> str:
     with _refine_lock:
         active_mem = dict(_active_refine_tasks)
 
-    active_jobs = [it for it in db_items if it.get("status") == "refining"]
+    active_jobs = [it for it in db_items if it.get("status") in ["refining", "assembling"]]
     pending_jobs = [it for it in db_items if it.get("status") == "pending"]
     # Invert history order so nearest/most recent is at the top
     history_jobs = sorted([it for it in db_items if it.get("status") in ["completed", "failed", "cancelled"]], key=lambda x: x.get("id", 0), reverse=True)
@@ -391,8 +391,8 @@ def render_refine_queue_html() -> str:
                         </span>
                     </div>
                     <div style="display: flex; align-items: center; gap: 8px;">
-                        <span style="background: #38234a; color: #cba6f7; border: 1px solid #cba6f7; font-weight: 600; font-size: 11px; padding: 2px 10px; border-radius: 12px;">
-                            Refining
+                        <span style="background: {'rgba(137, 180, 250, 0.2)' if job.get('status') == 'assembling' else '#38234a'}; color: {'#89b4fa' if job.get('status') == 'assembling' else '#cba6f7'}; border: 1px solid {'#89b4fa' if job.get('status') == 'assembling' else '#cba6f7'}; font-weight: 600; font-size: 11px; padding: 2px 10px; border-radius: 12px;">
+                            {'🧩 Assembling (CPU)' if job.get('status') == 'assembling' else '⚡ Transcoding (GPU)'}
                         </span>
                         <button onclick="window.cancelTask('refine_queue', {j_id})" title="Cancel and abort" style="background: rgba(243, 139, 168, 0.15); color: #f38ba8; border: 1px solid rgba(243, 139, 168, 0.4); font-weight: 600; font-size: 11px; padding: 3px 8px; border-radius: 6px; cursor: pointer;">
                             ✕ Cancel

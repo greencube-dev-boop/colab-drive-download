@@ -61,7 +61,21 @@ class HelperWorker:
         self.active_slots: Dict[int, Optional[Dict[str, Any]]] = {0: None, 1: None}
         self.active_slots_lock = threading.Lock()
         self.failed_chunks_cooldown: Dict[Any, float] = {}
-        self.local_temp_dir = os.path.join(getattr(config, "LOCAL_WORKSPACE", "/content/temp"), "helper_work")
+        # High-throughput RAM-disk staging: use /dev/shm if available and has >= 500 MB free space
+        shm_path = "/dev/shm"
+        self.using_ram_disk = False
+        if os.path.exists(shm_path) and os.path.isdir(shm_path):
+            try:
+                stat = shutil.disk_usage(shm_path)
+                if stat.free >= 500 * 1024 * 1024:
+                    self.local_temp_dir = os.path.join(shm_path, "helper_work")
+                    self.using_ram_disk = True
+                else:
+                    self.local_temp_dir = os.path.join(getattr(config, "LOCAL_WORKSPACE", "/content/temp"), "helper_work")
+            except Exception:
+                self.local_temp_dir = os.path.join(getattr(config, "LOCAL_WORKSPACE", "/content/temp"), "helper_work")
+        else:
+            self.local_temp_dir = os.path.join(getattr(config, "LOCAL_WORKSPACE", "/content/temp"), "helper_work")
         os.makedirs(self.local_temp_dir, exist_ok=True)
 
     def discover_master_url(self) -> Optional[str]:
@@ -270,17 +284,17 @@ class HelperWorker:
         self.announce_to_drive(status="idle")
         return True
 
-    def send_heartbeat(self, metrics: Optional[Dict[str, Any]] = None) -> bool:
+    def send_heartbeat(self, metrics: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Sends live progress and heartbeat to Main."""
         payload = metrics or {}
         payload["worker_id"] = self.worker_id
-        res = self._http_request("/api/cluster/heartbeat", payload)
+        res = self._http_request("/api/cluster/heartbeat", payload) or {}
         st = payload.get("status", "idle")
         self.check_and_restore_announcer(status=st)
         self.announce_to_drive(status=st)
         if payload.get("status") == "encoding":
             logger.debug("HELPER", f"💓 Heartbeat: Chunk #{payload.get('chunk_idx')} ({payload.get('pct', 0.0):.1f}%) @ {payload.get('fps', 0)} fps")
-        return bool(res and res.get("status") == "ok")
+        return res
 
     def claim_task(self) -> Optional[Dict[str, Any]]:
         """Polls Main for next available chunk assignment."""
@@ -309,7 +323,7 @@ class HelperWorker:
         }
         res = self._http_request("/api/cluster/complete_task", payload)
         logger.debug("HELPER", f"📤 Notified Main coordinator of chunk #{chunk_idx} completion (Job #{job_id}).")
-        return bool(res and res.get("status") == "accepted")
+        return bool(res and res.get("status") in ["accepted", "already_done"])
 
     def release_task(self, job_id: int, chunk_idx: int) -> bool:
         """Notifies coordinator to release a claimed chunk back to pending status for retry."""
@@ -463,7 +477,7 @@ class HelperWorker:
                         pass
                     now = time.time()
                     if (now - last_hb_time) >= 10.0:
-                        self.send_heartbeat({
+                        hb_res = self.send_heartbeat({
                             "job_id": job_id,
                             "chunk_idx": chunk_idx,
                             "pct": curr_pct,
@@ -471,6 +485,20 @@ class HelperWorker:
                             "speed": curr_speed,
                             "status": "encoding"
                         })
+                        if isinstance(hb_res, dict) and hb_res.get("abort_chunk"):
+                            logger.notify("HELPER", f"🛑 [Slot {slot_id}] Chunk #{chunk_idx + 1} aborted by coordinator (winner completed). Freeing slot...")
+                            proc.terminate()
+                            try:
+                                proc.wait(timeout=2.0)
+                            except Exception:
+                                proc.kill()
+                            for f in (local_raw, local_out):
+                                try:
+                                    if os.path.exists(f):
+                                        os.remove(f)
+                                except Exception:
+                                    pass
+                            return True
                         logger.debug("HELPER", f"⚡ [Slot {slot_id}] Chunk #{chunk_idx + 1} progress: {curr_pct:.1f}% @ {curr_fps:.0f} fps | Speed: {curr_speed}")
                         last_hb_time = now
                 elif line == "progress=end":

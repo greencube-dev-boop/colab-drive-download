@@ -177,7 +177,8 @@ LOCAL_CLUSTER_MASTER_FILE = os.path.join(LOCAL_CLUSTER_DIR, "master.json")
 CHUNK_DURATION_SEC = 240.0         # 4 minutes per keyframe segment (optimal balance of fault tolerance & low Drive FUSE I/O)
 CHUNK_LEASE_TIMEOUT_SEC = 300.0    # 5 minutes lease duration (prevents false abandonments during 4-min chunk transcodes)
 WORKER_HEARTBEAT_TIMEOUT_SEC = 15.0 # Mark worker offline and delete if no heartbeat for 15s
-MAX_ACTIVE_CLUSTER_JOBS = 2        # Continuous pipeline: pre-buffers next job's chunks so GPU workers never sit idle
+MAX_ACTIVE_CLUSTER_JOBS = 4        # Dynamic continuous pipeline: pre-buffers up to 4 jobs when cluster slots demand work
+SPECULATIVE_CHUNK_STALL_SEC = 45.0 # Seconds of 0% progress stall before a chunk is eligible for speculative parallel execution
 
 # Verbose Logging & Debug Notifications Toggle
 DEBUG_LOGS: bool = (os.environ.get("ENABLE_DEBUG_LOGS", "1") != "0")

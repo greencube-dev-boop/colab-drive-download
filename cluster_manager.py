@@ -235,17 +235,35 @@ def heartbeat_worker(worker_id: str, metrics: Optional[Dict[str, Any]] = None) -
             job = _active_cluster_jobs[job_id]
             if c_idx in job["chunks"]:
                 chunk = job["chunks"][c_idx]
-                if chunk.get("worker_id") == worker_id:
-                    # Extend chunk lease
+
+                # Check if chunk was already completed by another worker (e.g. winner of speculative race)
+                if chunk.get("status") == "done" and chunk.get("worker_id") != worker_id:
+                    return {"status": "ok", "extend_lease": False, "abort_chunk": True}
+
+                is_primary = (chunk.get("worker_id") == worker_id)
+                is_speculative = (chunk.get("speculative_worker_id") == worker_id)
+
+                if is_primary or is_speculative:
+                    now = time.time()
                     lease_sec = getattr(config, "CHUNK_LEASE_TIMEOUT_SEC", 90.0)
-                    chunk["leased_until"] = time.time() + lease_sec
-                    chunk["pct"] = float(metrics.get("pct", chunk.get("pct", 0.0)))
+                    if is_primary:
+                        chunk["leased_until"] = now + lease_sec
+                    else:
+                        chunk["speculative_until"] = now + lease_sec
+
+                    new_pct = float(metrics.get("pct", chunk.get("pct", 0.0)))
+                    # Track forward progress
+                    if new_pct > float(chunk.get("last_progress_pct", 0.0)):
+                        chunk["last_progress_pct"] = new_pct
+                        chunk["last_progress_time"] = now
+
+                    chunk["pct"] = new_pct
                     chunk["fps"] = float(metrics.get("fps", 0.0))
                     chunk["speed"] = str(metrics.get("speed", "--"))
 
         database.heartbeat_cluster_worker(worker_id, metrics)
 
-    return {"status": "ok", "extend_lease": True}
+    return {"status": "ok", "extend_lease": True, "abort_chunk": False}
 
 def register_cluster_job(job_id: int, job_info: Dict[str, Any]):
     """Registers a multi-chunk video refining job with the cluster manager."""
@@ -266,12 +284,16 @@ def claim_task(worker_id: str, node_name: Optional[str] = None, target_job_id: O
     """
     Leases the next available video chunk to an idle GPU worker node.
     Prioritizes pending chunks, or expired leased chunks needing recovery.
+    If all chunks are leased, checks for stuck/slow chunks eligible for speculative execution.
     If target_job_id is provided, only leases chunks for that specific job.
     """
     with _cluster_lock:
         now = time.time()
         lease_sec = getattr(config, "CHUNK_LEASE_TIMEOUT_SEC", 300.0)
 
+        # -------------------------------------------------------------
+        # PASS 1: Pending chunks or expired primary leases across all jobs
+        # -------------------------------------------------------------
         for job_id, job in _active_cluster_jobs.items():
             if target_job_id is not None and job_id != target_job_id:
                 continue
@@ -294,6 +316,11 @@ def claim_task(worker_id: str, node_name: Optional[str] = None, target_job_id: O
                     c["worker_id"] = worker_id
                     c["worker_name"] = node_name or worker_id
                     c["leased_until"] = now + effective_lease_sec
+                    c["lease_start"] = now
+                    c["last_progress_pct"] = c.get("pct", 0.0)
+                    c["last_progress_time"] = now
+                    c["speculative_worker_id"] = None
+                    c["speculative_until"] = 0.0
 
                     # Update database worker tracking
                     database.heartbeat_cluster_worker(worker_id, {
@@ -312,6 +339,7 @@ def claim_task(worker_id: str, node_name: Optional[str] = None, target_job_id: O
                         "has_task": True,
                         "job_id": job_id,
                         "chunk_idx": c_idx,
+                        "is_speculative": False,
                         "total_chunks": len(chunks),
                         "title": job.get("title", f"Job #{job_id}"),
                         "raw_chunk_path": c["raw_path"],
@@ -319,6 +347,71 @@ def claim_task(worker_id: str, node_name: Optional[str] = None, target_job_id: O
                         "dur_sec": float(c.get("dur_sec", 240.0)),
                         "refining_config": job.get("refining_config", {}),
                         "lease_seconds": int(effective_lease_sec)
+                    }
+
+        # -------------------------------------------------------------
+        # PASS 2: Speculative Execution for Stragglers / Stuck Chunks
+        # If all chunks are leased and this worker is idle, duplicate a slow/stalled chunk!
+        # -------------------------------------------------------------
+        speculative_timeout = getattr(config, "SPECULATIVE_CHUNK_STALL_SEC", 45.0)
+        for job_id, job in _active_cluster_jobs.items():
+            if target_job_id is not None and job_id != target_job_id:
+                continue
+            if job.get("cancelled"):
+                continue
+
+            chunks = job.get("chunks", {})
+            for c_idx in sorted(chunks.keys()):
+                c = chunks[c_idx]
+                if c.get("status") != "leased":
+                    continue
+                # Do not duplicate to the same worker that already holds the primary lease
+                if c.get("worker_id") == worker_id:
+                    continue
+                # Do not double-speculate if another worker is already speculatively computing it
+                if c.get("speculative_worker_id") is not None and now <= c.get("speculative_until", 0.0):
+                    continue
+
+                lease_start = float(c.get("lease_start") or now)
+                last_prog_time = float(c.get("last_progress_time") or lease_start)
+                lease_duration = now - lease_start
+                time_since_progress = now - last_prog_time
+                dur_sec = float(c.get("dur_sec", 240.0))
+
+                is_stalled = (lease_duration >= speculative_timeout and time_since_progress >= speculative_timeout)
+                is_abnormally_slow = (lease_duration >= (dur_sec * 1.5) and float(c.get("pct", 0.0)) < 70.0)
+
+                if is_stalled or is_abnormally_slow:
+                    c["speculative_worker_id"] = worker_id
+                    c["speculative_worker_name"] = node_name or worker_id
+                    c["speculative_until"] = now + 90.0
+
+                    database.heartbeat_cluster_worker(worker_id, {
+                        "job_id": job_id,
+                        "chunk_idx": c_idx,
+                        "pct": 0.0,
+                        "fps": 0.0,
+                        "speed": "--",
+                        "status": "encoding"
+                    })
+
+                    worker_label = node_name or worker_id
+                    orig_name = c.get("worker_name", c.get("worker_id", "unknown"))
+                    curr_pct = float(c.get("pct", 0.0))
+                    logger.notify("REFINER", f"⚡ [Speculative] Duplicating slow Chunk #{c_idx + 1} of Job #{job_id} onto idle helper '{worker_label}' (Original '{orig_name}' stalled for {int(time_since_progress)}s at {curr_pct:.1f}%)...")
+
+                    return {
+                        "has_task": True,
+                        "job_id": job_id,
+                        "chunk_idx": c_idx,
+                        "is_speculative": True,
+                        "total_chunks": len(chunks),
+                        "title": job.get("title", f"Job #{job_id}"),
+                        "raw_chunk_path": c["raw_path"],
+                        "out_chunk_path": c["out_path"],
+                        "dur_sec": dur_sec,
+                        "refining_config": job.get("refining_config", {}),
+                        "lease_seconds": 90
                     }
 
     return {"has_task": False, "wait_seconds": 5}
@@ -335,10 +428,21 @@ def complete_task(worker_id: str, job_id: int, chunk_idx: int, out_chunk_path: s
             return {"status": "error", "message": f"Chunk #{chunk_idx} not found in job #{job_id}"}
 
         chunk = chunks[chunk_idx]
+        if chunk.get("status") == "done":
+            # Another worker already finished this chunk (first to finish won)
+            return {
+                "status": "already_done",
+                "chunk_idx": chunk_idx,
+                "winner": chunk.get("worker_id"),
+                "all_chunks_done": all(c.get("status") == "done" for c in chunks.values())
+            }
+
         chunk["status"] = "done"
         chunk["pct"] = 100.0
         chunk["file_size_mb"] = file_size_mb
         chunk["worker_id"] = worker_id
+        chunk["speculative_worker_id"] = None
+        chunk["speculative_until"] = 0.0
 
         database.increment_worker_chunks(worker_id)
 
@@ -362,12 +466,27 @@ def release_task(worker_id: str, job_id: int, chunk_idx: int) -> Dict[str, Any]:
         if chunk_idx not in chunks:
             return {"status": "error", "message": f"Chunk #{chunk_idx} not found in job #{job_id}"}
         chunk = chunks[chunk_idx]
+
+        if chunk.get("speculative_worker_id") == worker_id:
+            chunk["speculative_worker_id"] = None
+            chunk["speculative_until"] = 0.0
+            return {"status": "speculative_released", "job_id": job_id, "chunk_idx": chunk_idx}
+
         if chunk.get("status") == "leased" and (chunk.get("worker_id") == worker_id or not worker_id):
-            chunk["status"] = "pending"
-            chunk["worker_id"] = None
-            chunk["leased_until"] = 0.0
-            chunk["pct"] = 0.0
-            logger.warn("REFINER", f"↩️ Chunk #{chunk_idx + 1} of Job #{job_id} released back to pending by '{worker_id}'.")
+            if chunk.get("speculative_worker_id"):
+                # Promote speculative worker to primary
+                chunk["worker_id"] = chunk["speculative_worker_id"]
+                chunk["worker_name"] = chunk.get("speculative_worker_name")
+                chunk["leased_until"] = chunk.get("speculative_until", 0.0)
+                chunk["speculative_worker_id"] = None
+                chunk["speculative_until"] = 0.0
+                logger.warn("REFINER", f"↩️ Chunk #{chunk_idx + 1} of Job #{job_id} primary worker released; promoted speculative worker '{chunk['worker_id']}'.")
+            else:
+                chunk["status"] = "pending"
+                chunk["worker_id"] = None
+                chunk["leased_until"] = 0.0
+                chunk["pct"] = 0.0
+                logger.warn("REFINER", f"↩️ Chunk #{chunk_idx + 1} of Job #{job_id} released back to pending by '{worker_id}'.")
             return {"status": "released", "job_id": job_id, "chunk_idx": chunk_idx}
         return {"status": "ignored", "current_status": chunk.get("status")}
 
@@ -390,13 +509,27 @@ def reclaim_stale_chunks():
             if job.get("cancelled"):
                 continue
             for c_idx, c in job.get("chunks", {}).items():
+                # Reclaim expired speculative lease
+                if c.get("speculative_worker_id") and now > c.get("speculative_until", 0.0):
+                    c["speculative_worker_id"] = None
+                    c["speculative_until"] = 0.0
+
                 if c.get("status") == "leased" and now > c.get("leased_until", 0.0):
                     abandoned_worker = c.get("worker_id", "unknown")
-                    logger.warn("REFINER", f"⚠️ Chunk #{c_idx + 1} of Job #{job_id} lease expired from worker '{abandoned_worker}'! Reclaimed back to pending for retry.")
-                    c["status"] = "pending"
-                    c["worker_id"] = None
-                    c["leased_until"] = 0.0
-                    c["pct"] = 0.0
+                    # If there's an active speculative worker, promote it instead of resetting to pending
+                    if c.get("speculative_worker_id") and now <= c.get("speculative_until", 0.0):
+                        c["worker_id"] = c["speculative_worker_id"]
+                        c["worker_name"] = c.get("speculative_worker_name")
+                        c["leased_until"] = c.get("speculative_until", 0.0)
+                        c["speculative_worker_id"] = None
+                        c["speculative_until"] = 0.0
+                        logger.warn("REFINER", f"⚠️ Primary lease expired for Chunk #{c_idx + 1} of Job #{job_id} from '{abandoned_worker}'; promoted speculative worker '{c['worker_id']}'.")
+                    else:
+                        logger.warn("REFINER", f"⚠️ Chunk #{c_idx + 1} of Job #{job_id} lease expired from worker '{abandoned_worker}'! Reclaimed back to pending for retry.")
+                        c["status"] = "pending"
+                        c["worker_id"] = None
+                        c["leased_until"] = 0.0
+                        c["pct"] = 0.0
 
                     # Clean up partial output file if present
                     out_part = c.get("out_path", "") + ".part"
@@ -405,6 +538,38 @@ def reclaim_stale_chunks():
                             os.remove(out_part)
                         except Exception:
                             pass
+
+def get_active_cluster_jobs_count() -> int:
+    """Returns the number of video jobs currently active in the cluster pool."""
+    with _cluster_lock:
+        return len(_active_cluster_jobs)
+
+def get_total_cluster_slots() -> int:
+    """Returns the total number of concurrent transcoding slots available across the cluster."""
+    status = get_cluster_status()
+    return max(1, int(status.get("total_slots", 1)))
+
+def get_pending_chunk_count() -> int:
+    """Returns the total number of unassigned or expired chunks across all active jobs."""
+    with _cluster_lock:
+        now = time.time()
+        count = 0
+        for job in _active_cluster_jobs.values():
+            if job.get("cancelled"):
+                continue
+            for c in job.get("chunks", {}).values():
+                if c.get("status") == "pending" or (c.get("status") == "leased" and now > c.get("leased_until", 0.0)):
+                    count += 1
+        return count
+
+def should_prechunk_next_video() -> bool:
+    """
+    Lookahead check: Returns True if the number of pending chunks in the cluster
+    is less than the total available GPU transcoding slots, meaning upcoming slots will soon idle.
+    """
+    pending = get_pending_chunk_count()
+    total_slots = get_total_cluster_slots()
+    return pending < total_slots
 
 def get_online_helper_count() -> int:
     """Returns the number of active, online remote GPU workers (excluding local node)."""

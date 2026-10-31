@@ -3,6 +3,7 @@ import time
 import glob
 import shutil
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, List, Tuple, Optional
 import config
 from config import (
@@ -26,6 +27,7 @@ _active_refine_tasks: Dict[int, Dict[str, Any]] = {}
 _active_download_tasks: Dict[int, Dict[str, Any]] = {}
 _refine_lock = threading.Lock()
 _dl_lock = threading.Lock()
+_assembly_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="CPUAssembly")
 
 def cleanup_task_files(task_id: int, task: Optional[Dict[str, Any]] = None):
     """Deletes all local raw, temp, chunks, and intermediate files for a given task."""
@@ -695,6 +697,7 @@ def _refine_job_worker(job: Dict[str, Any]):
         _active_refine_tasks[job_id] = refine_task
 
     semaphore_released = [False]
+    assembly_dispatched = [False]
 
     def _release_conversion_slot():
         if not semaphore_released[0]:
@@ -709,11 +712,62 @@ def _refine_job_worker(job: Dict[str, Any]):
         if refine_task.get("cancelled"):
             return
 
+        refine_task["_async_assembly"] = True
         try:
             convert_worker(refine_task, on_transcode_complete=_release_conversion_slot)
         except TypeError:
             convert_worker(refine_task)
             _release_conversion_slot()
+
+        if refine_task.get("cancelled"):
+            return
+
+        # GPU Transcoding completed. Immediately release semaphore permit for upcoming video chunking!
+        _release_conversion_slot()
+
+        # Hand off CPU concatenation, audio muxing, and Google Drive upload to asynchronous worker pool
+        assembly_dispatched[0] = True
+        _assembly_executor.submit(_async_assemble_and_upload, job, refine_task, target_refined_path, raw_drive_path)
+
+    except Exception as e:
+        if not refine_task.get("cancelled"):
+            err_msg = str(e)
+            logger.error("REFINER", f"❌ Error refining Job #{job_id} ('{job.get('title')}'): {err_msg}")
+            database.update_item_status("refine_queue", job_id, status="failed", error_msg=err_msg)
+    finally:
+        # If assembly was not dispatched (e.g. error or cancelled), clean up now; otherwise assembly worker cleans up
+        if not assembly_dispatched[0]:
+            cleanup_task_files(job_id, refine_task)
+            with _refine_lock:
+                _active_refine_tasks.pop(job_id, None)
+            if not semaphore_released[0]:
+                semaphore_released[0] = True
+                config.conversion_semaphore.release()
+            try:
+                cleanup_workspace(force=False)
+            except Exception:
+                pass
+
+def _async_assemble_and_upload(job: Dict[str, Any], refine_task: Dict[str, Any], target_refined_path: str, raw_drive_path: str):
+    """
+    Decoupled Asynchronous CPU Assembly Worker:
+    Concatenates finished video segments, muxes continuous audio, copies to Google Drive,
+    and updates metadata while the GPU cluster continues transcoding subsequent videos.
+    """
+    job_id = job["id"]
+    try:
+        database.update_item_status("refine_queue", job_id, status="assembling")
+        logger.notify("REFINER", f"🧩 [CPU Assembly] Starting concatenation & muxing for Job #{job_id} ('{job.get('title')}') in background...")
+
+        from encoder import assemble_video_locally
+        assemble_video_locally(
+            refine_task,
+            refine_task.get("_encoded_chunks", []),
+            refine_task.get("_audio_thread"),
+            refine_task.get("_audio_path", ""),
+            refine_task.get("_task_chunks_dir", ""),
+            refine_task.get("_res_tag", "480p")
+        )
 
         if refine_task.get("cancelled"):
             return
@@ -749,26 +803,34 @@ def _refine_job_worker(job: Dict[str, Any]):
     except Exception as e:
         if not refine_task.get("cancelled"):
             err_msg = str(e)
-            logger.error("REFINER", f"❌ Error refining Job #{job_id} ('{job.get('title')}'): {err_msg}")
+            logger.error("REFINER", f"❌ Error assembling Job #{job_id} ('{job.get('title')}'): {err_msg}")
             database.update_item_status("refine_queue", job_id, status="failed", error_msg=err_msg)
     finally:
         cleanup_task_files(job_id, refine_task)
         with _refine_lock:
             _active_refine_tasks.pop(job_id, None)
-        if not semaphore_released[0]:
-            semaphore_released[0] = True
-            config.conversion_semaphore.release()
         try:
             cleanup_workspace(force=False)
         except Exception:
             pass
 
 def _refine_daemon_loop():
-    """Continuous background loop executing refining jobs concurrently up to MAX_ACTIVE_CLUSTER_JOBS."""
+    """Continuous background loop executing refining jobs concurrently with dynamic lookahead up to MAX_ACTIVE_CLUSTER_JOBS."""
     while True:
         if not config.refine_worker_active:
             time.sleep(2.0)
             continue
+
+        try:
+            import cluster_manager
+            # Dynamic slot-aware lookahead:
+            # If the cluster is already active, only pre-chunk the next video if pending chunks < available GPU slots
+            if cluster_manager.get_active_cluster_jobs_count() > 0:
+                if not cluster_manager.should_prechunk_next_video():
+                    time.sleep(1.0)
+                    continue
+        except Exception:
+            pass
 
         acquired = config.conversion_semaphore.acquire(blocking=False)
         if not acquired:

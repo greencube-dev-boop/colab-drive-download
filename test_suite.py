@@ -1563,5 +1563,128 @@ class TestTwoStagePipeline(unittest.TestCase):
         discovered = worker_auto.discover_master_url()
         self.assertEqual(discovered, "https://discovered-cf.trycloudflare.com")
 
+    def test_speculative_chunk_execution_and_winner_resolution(self):
+        import cluster_manager
+        # Setup Job with 1 chunk
+        job_id = 888
+        job_info = {
+            "job_id": job_id,
+            "title": "Speculative Test Video",
+            "chunks": {
+                0: {
+                    "raw_path": "seg_000.mkv",
+                    "out_path": "enc_seg_000.mkv",
+                    "dur_sec": 240.0,
+                    "status": "pending",
+                    "worker_id": None,
+                    "leased_until": 0.0,
+                    "pct": 0.0,
+                    "fps": 0.0,
+                    "speed": "--"
+                }
+            }
+        }
+        cluster_manager.register_cluster_job(job_id, job_info)
+
+        # Worker 1 claims primary lease
+        task1 = cluster_manager.claim_task("worker_slow_1", node_name="Slow Helper 1")
+        self.assertTrue(task1["has_task"])
+        self.assertFalse(task1.get("is_speculative", False))
+
+        # Worker 1 sends heartbeat with 10% progress
+        cluster_manager.heartbeat_worker("worker_slow_1", {
+            "job_id": job_id,
+            "chunk_idx": 0,
+            "pct": 10.0,
+            "fps": 15.0,
+            "speed": "0.5x"
+        })
+
+        # Simulate Worker 1 stalling: artificially age lease_start and last_progress_time past 45s threshold
+        now = time.time()
+        job_info["chunks"][0]["lease_start"] = now - 60.0
+        job_info["chunks"][0]["last_progress_time"] = now - 60.0
+
+        # Worker 2 asks for task. Since all pending chunks are leased, it should get a SPECULATIVE duplicate!
+        task2 = cluster_manager.claim_task("worker_fast_2", node_name="Fast Helper 2")
+        self.assertTrue(task2["has_task"])
+        self.assertTrue(task2.get("is_speculative", False))
+        self.assertEqual(task2["chunk_idx"], 0)
+
+        # Worker 2 finishes first!
+        res_comp2 = cluster_manager.complete_task("worker_fast_2", job_id, 0, "enc_seg_000.mkv", file_size_mb=12.5)
+        self.assertEqual(res_comp2["status"], "accepted")
+        self.assertTrue(res_comp2["all_chunks_done"])
+
+        # When Worker 1 sends heartbeat later, coordinator informs it to abort!
+        hb_slow = cluster_manager.heartbeat_worker("worker_slow_1", {
+            "job_id": job_id,
+            "chunk_idx": 0,
+            "pct": 15.0
+        })
+        self.assertTrue(hb_slow.get("abort_chunk", False))
+
+        # Clean up
+        cluster_manager.unregister_cluster_job(job_id)
+
+    def test_slot_lookahead_and_pending_chunk_count(self):
+        import cluster_manager
+        job_id = 777
+        job_info = {
+            "job_id": job_id,
+            "title": "Lookahead Test Video",
+            "chunks": {
+                0: {"raw_path": "seg_000.mkv", "out_path": "enc_seg_000.mkv", "status": "pending", "leased_until": 0.0},
+                1: {"raw_path": "seg_001.mkv", "out_path": "enc_seg_001.mkv", "status": "pending", "leased_until": 0.0}
+            }
+        }
+        cluster_manager.register_cluster_job(job_id, job_info)
+
+        # Pending count should be 2
+        pending_count = cluster_manager.get_pending_chunk_count()
+        self.assertEqual(pending_count, 2)
+        self.assertEqual(cluster_manager.get_active_cluster_jobs_count(), 1)
+
+        # Leased chunks drop pending count
+        cluster_manager.claim_task("worker_lookahead_1")
+        cluster_manager.claim_task("worker_lookahead_2")
+        self.assertEqual(cluster_manager.get_pending_chunk_count(), 0)
+
+        # Should trigger prechunk lookahead when pending < slots
+        slots = cluster_manager.get_total_cluster_slots()
+        self.assertGreaterEqual(slots, 1)
+        self.assertTrue(cluster_manager.should_prechunk_next_video())
+
+        # Clean up
+        cluster_manager.unregister_cluster_job(job_id)
+
+    def test_helper_worker_ram_disk_staging(self):
+        from helper_worker import HelperWorker
+        worker = HelperWorker(worker_id="test_ram_worker")
+        self.assertTrue(hasattr(worker, "local_temp_dir"))
+        self.assertTrue(os.path.exists(worker.local_temp_dir))
+        if os.path.exists("/dev/shm") and os.path.isdir("/dev/shm"):
+            try:
+                free = shutil.disk_usage("/dev/shm").free
+                if free >= 500 * 1024 * 1024:
+                    self.assertTrue(worker.using_ram_disk)
+                    self.assertIn("/dev/shm", worker.local_temp_dir)
+            except Exception:
+                pass
+
+    def test_decoupled_assembly_status_and_flow(self):
+        import database
+        job_id = database.enqueue_refine({
+            "title": "Assembly Status Test Video",
+            "raw_drive_path": "raw/test.mkv",
+            "target_refined_path": "refined/test.mkv"
+        })
+        database.update_item_status("refine_queue", job_id, status="assembling")
+        items = database.get_refine_queue()
+        matched = next((it for it in items if it["id"] == job_id), None)
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched["status"], "assembling")
+        database.cancel_queue_item("refine_queue", job_id)
+
 if __name__ == "__main__":
     unittest.main()

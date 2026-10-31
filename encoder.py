@@ -616,8 +616,33 @@ def convert_worker(task: Dict[str, Any], on_transcode_complete: Optional[Any] = 
 
     encoded_chunks = [c["out_path"] for c in sorted(chunks_dict.values(), key=lambda x: x["raw_path"])]
 
-    # 7. Concat video chunks and mux with continuous audio
-    encoded_chunks.sort()
+    # Pass metadata needed for assembly
+    task["_encoded_chunks"] = encoded_chunks
+    task["_audio_thread"] = audio_thread
+    task["_audio_path"] = audio_path
+    task["_task_chunks_dir"] = task_chunks_dir
+    task["_res_tag"] = res_tag
+
+    # If caller requested async assembly, return immediately to let CPU assembly run detached
+    if not task.get("_async_assembly"):
+        assemble_video_locally(task, encoded_chunks, audio_thread, audio_path, task_chunks_dir, res_tag)
+
+def assemble_video_locally(
+    task: Dict[str, Any],
+    encoded_chunks: List[str],
+    audio_thread: Optional[threading.Thread] = None,
+    audio_path: str = "",
+    task_chunks_dir: str = "",
+    res_tag: str = "480p"
+):
+    """
+    CPU-only phase: Concatenates transcoded video segments and muxes with continuous audio.
+    Runs asynchronously on background CPU worker pool, freeing GPU cluster immediately.
+    """
+    if task.get("cancelled"):
+        return
+
+    encoded_chunks = sorted(list(encoded_chunks))
     logger.notify("REFINER", f"🧩 All {len(encoded_chunks)} chunks completed for Job #{task['id']}! Starting segment concatenation and audio muxing...")
     concat_list_file = os.path.join(TEMP_DIR, f"concat_{task['id']}.txt")
     with open(concat_list_file, "w") as lf:
@@ -647,12 +672,11 @@ def convert_worker(task: Dict[str, Any], on_transcode_complete: Optional[Any] = 
         logger.notify("REFINER", "⏳ Waiting for background audio extraction to finalize before muxing...")
         audio_thread.join(timeout=300.0)
 
-    # 8. Mux into chosen container (MKV or MP4)
+    # Mux into chosen container (MKV or MP4)
     container_choice = task.get("container_format", "mkv").lower()
     target_ext = ".mp4" if "mp4" in container_choice else ".mkv"
 
     stem = os.path.splitext(task["title"])[0]
-    # Remove existing resolution tag if user provided it to avoid double tags
     stem = re.sub(r'_(240p|360p|480p|720p|1080p|orig)$', '', stem, flags=re.I)
     task["temp_path"] = os.path.join(TEMP_DIR, f"{stem}_{res_tag}{target_ext}")
     if os.path.exists(task["temp_path"]):
@@ -677,13 +701,17 @@ def convert_worker(task: Dict[str, Any], on_transcode_complete: Optional[Any] = 
         unregister_proc(task, m_proc)
 
     task["convert_pct"] = 100.0
-    task["final_size_mb"] = os.path.getsize(task["temp_path"]) / (1024 * 1024)
+    task["final_size_mb"] = os.path.getsize(task["temp_path"]) / (1024 * 1024) if os.path.exists(task["temp_path"]) else 0.0
 
     # Clean intermediate chunk directory and files
-    shutil.rmtree(task_chunks_dir, ignore_errors=True)
+    if task_chunks_dir and os.path.exists(task_chunks_dir):
+        shutil.rmtree(task_chunks_dir, ignore_errors=True)
     for p in [stitched_video, concat_list_file, audio_path]:
         if os.path.exists(p):
-            os.remove(p)
+            try:
+                os.remove(p)
+            except Exception:
+                pass
 
 def move_to_drive_worker(task: Dict[str, Any]):
     """Preserves folder hierarchy in Google Drive and cleans workspace."""
