@@ -68,21 +68,7 @@ def reset_cluster_on_startup():
     Cleans up all stale remote workers, lingering worker beacon files, and previous session
     state on coordinator startup so the new session starts with a clean slate.
     """
-    database.purge_all_remote_workers()
-    search_dirs = [
-        getattr(config, "CLUSTER_WORKERS_DIR", os.path.join(config.DATA_DIR, "cluster", "workers")),
-        getattr(config, "LOCAL_CLUSTER_WORKERS_DIR", os.path.join(config.LOCAL_DATA_DIR, "cluster", "workers"))
-    ]
-    for sdir in search_dirs:
-        if os.path.exists(sdir):
-            try:
-                for fpath in glob.glob(os.path.join(sdir, "worker_*.json")):
-                    try:
-                        os.remove(fpath)
-                    except Exception:
-                        pass
-            except Exception:
-                pass
+    clean_inactive_workers(force_all_offline=True)
     logger.notify("CLUSTER", "🧹 GPU Cluster state reset for fresh session: purged stale remote workers.")
 
 def clean_inactive_workers(force_all_offline: bool = False, timeout_sec: float = 15.0) -> int:
@@ -126,18 +112,33 @@ def clean_inactive_workers(force_all_offline: bool = False, timeout_sec: float =
                     hb = float(w.get("last_heartbeat") or 0.0)
                     st = str(w.get("status", "")).lower()
                     wid = w.get("worker_id", "")
+                    if wid and not force_all_offline:
+                        db_w = database.get_cluster_worker(wid)
+                        if db_w:
+                            db_hb = float(db_w.get("last_heartbeat") or 0.0)
+                            if db_hb > hb:
+                                hb = db_hb
+                            db_st = str(db_w.get("status", "")).lower()
+                            if db_st:
+                                st = db_st
                     if force_all_offline or st in ["offline", "waiting_for_master"] or (now - hb) > timeout_sec:
                         try:
-                            os.remove(fpath)
+                            config.bypass_trash_delete(fpath)
                         except Exception:
-                            pass
+                            try:
+                                os.remove(fpath)
+                            except Exception:
+                                pass
                         if wid:
                             database.remove_cluster_worker(wid)
                 except Exception:
                     try:
-                        os.remove(fpath)
+                        config.bypass_trash_delete(fpath)
                     except Exception:
-                        pass
+                        try:
+                            os.remove(fpath)
+                        except Exception:
+                            pass
         except Exception:
             pass
 
@@ -154,8 +155,21 @@ def discover_workers_from_drive():
     """
     search_dirs = [
         getattr(config, "CLUSTER_WORKERS_DIR", os.path.join(config.DATA_DIR, "cluster", "workers")),
-        getattr(config, "LOCAL_CLUSTER_WORKERS_DIR", os.path.join(config.LOCAL_DATA_DIR, "cluster", "workers"))
+        getattr(config, "LOCAL_CLUSTER_WORKERS_DIR", os.path.join(config.LOCAL_DATA_DIR, "cluster", "workers")),
+        os.path.abspath(os.path.join("data", "cluster", "workers")),
+        os.path.abspath(os.path.join("..", "data", "cluster", "workers"))
     ]
+    if getattr(config, "IS_COLAB", False):
+        mydrive = "/content/drive/MyDrive"
+        if os.path.exists(mydrive):
+            try:
+                for entry in os.listdir(mydrive):
+                    cand = os.path.join(mydrive, entry, "data", "cluster", "workers")
+                    if os.path.isdir(cand) and cand not in search_dirs:
+                        search_dirs.append(cand)
+            except Exception:
+                pass
+
     seen_ids = set()
     now = time.time()
     for sdir in search_dirs:
@@ -175,12 +189,26 @@ def discover_workers_from_drive():
                         wid = w_data["worker_id"]
                         hb = float(w_data.get("last_heartbeat") or 0.0)
                         st = str(w_data.get("status", "")).lower()
+
+                        # Protect actively connected HTTP workers
+                        db_w = database.get_cluster_worker(wid)
+                        if db_w:
+                            db_hb = float(db_w.get("last_heartbeat") or 0.0)
+                            if db_hb > hb:
+                                hb = db_hb
+                            db_st = str(db_w.get("status", "")).lower()
+                            if db_st:
+                                st = db_st
+
                         if (now - hb) > 15.0 or st in ["offline", "waiting_for_master"]:
                             # Prune stale dead worker beacon from Drive so it doesn't linger
                             try:
-                                os.remove(fpath)
+                                config.bypass_trash_delete(fpath)
                             except Exception:
-                                pass
+                                try:
+                                    os.remove(fpath)
+                                except Exception:
+                                    pass
                             database.remove_cluster_worker(wid)
                             continue
 
@@ -214,10 +242,15 @@ def register_worker(worker_data: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         pass
 
+    downloader_dir = getattr(config, "DOWNLOADER_DIR", "")
+    folder_name = os.path.basename(downloader_dir) if downloader_dir else ""
+
     return {
         "status": "registered",
         "worker_id": worker_id,
-        "assigned_name": node_name
+        "assigned_name": node_name,
+        "downloader_dir": downloader_dir,
+        "folder_name": folder_name
     }
 
 def heartbeat_worker(worker_id: str, metrics: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -580,6 +613,7 @@ def get_online_helper_count() -> int:
 def get_cluster_status() -> Dict[str, Any]:
     """Returns a high-level summary of the GPU cluster health, nodes, and jobs."""
     discover_workers_from_drive()
+    clean_inactive_workers(force_all_offline=False, timeout_sec=15.0)
     workers = database.get_cluster_workers(active_only=False)
 
     has_gpu = False
@@ -637,10 +671,11 @@ def get_cluster_status() -> Dict[str, Any]:
         and (now - float(w.get("last_heartbeat") or 0.0)) <= 15.0
     ]
 
-    # For display in dashboard, show any remote worker seen in last 15s
+    # For display in dashboard, show any active remote worker seen in last 15s
     visible_remote = [
         w for w in workers
         if w.get("worker_id") != "main_coordinator"
+        and w.get("status") not in ["offline", "waiting_for_master"]
         and (now - float(w.get("last_heartbeat") or 0.0)) <= 15.0
     ]
 

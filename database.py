@@ -752,6 +752,18 @@ def heartbeat_cluster_worker(worker_id: str, progress_data: Optional[Dict[str, A
         finally:
             conn.close()
 
+def get_cluster_worker(worker_id: str) -> Optional[Dict[str, Any]]:
+    """Retrieves a single cluster worker by worker_id, or None if not found."""
+    with _db_lock:
+        conn = _get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM cluster_workers WHERE worker_id = ?", (worker_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
 def get_cluster_workers(active_only: bool = False, timeout_sec: float = 15.0) -> List[Dict[str, Any]]:
     """Retrieves all registered cluster GPU workers, dynamically marking stale nodes as offline."""
     with _db_lock:
@@ -799,7 +811,7 @@ def purge_all_remote_workers() -> int:
         conn = _get_connection()
         try:
             cur = conn.cursor()
-            cur.execute("DELETE FROM cluster_workers WHERE worker_id != 'main_coordinator'")
+            cur.execute("DELETE FROM cluster_workers")
             count = cur.rowcount
             _commit_and_sync(conn, force=True)
             return count
@@ -815,8 +827,7 @@ def cleanup_stale_cluster_workers(timeout_sec: float = 15.0) -> int:
             cutoff = time.time() - timeout_sec
             cur.execute("""
                 DELETE FROM cluster_workers 
-                WHERE worker_id != 'main_coordinator' 
-                AND (
+                WHERE (
                     last_heartbeat < ? 
                     OR status = 'offline' 
                     OR status = 'waiting_for_master'

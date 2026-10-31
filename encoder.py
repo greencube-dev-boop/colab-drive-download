@@ -512,6 +512,12 @@ def convert_worker(task: Dict[str, Any], on_transcode_complete: Optional[Any] = 
             })
         except Exception:
             pass
+    else:
+        try:
+            import database
+            database.remove_cluster_worker("main_coordinator")
+        except Exception:
+            pass
 
     if not has_main_gpu:
         # Non-GPU Main notebook: zero transcoding on Main (pure coordinator, all chunks delegated to GPU helpers)

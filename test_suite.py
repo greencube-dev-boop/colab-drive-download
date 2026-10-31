@@ -718,7 +718,7 @@ class TestTwoStagePipeline(unittest.TestCase):
         resolved = config.resolve_downloader_dir()
         forbidden = ["/content/drive/MyDrive", "/content/drive", "/content", "/"]
         self.assertNotIn(os.path.abspath(resolved), [os.path.abspath(f) for f in forbidden])
-        self.assertTrue(resolved.endswith("downloader") or "downloader" in resolved or "downloader_staging" in resolved)
+        self.assertTrue(resolved.endswith("downloader") or "downloader" in resolved or "downloader_staging" in resolved or "colab drive download" in resolved)
 
         # 2. Test cleanup_drive_root_stray_files
         mock_mydrive = os.path.join(self.test_dir, "mock_mydrive")
@@ -1546,6 +1546,61 @@ class TestTwoStagePipeline(unittest.TestCase):
         ids = [w["worker_id"] for w in workers]
         self.assertIn("worker_active_now", ids)
         self.assertNotIn("worker_dead_now", ids)
+
+    def test_active_http_worker_protected_from_deletion_and_get_cluster_worker(self):
+        import cluster_manager
+        # 1. Test get_cluster_worker
+        now = time.time()
+        database.upsert_cluster_worker({
+            "worker_id": "worker_http_live_999",
+            "node_name": "HTTP Live Node",
+            "gpu_name": "Tesla T4",
+            "vram_mb": 15360,
+            "status": "idle",
+            "last_heartbeat": now
+        })
+        w = database.get_cluster_worker("worker_http_live_999")
+        self.assertIsNotNone(w)
+        self.assertEqual(w["worker_id"], "worker_http_live_999")
+        self.assertIsNone(database.get_cluster_worker("non_existent_worker"))
+
+        # 2. Test file on Drive has older timestamp, but HTTP heartbeat in DB is fresh
+        w_dir = config.CLUSTER_WORKERS_DIR
+        os.makedirs(w_dir, exist_ok=True)
+        w_file = os.path.join(w_dir, "worker_worker_http_live_999.json")
+        with open(w_file, "w", encoding="utf-8") as f:
+            json.dump({
+                "worker_id": "worker_http_live_999",
+                "node_name": "HTTP Live Node",
+                "gpu_name": "Tesla T4",
+                "vram_mb": 15360,
+                "status": "idle",
+                "last_heartbeat": now - 30.0
+            }, f)
+
+        # clean_inactive_workers should NOT delete this worker because DB heartbeat is live!
+        cluster_manager.clean_inactive_workers(force_all_offline=False, timeout_sec=15.0)
+        self.assertTrue(os.path.exists(w_file))
+        self.assertIsNotNone(database.get_cluster_worker("worker_http_live_999"))
+
+        # 3. Test register_worker returns downloader_dir and folder_name
+        res = cluster_manager.register_worker({
+            "worker_id": "worker_test_reg_sync",
+            "node_name": "Reg Sync",
+            "gpu_name": "Tesla T4",
+            "vram_mb": 15360
+        })
+        self.assertEqual(res["status"], "registered")
+        self.assertIn("downloader_dir", res)
+        self.assertIn("folder_name", res)
+
+        # Cleanup
+        try:
+            os.remove(w_file)
+        except Exception:
+            pass
+        database.remove_cluster_worker("worker_http_live_999")
+        database.remove_cluster_worker("worker_test_reg_sync")
 
     def test_helper_worker_coordinator_param_and_discovery(self):
         from helper_worker import HelperWorker

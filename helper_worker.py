@@ -51,7 +51,7 @@ class HelperWorker:
     """
     MAX_CONCURRENT_CHUNKS = 2
 
-    def __init__(self, worker_id: Optional[str] = None, coordinator_url: Optional[str] = None):
+    def __init__(self, worker_id: Optional[str] = None, coordinator_url: Optional[str] = None, drive_folder_name: Optional[str] = None):
         self.gpu_info = get_gpu_info()
         short_gpu = self.gpu_info["gpu_name"].replace("NVIDIA", "").replace("Tesla", "").strip() or "Node"
         self.worker_id = worker_id or f"worker_{short_gpu.lower()}_{uuid.uuid4().hex[:8]}"
@@ -61,6 +61,22 @@ class HelperWorker:
         self.active_slots: Dict[int, Optional[Dict[str, Any]]] = {0: None, 1: None}
         self.active_slots_lock = threading.Lock()
         self.failed_chunks_cooldown: Dict[Any, float] = {}
+
+        # Resolve explicit drive folder if provided
+        if drive_folder_name and drive_folder_name.strip():
+            f_name = drive_folder_name.strip()
+            candidates = [
+                f_name,
+                os.path.join("/content/drive/MyDrive", f_name),
+                os.path.join("/content/drive/Shareddrives", f_name)
+            ]
+            for c in candidates:
+                if os.path.isdir(c):
+                    try:
+                        config.update_downloader_dir(c)
+                        break
+                    except Exception:
+                        pass
         # High-throughput RAM-disk staging: use /dev/shm if available and has >= 500 MB free space
         shm_path = "/dev/shm"
         self.using_ram_disk = False
@@ -129,12 +145,19 @@ class HelperWorker:
                 unique_candidates.append(norm)
 
         for target in unique_candidates:
-            parent_dir = os.path.dirname(target)
-            if os.path.exists(parent_dir):
-                try:
-                    os.listdir(parent_dir)  # Invalidate Drive FUSE cache
-                except Exception:
-                    pass
+            # Recursively bust FUSE directory cache from root down to master.json
+            parts = []
+            cur = os.path.dirname(target)
+            while cur and cur != os.path.dirname(cur):
+                parts.append(cur)
+                cur = os.path.dirname(cur)
+            for p in reversed(parts):
+                if os.path.isdir(p):
+                    try:
+                        os.listdir(p)
+                    except Exception:
+                        pass
+
             if os.path.exists(target):
                 try:
                     with open(target, "r", encoding="utf-8") as f:
@@ -200,6 +223,10 @@ class HelperWorker:
         for tdir in targets:
             try:
                 os.makedirs(tdir, exist_ok=True)
+                try:
+                    os.listdir(tdir)  # Invalidate Drive FUSE directory listing
+                except Exception:
+                    pass
                 w_file = os.path.join(tdir, f"worker_{self.worker_id}.json")
                 if not os.path.exists(w_file):
                     is_missing = True
@@ -225,7 +252,10 @@ class HelperWorker:
             try:
                 w_file = os.path.join(tdir, f"worker_{self.worker_id}.json")
                 if os.path.exists(w_file):
-                    os.remove(w_file)
+                    try:
+                        config.bypass_trash_delete(w_file)
+                    except Exception:
+                        os.remove(w_file)
             except Exception:
                 pass
 
@@ -278,6 +308,35 @@ class HelperWorker:
         if res and res.get("status") == "registered":
             assigned = res.get("assigned_name", self.node_name)
             logger.success("HELPER", f"Successfully registered with Main coordinator as '{assigned}'!")
+
+            # Synchronize Google Drive storage directory from Main coordinator's response
+            main_folder_name = res.get("folder_name")
+            main_dl_dir = res.get("downloader_dir")
+            synced_dir = None
+            if getattr(config, "IS_COLAB", False):
+                if main_folder_name:
+                    roots = ["/content/drive/MyDrive", "/content/drive/Shareddrives"]
+                    for droot in roots:
+                        if os.path.isdir(droot):
+                            try:
+                                for entry in os.listdir(droot):
+                                    if entry.strip().lower() == main_folder_name.strip().lower():
+                                        cand = os.path.join(droot, entry)
+                                        if os.path.isdir(cand):
+                                            synced_dir = cand
+                                            break
+                            except Exception:
+                                pass
+                        if synced_dir:
+                            break
+                if not synced_dir and main_dl_dir and os.path.isdir(main_dl_dir):
+                    synced_dir = main_dl_dir
+            if synced_dir:
+                try:
+                    config.update_downloader_dir(synced_dir)
+                    logger.notify("HELPER", f"📁 Synchronized Drive workspace folder with Main: {synced_dir}")
+                except Exception:
+                    pass
         else:
             logger.warn("HELPER", "Direct HTTP registration pending; synced via Google Drive shared beacon.")
 
@@ -291,7 +350,6 @@ class HelperWorker:
         res = self._http_request("/api/cluster/heartbeat", payload) or {}
         st = payload.get("status", "idle")
         self.check_and_restore_announcer(status=st)
-        self.announce_to_drive(status=st)
         if payload.get("status") == "encoding":
             logger.debug("HELPER", f"💓 Heartbeat: Chunk #{payload.get('chunk_idx')} ({payload.get('pct', 0.0):.1f}%) @ {payload.get('fps', 0)} fps")
         return res
@@ -629,10 +687,10 @@ class HelperWorker:
                 self.send_heartbeat({"status": "idle"})
             time.sleep(10)
 
-def run_helper_main(coordinator_url: str = "", enable_debug_logs: bool = True):
+def run_helper_main(coordinator_url: str = "", drive_folder_name: str = "", enable_debug_logs: bool = True):
     """Entry point for Helper Colab notebook."""
     logger.set_debug(enable_debug_logs)
-    worker = HelperWorker(coordinator_url=coordinator_url)
+    worker = HelperWorker(coordinator_url=coordinator_url, drive_folder_name=drive_folder_name)
     try:
         worker.run()
     except KeyboardInterrupt:
