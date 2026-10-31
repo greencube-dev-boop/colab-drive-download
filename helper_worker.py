@@ -164,8 +164,42 @@ class HelperWorker:
                 w_file = os.path.join(tdir, f"worker_{self.worker_id}.json")
                 with open(w_file, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2)
+                    f.flush()
+                    try:
+                        os.fsync(f.fileno())
+                    except Exception:
+                        pass
             except Exception:
                 pass
+
+    def check_and_restore_announcer(self, status: str = "idle") -> bool:
+        """
+        Verifies that this worker's announcer beacon file exists on shared Google Drive.
+        If it was deleted (e.g. by coordinator cleaning inactive nodes),
+        re-creates it immediately and re-registers with the coordinator.
+        """
+        targets = [
+            getattr(config, "CLUSTER_WORKERS_DIR", os.path.join(config.DATA_DIR, "cluster", "workers")),
+            getattr(config, "LOCAL_CLUSTER_WORKERS_DIR", os.path.join(config.LOCAL_DATA_DIR, "cluster", "workers"))
+        ]
+        is_missing = False
+        for tdir in targets:
+            try:
+                os.makedirs(tdir, exist_ok=True)
+                w_file = os.path.join(tdir, f"worker_{self.worker_id}.json")
+                if not os.path.exists(w_file):
+                    is_missing = True
+                    break
+            except Exception:
+                pass
+
+        if is_missing:
+            logger.notify("HELPER", f"🔄 Announcer beacon was missing on Drive. Recreating 'worker_{self.worker_id}.json'...")
+            self.announce_to_drive(status=status)
+            if self.master_url:
+                self.register_with_master()
+            return True
+        return False
 
     def cleanup_drive_beacon(self):
         """Removes this worker's beacon file from Google Drive on shutdown."""
@@ -241,7 +275,9 @@ class HelperWorker:
         payload = metrics or {}
         payload["worker_id"] = self.worker_id
         res = self._http_request("/api/cluster/heartbeat", payload)
-        self.announce_to_drive(status=payload.get("status", "idle"))
+        st = payload.get("status", "idle")
+        self.check_and_restore_announcer(status=st)
+        self.announce_to_drive(status=st)
         if payload.get("status") == "encoding":
             logger.debug("HELPER", f"💓 Heartbeat: Chunk #{payload.get('chunk_idx')} ({payload.get('pct', 0.0):.1f}%) @ {payload.get('fps', 0)} fps")
         return bool(res and res.get("status") == "ok")

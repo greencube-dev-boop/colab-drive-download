@@ -692,7 +692,7 @@ def upsert_cluster_worker(worker: Dict[str, Any]) -> bool:
                 file_hb = now
             reg_time = float(worker.get("registered_at") or now)
             w_status = worker.get("status", "idle")
-            if (now - file_hb) > 30.0:
+            if (now - file_hb) > 15.0:
                 init_status = "offline"
             elif w_status == "waiting_for_master":
                 init_status = "waiting_for_master"
@@ -710,9 +710,9 @@ def upsert_cluster_worker(worker: Dict[str, Any]) -> bool:
                     tunnel_url = CASE WHEN excluded.tunnel_url != '' THEN excluded.tunnel_url ELSE cluster_workers.tunnel_url END,
                     last_heartbeat = MAX(cluster_workers.last_heartbeat, excluded.last_heartbeat),
                     status = CASE 
-                        WHEN (? - excluded.last_heartbeat) > 30.0 THEN 'offline'
+                        WHEN (? - excluded.last_heartbeat) > 15.0 THEN 'offline'
                         WHEN excluded.status = 'waiting_for_master' THEN 'waiting_for_master'
-                        WHEN cluster_workers.status = 'offline' AND (? - excluded.last_heartbeat) <= 30.0 THEN 'idle' 
+                        WHEN cluster_workers.status = 'offline' AND (? - excluded.last_heartbeat) <= 15.0 THEN 'idle' 
                         ELSE cluster_workers.status 
                     END
             """, (w_id, node_name, gpu_name, vram_mb, tunnel_url, file_hb, init_status, reg_time, now, now))
@@ -752,7 +752,7 @@ def heartbeat_cluster_worker(worker_id: str, progress_data: Optional[Dict[str, A
         finally:
             conn.close()
 
-def get_cluster_workers(active_only: bool = False, timeout_sec: float = 30.0) -> List[Dict[str, Any]]:
+def get_cluster_workers(active_only: bool = False, timeout_sec: float = 15.0) -> List[Dict[str, Any]]:
     """Retrieves all registered cluster GPU workers, dynamically marking stale nodes as offline."""
     with _db_lock:
         conn = _get_connection()
@@ -806,7 +806,7 @@ def purge_all_remote_workers() -> int:
         finally:
             conn.close()
 
-def cleanup_stale_cluster_workers(timeout_sec: float = 30.0) -> int:
+def cleanup_stale_cluster_workers(timeout_sec: float = 15.0) -> int:
     """Removes offline or stale worker nodes that haven't sent a heartbeat for longer than timeout_sec."""
     with _db_lock:
         conn = _get_connection()

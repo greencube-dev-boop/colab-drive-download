@@ -727,7 +727,7 @@ def render_cluster_html() -> str:
                 badge_color = "#f9e2af"
                 badge_text = "⚡ Encoding"
                 border_color = "rgba(249, 226, 175, 0.4)"
-            elif st == "offline" or ago > 30:
+            elif st == "offline" or ago > 15:
                 badge_bg = "rgba(243, 139, 168, 0.15)"
                 badge_color = "#f38ba8"
                 badge_text = "🔴 Offline"

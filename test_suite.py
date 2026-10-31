@@ -1365,11 +1365,20 @@ class TestTwoStagePipeline(unittest.TestCase):
     def test_main_coordinator_in_cluster_status(self):
         import cluster_manager
         status = cluster_manager.get_cluster_status()
-        self.assertGreaterEqual(status["total_nodes"], 1)
+        # coordinator_node should always be present in the status dict
+        self.assertIn("coordinator_node", status)
+        self.assertIn("main_has_gpu", status)
+        coord = status["coordinator_node"]
+        self.assertEqual(coord["worker_id"], "main_coordinator")
+        self.assertIn("Main", coord["node_name"])
+
+        # Main should only appear in workers list if it has a GPU
         workers = status["workers"]
-        main_nodes = [w for w in workers if w.get("worker_id") == "main_coordinator"]
-        self.assertEqual(len(main_nodes), 1)
-        self.assertIn("Main", main_nodes[0]["node_name"])
+        main_in_workers = [w for w in workers if w.get("worker_id") == "main_coordinator"]
+        if status["main_has_gpu"]:
+            self.assertEqual(len(main_in_workers), 1, "Main GPU should be in workers when GPU present")
+        else:
+            self.assertEqual(len(main_in_workers), 0, "Main should NOT be in workers when no GPU")
 
     def test_remote_chunks_telemetry_progress_100_pct(self):
         # Simulate encoder progress calculation when remote chunks are marked done

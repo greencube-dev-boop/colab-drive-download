@@ -85,7 +85,7 @@ def reset_cluster_on_startup():
                 pass
     logger.notify("CLUSTER", "🧹 GPU Cluster state reset for fresh session: purged stale remote workers.")
 
-def clean_inactive_workers(force_all_offline: bool = False) -> int:
+def clean_inactive_workers(force_all_offline: bool = False, timeout_sec: float = 15.0) -> int:
     """
     Scans worker beacon files on Google Drive and SQLite database, purging all
     offline, stale, or abandoned worker nodes and their files.
@@ -93,24 +93,40 @@ def clean_inactive_workers(force_all_offline: bool = False) -> int:
     now = time.time()
     search_dirs = [
         getattr(config, "CLUSTER_WORKERS_DIR", os.path.join(config.DATA_DIR, "cluster", "workers")),
-        getattr(config, "LOCAL_CLUSTER_WORKERS_DIR", os.path.join(config.LOCAL_DATA_DIR, "cluster", "workers"))
+        getattr(config, "LOCAL_CLUSTER_WORKERS_DIR", os.path.join(config.LOCAL_DATA_DIR, "cluster", "workers")),
+        os.path.abspath(os.path.join("data", "cluster", "workers")),
+        os.path.abspath(os.path.join("..", "data", "cluster", "workers"))
     ]
-    for sdir in search_dirs:
-        if not os.path.exists(sdir):
-            continue
-        try:
+    if getattr(config, "IS_COLAB", False):
+        mydrive = "/content/drive/MyDrive"
+        if os.path.exists(mydrive):
             try:
-                os.listdir(sdir)  # Busts Drive FUSE cache
+                for entry in os.listdir(mydrive):
+                    cand = os.path.join(mydrive, entry, "data", "cluster", "workers")
+                    if os.path.isdir(cand) and cand not in search_dirs:
+                        search_dirs.append(cand)
             except Exception:
                 pass
-            for fpath in glob.glob(os.path.join(sdir, "worker_*.json")):
+
+    seen_dirs = set()
+    for sdir in search_dirs:
+        norm = os.path.abspath(sdir)
+        if norm in seen_dirs or not os.path.exists(norm):
+            continue
+        seen_dirs.add(norm)
+        try:
+            try:
+                os.listdir(norm)  # Busts Drive FUSE cache
+            except Exception:
+                pass
+            for fpath in glob.glob(os.path.join(norm, "worker_*.json")):
                 try:
                     with open(fpath, "r", encoding="utf-8") as f:
                         w = json.load(f)
                     hb = float(w.get("last_heartbeat") or 0.0)
                     st = str(w.get("status", "")).lower()
                     wid = w.get("worker_id", "")
-                    if force_all_offline or st in ["offline", "waiting_for_master"] or (now - hb) > 30.0:
+                    if force_all_offline or st in ["offline", "waiting_for_master"] or (now - hb) > timeout_sec:
                         try:
                             os.remove(fpath)
                         except Exception:
@@ -128,13 +144,13 @@ def clean_inactive_workers(force_all_offline: bool = False) -> int:
     if force_all_offline:
         return database.purge_all_remote_workers()
     else:
-        return database.cleanup_stale_cluster_workers(timeout_sec=30.0)
+        return database.cleanup_stale_cluster_workers(timeout_sec=timeout_sec)
 
 def discover_workers_from_drive():
     """
     Scans shared Google Drive folder for worker beacon files (data/cluster/workers/worker_*.json).
     Allows Main to discover active helper nodes natively through shared storage.
-    Prunes stale worker files whose last heartbeat is older than 30 seconds.
+    Prunes stale worker files whose last heartbeat is older than 15 seconds.
     """
     search_dirs = [
         getattr(config, "CLUSTER_WORKERS_DIR", os.path.join(config.DATA_DIR, "cluster", "workers")),
@@ -159,7 +175,7 @@ def discover_workers_from_drive():
                         wid = w_data["worker_id"]
                         hb = float(w_data.get("last_heartbeat") or 0.0)
                         st = str(w_data.get("status", "")).lower()
-                        if (now - hb) > 30.0 or st in ["offline", "waiting_for_master"]:
+                        if (now - hb) > 15.0 or st in ["offline", "waiting_for_master"]:
                             # Prune stale dead worker beacon from Drive so it doesn't linger
                             try:
                                 os.remove(fpath)
@@ -447,30 +463,33 @@ def get_cluster_status() -> Dict[str, Any]:
         "current_speed": main_speed
     }
 
-    # Filter out workers that have no heartbeat for > 30s (stale/disconnected) or are not ready
+    # Filter out workers that have no heartbeat for > 15s (stale/disconnected) or are not ready
     now = time.time()
     active_remote = [
         w for w in workers 
         if w.get("worker_id") != "main_coordinator" 
         and w.get("status") in ["idle", "encoding"]
-        and (now - float(w.get("last_heartbeat") or 0.0)) <= 30.0
+        and (now - float(w.get("last_heartbeat") or 0.0)) <= 15.0
     ]
 
-    # For display in dashboard, show main node and any remote worker seen in last 45s
+    # For display in dashboard, show any remote worker seen in last 15s
     visible_remote = [
         w for w in workers
         if w.get("worker_id") != "main_coordinator"
-        and (now - float(w.get("last_heartbeat") or 0.0)) <= 45.0
+        and (now - float(w.get("last_heartbeat") or 0.0)) <= 15.0
     ]
 
-    all_workers = [main_node] + visible_remote
-    online_count = sum(1 for w in all_workers if w.get("status") not in ["offline", "coordinator", "waiting_for_master"])
-    if not has_gpu:
-        online_gpus = len(active_remote)
-    else:
+    # Only include main_node in GPU compute worker cards if Main actually has a hardware GPU
+    if has_gpu:
+        all_workers = [main_node] + visible_remote
         online_gpus = len(active_remote) + 1
+        total_slots = 1 + (len(active_remote) * 2)
+    else:
+        all_workers = visible_remote
+        online_gpus = len(active_remote)
+        total_slots = len(active_remote) * 2
 
-    total_slots = (1 if has_gpu else 0) + (len(active_remote) * 2)
+    online_count = sum(1 for w in all_workers if w.get("status") not in ["offline", "coordinator", "waiting_for_master"])
     encoding_count = sum(1 for w in all_workers if w.get("status") == "encoding")
 
     with _cluster_lock:
@@ -491,6 +510,8 @@ def get_cluster_status() -> Dict[str, Any]:
         "active_jobs": active_jobs_count,
         "total_chunks": total_chunks,
         "done_chunks": done_chunks,
+        "main_has_gpu": has_gpu,
+        "coordinator_node": main_node,
         "workers": all_workers
     }
 
@@ -500,13 +521,13 @@ def _cluster_daemon_loop():
     while _daemon_running:
         try:
             now = time.time()
-            if _last_master_url and (now - last_beacon_refresh) >= 10.0:
+            if _last_master_url and (now - last_beacon_refresh) >= 5.0:
                 publish_master_beacon(_last_master_url)
                 last_beacon_refresh = now
 
             discover_workers_from_drive()
             reclaim_stale_chunks()
-            database.cleanup_stale_cluster_workers(timeout_sec=30.0)
+            clean_inactive_workers(force_all_offline=False, timeout_sec=15.0)
         except Exception as e:
             print(f"[ClusterDaemon] Exception in cluster loop: {e}")
-        time.sleep(5.0)
+        time.sleep(3.0)

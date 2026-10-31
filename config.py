@@ -176,7 +176,7 @@ LOCAL_CLUSTER_MASTER_FILE = os.path.join(LOCAL_CLUSTER_DIR, "master.json")
 # Distributed Cluster Configuration
 CHUNK_DURATION_SEC = 240.0         # 4 minutes per keyframe segment (optimal balance of fault tolerance & low Drive FUSE I/O)
 CHUNK_LEASE_TIMEOUT_SEC = 300.0    # 5 minutes lease duration (prevents false abandonments during 4-min chunk transcodes)
-WORKER_HEARTBEAT_TIMEOUT_SEC = 45.0 # Mark worker offline if no heartbeat for 45s
+WORKER_HEARTBEAT_TIMEOUT_SEC = 15.0 # Mark worker offline and delete if no heartbeat for 15s
 MAX_ACTIVE_CLUSTER_JOBS = 2        # Continuous pipeline: pre-buffers next job's chunks so GPU workers never sit idle
 
 # Verbose Logging & Debug Notifications Toggle
