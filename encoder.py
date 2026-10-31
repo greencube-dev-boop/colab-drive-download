@@ -535,10 +535,22 @@ def convert_worker(task: Dict[str, Any], on_transcode_complete: Optional[Any] = 
             if all(c.get("status") == "done" for c in chunks_dict.values()):
                 break
 
-            # Fast check: are there pending chunks or expired leases?
-            has_pending = any(c.get("status") == "pending" or (c.get("status") == "leased" and time.time() > c.get("leased_until", 0.0)) for c in chunks_dict.values())
-            if not has_pending:
-                time.sleep(0.2)
+            # Fast check: are there pending chunks, expired leases, or stalled chunks eligible for speculative execution?
+            now = time.time()
+            spec_timeout = getattr(config, "SPECULATIVE_CHUNK_STALL_SEC", 45.0)
+            has_work = any(
+                c.get("status") == "pending"
+                or (c.get("status") == "leased" and now > c.get("leased_until", 0.0))
+                or (
+                    c.get("status") == "leased"
+                    and c.get("worker_id") != local_worker_id
+                    and (now - float(c.get("last_progress_time") or c.get("lease_start") or now)) >= spec_timeout
+                    and c.get("speculative_worker_id") is None
+                )
+                for c in chunks_dict.values()
+            )
+            if not has_work:
+                time.sleep(0.5)
                 continue
 
             acquired = _main_gpu_slot_lock.acquire(blocking=False)

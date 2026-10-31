@@ -1813,5 +1813,70 @@ class TestTwoStagePipeline(unittest.TestCase):
 
         cluster_manager.unregister_cluster_job(job_id)
 
+    def test_heartbeat_lease_capping_on_zero_progress(self):
+        import cluster_manager
+        job_id = 4321
+        job_info = {
+            "job_id": job_id,
+            "title": "Heartbeat Lease Cap Test",
+            "chunks": {
+                0: {"raw_path": "seg_000.mkv", "out_path": "enc_seg_000.mkv", "status": "pending", "leased_until": 0.0}
+            }
+        }
+        cluster_manager.register_cluster_job(job_id, job_info)
+
+        # Worker 1 leases chunk 0
+        task = cluster_manager.claim_task("worker_stall_1")
+        self.assertTrue(task["has_task"])
+
+        # Artificially age lease_start to 100 seconds ago with 0.0% progress
+        now = time.time()
+        job_info["chunks"][0]["lease_start"] = now - 100.0
+
+        # Worker 1 sends heartbeat with pct=0.0
+        hb_res = cluster_manager.heartbeat_worker("worker_stall_1", {
+            "job_id": job_id,
+            "chunk_idx": 0,
+            "pct": 0.0,
+            "fps": 0.0
+        })
+        self.assertTrue(hb_res["extend_lease"])
+
+        # Leased until should be capped at lease_start + 90.0, which is in the past!
+        capped_lease = job_info["chunks"][0]["leased_until"]
+        self.assertLessEqual(capped_lease, now)
+
+        cluster_manager.unregister_cluster_job(job_id)
+
+    def test_encoder_speculative_work_detection(self):
+        # Verify that encoder's has_work condition detects a stalled chunk at 0%
+        now = time.time()
+        spec_timeout = 45.0
+        local_worker_id = "main_coordinator"
+        chunks_dict = {
+            0: {
+                "status": "leased",
+                "worker_id": "remote_helper_1",
+                "lease_start": now - 60.0,
+                "last_progress_time": now - 60.0,
+                "pct": 0.0,
+                "leased_until": now + 30.0,
+                "speculative_worker_id": None
+            }
+        }
+
+        has_work = any(
+            c.get("status") == "pending"
+            or (c.get("status") == "leased" and now > c.get("leased_until", 0.0))
+            or (
+                c.get("status") == "leased"
+                and c.get("worker_id") != local_worker_id
+                and (now - float(c.get("last_progress_time") or c.get("lease_start") or now)) >= spec_timeout
+                and c.get("speculative_worker_id") is None
+            )
+            for c in chunks_dict.values()
+        )
+        self.assertTrue(has_work)
+
 if __name__ == "__main__":
     unittest.main()

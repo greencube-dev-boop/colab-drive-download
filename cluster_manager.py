@@ -121,7 +121,8 @@ def clean_inactive_workers(force_all_offline: bool = False, timeout_sec: float =
                             db_st = str(db_w.get("status", "")).lower()
                             if db_st:
                                 st = db_st
-                    if force_all_offline or st in ["offline", "waiting_for_master"] or (now - hb) > timeout_sec:
+                    effective_timeout = max(60.0, timeout_sec) if st == "encoding" else max(30.0, timeout_sec)
+                    if force_all_offline or st in ["offline", "waiting_for_master"] or (now - hb) > effective_timeout:
                         try:
                             config.bypass_trash_delete(fpath)
                         except Exception:
@@ -132,13 +133,8 @@ def clean_inactive_workers(force_all_offline: bool = False, timeout_sec: float =
                         if wid:
                             database.remove_cluster_worker(wid)
                 except Exception:
-                    try:
-                        config.bypass_trash_delete(fpath)
-                    except Exception:
-                        try:
-                            os.remove(fpath)
-                        except Exception:
-                            pass
+                    # Do not delete valid files on transient FUSE read/lock errors
+                    continue
         except Exception:
             pass
 
@@ -200,7 +196,8 @@ def discover_workers_from_drive():
                             if db_st:
                                 st = db_st
 
-                        if (now - hb) > 15.0 or st in ["offline", "waiting_for_master"]:
+                        effective_timeout = max(60.0, 30.0) if st == "encoding" else 30.0
+                        if (now - hb) > effective_timeout or st in ["offline", "waiting_for_master"]:
                             # Prune stale dead worker beacon from Drive so it doesn't linger
                             try:
                                 config.bypass_trash_delete(fpath)
@@ -236,7 +233,8 @@ def register_worker(worker_data: Dict[str, Any]) -> Dict[str, Any]:
     try:
         w_dir = getattr(config, "CLUSTER_WORKERS_DIR", os.path.join(config.DATA_DIR, "cluster", "workers"))
         os.makedirs(w_dir, exist_ok=True)
-        w_file = os.path.join(w_dir, f"worker_{worker_id}.json")
+        b_fname = f"{worker_id}.json" if worker_id.startswith("worker_") else f"worker_{worker_id}.json"
+        w_file = os.path.join(w_dir, b_fname)
         with open(w_file, "w", encoding="utf-8") as f:
             json.dump(worker_data, f, indent=2)
     except Exception:
@@ -279,10 +277,6 @@ def heartbeat_worker(worker_id: str, metrics: Optional[Dict[str, Any]] = None) -
                 if is_primary or is_speculative:
                     now = time.time()
                     lease_sec = getattr(config, "CHUNK_LEASE_TIMEOUT_SEC", 90.0)
-                    if is_primary:
-                        chunk["leased_until"] = now + lease_sec
-                    else:
-                        chunk["speculative_until"] = now + lease_sec
 
                     new_pct = float(metrics.get("pct", chunk.get("pct", 0.0)))
                     # Track forward progress
@@ -293,6 +287,16 @@ def heartbeat_worker(worker_id: str, metrics: Optional[Dict[str, Any]] = None) -
                     chunk["pct"] = new_pct
                     chunk["fps"] = float(metrics.get("fps", 0.0))
                     chunk["speed"] = str(metrics.get("speed", "--"))
+
+                    # If stuck at 0.0% progress for > 90s, do not allow infinite renewal of primary lease
+                    l_start = float(chunk.get("lease_start") or now)
+                    if new_pct == 0.0 and (now - l_start) > 90.0:
+                        chunk["leased_until"] = min(chunk.get("leased_until", now), l_start + 90.0)
+                    else:
+                        if is_primary:
+                            chunk["leased_until"] = now + lease_sec
+                        else:
+                            chunk["speculative_until"] = now + lease_sec
 
         database.heartbeat_cluster_worker(worker_id, metrics)
 

@@ -197,6 +197,9 @@ class HelperWorker:
                     pass
         return None
 
+    def _beacon_filename(self) -> str:
+        return f"{self.worker_id}.json" if self.worker_id.startswith("worker_") else f"worker_{self.worker_id}.json"
+
     def announce_to_drive(self, status: str = "idle"):
         """Writes collision-free worker beacon file directly to shared Google Drive."""
         data = {
@@ -208,6 +211,7 @@ class HelperWorker:
             "last_heartbeat": time.time(),
             "registered_at": time.time()
         }
+        b_fname = self._beacon_filename()
         targets = [
             getattr(config, "CLUSTER_WORKERS_DIR", os.path.join(config.DATA_DIR, "cluster", "workers")),
             getattr(config, "LOCAL_CLUSTER_WORKERS_DIR", os.path.join(config.LOCAL_DATA_DIR, "cluster", "workers"))
@@ -215,7 +219,7 @@ class HelperWorker:
         for tdir in targets:
             try:
                 os.makedirs(tdir, exist_ok=True)
-                w_file = os.path.join(tdir, f"worker_{self.worker_id}.json")
+                w_file = os.path.join(tdir, b_fname)
                 with open(w_file, "w", encoding="utf-8") as f:
                     json.dump(data, f, indent=2)
                     f.flush()
@@ -232,27 +236,24 @@ class HelperWorker:
         If it was deleted (e.g. by coordinator cleaning inactive nodes),
         re-creates it immediately and re-registers with the coordinator.
         """
-        targets = [
-            getattr(config, "CLUSTER_WORKERS_DIR", os.path.join(config.DATA_DIR, "cluster", "workers")),
-            getattr(config, "LOCAL_CLUSTER_WORKERS_DIR", os.path.join(config.LOCAL_DATA_DIR, "cluster", "workers"))
-        ]
+        b_fname = self._beacon_filename()
+        # Primary check on shared Google Drive cluster directory
+        drive_tdir = getattr(config, "CLUSTER_WORKERS_DIR", os.path.join(config.DATA_DIR, "cluster", "workers"))
         is_missing = False
-        for tdir in targets:
+        try:
+            os.makedirs(drive_tdir, exist_ok=True)
             try:
-                os.makedirs(tdir, exist_ok=True)
-                try:
-                    os.listdir(tdir)  # Invalidate Drive FUSE directory listing
-                except Exception:
-                    pass
-                w_file = os.path.join(tdir, f"worker_{self.worker_id}.json")
-                if not os.path.exists(w_file):
-                    is_missing = True
-                    break
+                os.listdir(drive_tdir)  # Invalidate Drive FUSE directory listing
             except Exception:
                 pass
+            w_file = os.path.join(drive_tdir, b_fname)
+            if not os.path.exists(w_file):
+                is_missing = True
+        except Exception:
+            pass
 
         if is_missing:
-            logger.notify("HELPER", f"🔄 Announcer beacon was missing on Drive. Recreating 'worker_{self.worker_id}.json'...")
+            logger.notify("HELPER", f"🔄 Announcer beacon was missing on Drive. Recreating '{b_fname}'...")
             self.announce_to_drive(status=status)
             if self.master_url:
                 self.register_with_master()
@@ -261,13 +262,14 @@ class HelperWorker:
 
     def cleanup_drive_beacon(self):
         """Removes this worker's beacon file from Google Drive on shutdown."""
+        b_fname = self._beacon_filename()
         targets = [
             getattr(config, "CLUSTER_WORKERS_DIR", os.path.join(config.DATA_DIR, "cluster", "workers")),
             getattr(config, "LOCAL_CLUSTER_WORKERS_DIR", os.path.join(config.LOCAL_DATA_DIR, "cluster", "workers"))
         ]
         for tdir in targets:
             try:
-                w_file = os.path.join(tdir, f"worker_{self.worker_id}.json")
+                w_file = os.path.join(tdir, b_fname)
                 if os.path.exists(w_file):
                     try:
                         config.bypass_trash_delete(w_file)
@@ -418,7 +420,7 @@ class HelperWorker:
         return bool(res and res.get("status") == "released")
 
     def download_chunk_file(self, endpoint: str, target_local_path: str) -> bool:
-        """Downloads raw chunk file directly from Main coordinator via HTTP stream if Drive sync is pending."""
+        """Downloads raw chunk file directly from Main coordinator via HTTP stream with strict timeout and chunked reads."""
         if not self.master_url:
             return False
         url = f"{self.master_url.rstrip('/')}{endpoint}"
@@ -428,15 +430,36 @@ class HelperWorker:
             "X-Worker-ID": self.worker_id
         }
         req = urllib.request.Request(url, headers=headers)
+        start_t = time.time()
+        max_duration_sec = 45.0
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with urllib.request.urlopen(req, timeout=15) as resp:
                 if resp.status != 200:
                     return False
                 with open(target_local_path, "wb") as out_f:
-                    shutil.copyfileobj(resp, out_f)
-            return os.path.exists(target_local_path) and os.path.getsize(target_local_path) > 0
+                    while True:
+                        if (time.time() - start_t) > max_duration_sec:
+                            logger.warn("HELPER", f"HTTP chunk download timed out after {max_duration_sec}s ({url})")
+                            break
+                        buf = resp.read(128 * 1024)
+                        if not buf:
+                            break
+                        out_f.write(buf)
+            if os.path.exists(target_local_path) and os.path.getsize(target_local_path) > 0:
+                return True
+            if os.path.exists(target_local_path):
+                try:
+                    os.remove(target_local_path)
+                except Exception:
+                    pass
+            return False
         except Exception as e:
             logger.debug("HELPER", f"HTTP chunk stream download error ({url}): {e}")
+            if os.path.exists(target_local_path):
+                try:
+                    os.remove(target_local_path)
+                except Exception:
+                    pass
             return False
 
     def encode_chunk(self, task: Dict[str, Any], slot_id: int = 0) -> bool:
@@ -461,7 +484,7 @@ class HelperWorker:
                 except Exception:
                     pass
 
-        # 1. Fetch raw segment: Try Google Drive first (with deep cache invalidation), fallback to direct HTTP stream
+        # 1. Fetch raw segment: Check Google Drive with deep cache invalidation & patience (up to 30s)
         found_on_drive = False
         candidate_paths = [raw_drive_chunk]
         # Also check with local config.DOWNLOADER_DIR if different from coordinator's base path
@@ -470,7 +493,8 @@ class HelperWorker:
         if local_cand not in candidate_paths:
             candidate_paths.append(local_cand)
 
-        for attempt in range(4):
+        max_drive_attempts = 20
+        for attempt in range(max_drive_attempts):
             for cand in candidate_paths:
                 bust_fuse_path(cand)
                 if os.path.exists(cand) and os.path.getsize(cand) > 0:
@@ -479,7 +503,9 @@ class HelperWorker:
                     break
             if found_on_drive:
                 break
-            time.sleep(1.0)
+            if (attempt + 1) % 4 == 0:
+                logger.notify("HELPER", f"⏳ [Slot {slot_id}] Waiting for Drive FUSE cloud sync for Chunk #{chunk_idx + 1} ({int((attempt + 1) * 1.5)}s elapsed)...")
+            time.sleep(1.5)
 
         if found_on_drive:
             try:
@@ -494,7 +520,7 @@ class HelperWorker:
             dl_ok = self.download_chunk_file(chunk_ep, local_raw)
             if not dl_ok:
                 logger.warn("HELPER", f"[Slot {slot_id}] ⚠️ Source chunk #{chunk_idx + 1} not yet accessible on Drive or HTTP. Releasing back to queue...")
-                self.failed_chunks_cooldown[(job_id, chunk_idx)] = time.time() + 20.0
+                self.failed_chunks_cooldown[(job_id, chunk_idx)] = time.time() + 25.0
                 self.release_task(job_id, chunk_idx)
                 return False
             f_mb = os.path.getsize(local_raw) / (1024 * 1024)
